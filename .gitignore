@@ -1,0 +1,12 @@
+/target
+/dist
+/node_modules
+/.tauri
+/src-tauri/target
+.env
+.env.*
+!.env.example
+*.part
+*.sftp-state
+.DS_Store
+Thumbs.db
