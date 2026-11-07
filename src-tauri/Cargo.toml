@@ -1,19 +1,16 @@
 [package]
 name = "rust-sftp-client"
 version = "0.1.0"
-description = "A desktop SFTP client with resumable segmented downloads"
+description = "A native Rust desktop SFTP client with resumable segmented downloads"
 authors = ["Psmths"]
 edition = "2021"
 
-[lib]
-name = "rust_sftp_client_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+[[bin]]
+name = "rust-sftp-client"
+path = "src/main.rs"
 
 [dependencies]
-tauri = { version = "2", features = [] }
+eframe = "0.33"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
