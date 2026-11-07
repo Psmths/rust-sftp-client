@@ -16,17 +16,21 @@ There is no Tauri, React, TypeScript, Vite, Node.js, or NPM build step.
 
 ## Build
 
-Install native Linux development dependencies for eframe's windowing and rendering backends, then run:
+From the repository root:
 
 ```bash
+cd src-tauri
 cargo run --release
 ```
 
-Build an optimized binary:
+Build an optimized binary without launching it:
 
 ```bash
+cd src-tauri
 cargo build --release
 ```
+
+The executable is written to `src-tauri/target/release/rust-sftp-client`.
 
 ## Interface
 
