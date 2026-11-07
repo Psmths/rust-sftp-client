@@ -1,0 +1,9 @@
+[Desktop Entry]
+Categories=
+Comment=A desktop SFTP client with resumable segmented downloads
+Exec=rust-sftp-client
+StartupWMClass=rust-sftp-client
+Icon=rust-sftp-client
+Name=Rust SFTP Client
+Terminal=false
+Type=Application
