@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use eframe::egui;
 use crate::connection::{AuthMethod, ConnectionProfile};
 use crate::transfer::TransferSettings;
