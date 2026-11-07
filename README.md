@@ -1,8 +1,8 @@
 # Rust SFTP Client
 
-A cross-platform desktop SFTP client built with Rust and Tauri, with a dual-pane file manager and a transfer engine designed around resumable, parallel downloads.
+A cross-platform desktop SFTP client built with Rust and Tauri, with a WinSCP-inspired dual-pane file manager and a transfer engine designed around resumable, parallel downloads.
 
-> **Status:** Early project scaffold. The transfer engine and GUI are not implemented yet.
+> **Status:** Early development. The UI is a scaffold; SSH connection and transfer operations are not wired up yet. The Rust core now contains validated connection-profile types and a tested segmented-download range planner.
 
 ## Goals
 
@@ -13,28 +13,17 @@ A cross-platform desktop SFTP client built with Rust and Tauri, with a dual-pane
 - Segmented downloads for large files, controlled by a user-configurable size threshold and concurrency limit.
 - Conservative, measurable network tuning rather than arbitrary socket tweaks.
 
-## Segmented download design
+## Segmented downloads
 
-SFTP supports offset-based reads. The client can use these to divide a remote file into non-overlapping byte ranges and fetch those ranges concurrently over independent SFTP channels or sessions, subject to server limits.
+SFTP supports offset-based reads. The client can divide a remote file into non-overlapping byte ranges and fetch them concurrently over independent SFTP channels or sessions, subject to server limits.
 
-The implementation must:
-
-1. Read remote metadata and determine whether the file is eligible for segmentation.
-2. Confirm that the server/session permits the required concurrent reads.
-3. Divide the file into bounded ranges and schedule them with a configurable concurrency limit.
-4. Write each range at its correct offset in a temporary destination file.
-5. Retry failed ranges without corrupting completed ranges.
-6. Persist enough transfer state to resume safely after interruption.
-7. Verify final length and, when a trusted checksum is available, content integrity.
-8. Rename the temporary file into place only after successful completion.
+The Rust core now implements deterministic range planning. It produces contiguous half-open ranges, handles uneven file sizes without gaps or overlaps, respects a maximum segment count, and uses a single range below the configured threshold. Network workers, positional disk writes, retry logic, resume state, and finalization remain future work.
 
 Parallel SFTP reads are not guaranteed to improve throughput on every server or network. The client must support falling back to a single stream and must avoid exceeding server connection/channel limits.
 
-## Planned defaults
+## Initial defaults
 
-These are initial product defaults, not hard limits; expose them in Settings.
-
-| Setting | Initial default |
+| Setting | Default |
 |---|---:|
 | Segmentation threshold | 64 MiB |
 | Concurrent segments per file | 8 |
@@ -42,25 +31,22 @@ These are initial product defaults, not hard limits; expose them in Settings.
 | Maximum concurrent transfers | 4 |
 | Retry attempts per segment | 3 |
 
-## Technology direction
+## Technology
 
-- Rust for the transfer engine and application services.
-- Tauri 2 for the desktop shell.
-- React + TypeScript for the interface.
-- Tokio for asynchronous I/O and task scheduling.
-- An actively maintained Rust SSH/SFTP implementation, selected after a protocol and maintenance review.
+- Rust + Tokio for the application and transfer engine.
+- Tauri 2 and React + TypeScript for the desktop interface.
+- russh 0.63.x for async SSH transport.
+- russh-sftp 3.0.1 for SFTP v3.
 
-The SSH/SFTP library is intentionally not locked in until its algorithm support, host-key verification, agent support, SFTP protocol coverage, and concurrency behavior have been evaluated.
-
-## Development
-
-The repository is currently an architecture-first scaffold. See [docs/architecture.md](docs/architecture.md) and [docs/transfer-engine.md](docs/transfer-engine.md) for implementation constraints and milestones.
+The selected russh 0.63.x line matches the dependency range used by russh-sftp 3.0.1. Russh provides password and public-key authentication, agent-backed signing, a host-key verification callback, and Tokio-native channels. Its client handler rejects host keys by default unless the application explicitly trusts them. TCP_NODELAY will be benchmarked rather than assumed to improve every workload.
 
 ## Security principles
 
-- Never store plaintext passwords.
-- Use the operating system credential store for saved secrets.
-- Verify SSH host keys and make trust changes explicit.
+- Never store plaintext passwords in connection profiles.
+- Use the operating-system credential store for saved secrets.
+- Verify SSH host keys and make trust changes explicit; changed keys must never be silently accepted.
 - Keep private-key material out of logs and frontend state.
 - Use restrictive permissions for temporary transfer state and partial files.
 - Treat remote filenames and server-provided metadata as untrusted input.
+
+See docs/architecture.md and docs/transfer-engine.md for implementation constraints.

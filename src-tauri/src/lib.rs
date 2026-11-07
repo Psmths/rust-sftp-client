@@ -1,3 +1,6 @@
+mod connection;
+mod transfer;
+
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -13,7 +16,7 @@ fn get_app_info() -> AppInfo {
     AppInfo {
         name: "Rust SFTP Client",
         version: env!("CARGO_PKG_VERSION"),
-        status: "scaffold",
+        status: "core-foundation",
     }
 }
 

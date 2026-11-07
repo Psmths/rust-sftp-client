@@ -4,28 +4,27 @@
 
 The application is split into a desktop presentation layer and a Rust core. The frontend requests operations through narrow Tauri commands; it does not implement SSH, SFTP, credential handling, or file-transfer logic.
 
-```text
-React UI
-  ├── Connection manager
-  ├── Local file browser
-  ├── Remote file browser
-  ├── Transfer queue
-  └── Settings
-        │ Tauri command/event boundary
-        ▼
-Rust application layer
-  ├── Profile and credential services
-  ├── SSH connection manager
-  ├── SFTP filesystem service
-  ├── Transfer scheduler
-  │     ├── Single-stream transfer
-  │     ├── Segmented download
-  │     ├── Resume/state persistence
-  │     └── Retry and integrity checks
-  └── Platform integration
-        ├── Credential store
-        └── Native filesystem
-```
+    React UI
+      ├── Connection manager
+      ├── Local file browser
+      ├── Remote file browser
+      ├── Transfer queue
+      └── Settings
+            │ Tauri command/event boundary
+            ▼
+    Rust application layer
+      ├── Connection profile and credential services
+      ├── SSH connection manager (russh)
+      ├── SFTP filesystem service (russh-sftp)
+      ├── Transfer scheduler
+      │     ├── Single-stream transfer
+      │     ├── Segmented download planner
+      │     ├── Segmented download workers
+      │     ├── Resume/state persistence
+      │     └── Retry and integrity checks
+      └── Platform integration
+            ├── Credential store
+            └── Native filesystem
 
 ## Design boundaries
 
@@ -34,6 +33,12 @@ Rust application layer
 - **SSH/SFTP layer:** owns authenticated sessions/channels, host-key policy, metadata, reads, writes, and remote filesystem operations.
 - **Transfer engine:** schedules bounded work and writes to local files safely.
 - **Persistence:** stores non-secret profiles and resumable transfer metadata. Secrets belong in the OS credential manager.
+
+## SSH/SFTP implementation choice
+
+The initial transport is russh 0.63.x with russh-sftp 3.0.1. The SFTP crate 3.0.1 depends on the russh 0.63.2 line, so the application uses the compatible minor line rather than selecting russh 0.65.x independently. Russh is Tokio-native and supports password and public-key authentication, agent-backed signing, a host-key verification callback, and modern SSH algorithms. The SFTP crate exposes a client filesystem API and SFTP v3 support.
+
+The host-key callback is a security boundary: unknown keys must be presented to the user for explicit trust, known keys must match, and changed keys must fail closed. No frontend command may pass a skip-verification switch.
 
 ## Connection lifecycle
 
@@ -61,11 +66,12 @@ Concurrency is configurable but bounded. The scheduler must account for per-serv
 
 TCP_NODELAY, keepalive, and socket buffer options should be exposed only where the underlying SSH transport and platform permit them. TCP congestion control remains an operating-system concern. Benchmark each option before making it a default.
 
-## Initial implementation sequence
+## Implementation sequence
 
-1. Establish the Tauri shell and a compilable Rust core.
-2. Implement SSH host-key verification and password/key authentication.
-3. Implement SFTP list/stat/read/write and local/remote panes.
-4. Implement a single-stream transfer path and transfer queue.
-5. Add segmented download scheduling and resume.
-6. Add performance instrumentation and reproducible benchmarks.
+1. Establish the Tauri shell and Rust core.
+2. Define connection profiles and select a compatible SSH/SFTP stack.
+3. Implement host-key verification and password/key/agent authentication.
+4. Implement SFTP list/stat/read/write and local/remote panes.
+5. Implement a single-stream transfer path and transfer queue.
+6. Add segmented download workers, resume, and integrity checks.
+7. Add performance instrumentation and reproducible benchmarks.

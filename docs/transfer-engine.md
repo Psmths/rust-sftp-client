@@ -14,15 +14,13 @@ If any condition fails, use the single-stream implementation.
 
 ## Range planning
 
-For file size `N`, segment count `K`, and segment index `i`, compute a half-open byte range:
+For file size N, segment count K, and segment index i, ranges are half-open:
 
-- `start = floor(i * N / K)`
-- `end_exclusive = floor((i + 1) * N / K)`
-- `length = end_exclusive - start`
+- start = floor(i * N / K)
+- end_exclusive = floor((i + 1) * N / K)
+- length = end_exclusive - start
 
-Use checked integer arithmetic. Empty ranges are not scheduled. The final byte offset must never exceed `N - 1`.
-
-The planner should derive a segment count from the configured target segment size and concurrency ceiling. Avoid creating thousands of tiny tasks for very large files.
+The Rust planner now implements balanced contiguous ranges using quotient/remainder arithmetic to avoid multiplication overflow. It validates non-zero segment size and concurrency, handles empty files, respects the configured threshold, and caps the range count.
 
 ## Worker model
 
