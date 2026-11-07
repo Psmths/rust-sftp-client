@@ -106,7 +106,7 @@ function App() {
           {authMethod === "password" && <label>Password <input type="password" placeholder="Password" /></label>}
           {authMethod === "key" && <label>Private key file <input placeholder="Select an OpenSSH private key…" /></label>}
           <div className="hostkey-note"><ShieldCheck size={16} /><span>Host key verification will be required before credentials are sent.</span></div>
-          <div className="modal-actions"><button className="tool-button" onClick={() => setShowConnect(false)}>Cancel</button><button className="primary-button" disabled={!host.trim() || !username.trim()} title="Connection workflow is not implemented yet">Connect <ChevronRight size={15} /></button></div>
+          <div className="modal-actions"><button className="tool-button" onClick={() => setShowConnect(false)}>Cancel</button><button className="primary-button" disabled title="Connection workflow is not implemented yet">Connect <ChevronRight size={15} /></button></div>
           <p className="modal-footnote">Connection is a UI scaffold; SSH authentication is not wired up yet.</p>
         </section>
       </div>}
