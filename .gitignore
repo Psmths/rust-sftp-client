@@ -1,8 +1,6 @@
 /target
-/dist
-/node_modules
-/.tauri
 /src-tauri/target
+/artifacts
 .env
 .env.*
 !.env.example
