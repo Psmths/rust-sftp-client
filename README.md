@@ -23,6 +23,11 @@ cargo build --release
 
 The executable is written to `target/release/rust-sftp-client`.
 
+Every push to `main` is built and tested on Linux and Windows by GitHub Actions
+([.github/workflows/build.yml](.github/workflows/build.yml)). The binaries are attached to each
+run as artifacts (`rust-sftp-client-linux-x86_64.tar.gz` and `rust-sftp-client-windows-x86_64.exe`)
+and kept for 30 days. A build can also be started by hand from the Actions tab.
+
 ## Implemented workflows
 
 - Save and load non-secret connection profiles.

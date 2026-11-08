@@ -3,7 +3,7 @@ use thiserror::Error;
 
 /// User-adjustable transfer defaults. Sizes are bytes internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct TransferSettings {
     pub segmentation_threshold_bytes: u64,
     pub target_segment_size_bytes: u64,

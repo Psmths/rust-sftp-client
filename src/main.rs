@@ -1,6 +1,14 @@
+// Release builds on Windows are GUI apps: don't open a console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod connection;
+mod logging;
 mod transfer;
+mod places;
+mod session;
+mod settings;
+mod win32;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

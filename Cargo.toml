@@ -17,3 +17,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
 russh = { version = "0.63.3", features = ["aws-lc-rs"] }
 russh-sftp = "3.0.1"
+# Versions match the ones russh already pulls in (see Cargo.lock).
+md5 = "0.8"
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }

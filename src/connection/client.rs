@@ -374,6 +374,47 @@ impl SftpConnection {
         Ok(DownloadResult { bytes: completed, segments: segment_count, segmented })
     }
 
+    /// Opens a remote file for sequential reading.
+    pub async fn open_read(&self, path: &str) -> Result<russh_sftp::client::fs::File, ConnectError> {
+        self.sftp.open(path.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
+    }
+
+    pub async fn rename(&self, from: &str, to: &str) -> Result<(), ConnectError> {
+        self.sftp.rename(from.to_owned(), to.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
+    }
+
+    /// Deletes a file, symlink or (recursively) a directory. Symlinks are
+    /// removed, never followed.
+    pub async fn remove_path(&self, path: &str) -> Result<(), ConnectError> {
+        let sftp_error = |e: russh_sftp::client::error::Error| ConnectError::Sftp(e.to_string());
+        let metadata = self.sftp.symlink_metadata(path.to_owned()).await.map_err(sftp_error)?;
+        if !metadata.is_dir() {
+            return self.sftp.remove_file(path.to_owned()).await.map_err(sftp_error);
+        }
+        // Parents are recorded before their children, so deleting in reverse
+        // order empties every directory before it is removed.
+        let mut directories = vec![path.to_owned()];
+        let mut stack = vec![path.to_owned()];
+        while let Some(directory) = stack.pop() {
+            let entries = self.sftp.read_dir(directory.clone()).await.map_err(sftp_error)?;
+            for entry in entries {
+                let name = entry.file_name();
+                if name == "." || name == ".." { continue; }
+                let child = format!("{}/{}", directory.trim_end_matches('/'), name);
+                if entry.metadata().is_dir() {
+                    directories.push(child.clone());
+                    stack.push(child);
+                } else {
+                    self.sftp.remove_file(child).await.map_err(sftp_error)?;
+                }
+            }
+        }
+        for directory in directories.into_iter().rev() {
+            self.sftp.remove_dir(directory).await.map_err(sftp_error)?;
+        }
+        Ok(())
+    }
+
     pub async fn download(
         &self,
         remote_path: &str,
@@ -386,7 +427,7 @@ impl SftpConnection {
 }
 
 pub fn host_key_store_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| "HOME is not set".to_owned())?;
+    let home = crate::places::home_dir().ok_or_else(|| "home directory is not set".to_owned())?;
     Ok(home.join(".config/rust-sftp-client/known_hosts.json"))
 }
 
