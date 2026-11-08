@@ -4,7 +4,7 @@ use russh::keys::ssh_key::HashAlg;
 use russh_sftp::client::{fs::ReadDir, SftpSession};
 use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
 
-use crate::{connection::{AuthMethod, ConnectionProfile}, transfer::{download_file, DownloadProgress, DownloadResult, TransferSettings}};
+use crate::{connection::{AuthMethod, ConnectionProfile}, transfer::{download_file, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings}};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -288,12 +288,20 @@ impl SftpConnection {
                     }
                     update = inner_rx.recv() => {
                         if let (Some(tx), Some(update)) = (&progress, update) {
+                            let segment = update.segment.map(|segment| SegmentProgress {
+                                index: segment_count.saturating_add(segment.index),
+                                start: completed.saturating_add(segment.start),
+                                end_exclusive: completed.saturating_add(segment.end_exclusive),
+                                transferred_bytes: segment.transferred_bytes,
+                                complete: segment.complete,
+                                failed: segment.failed,
+                            });
                             let _ = tx.send(DownloadProgress {
                                 total_bytes: total,
                                 transferred_bytes: completed.saturating_add(update.transferred_bytes),
-                                completed_segments: update.completed_segments,
-                                total_segments: update.total_segments,
-                                segment: None,
+                                completed_segments: segment_count.saturating_add(update.completed_segments),
+                                total_segments: segment_count.saturating_add(update.total_segments),
+                                segment,
                             });
                         }
                     }
