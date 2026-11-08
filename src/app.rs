@@ -408,6 +408,7 @@ impl SftpApp {
 
 
     fn queue_dropped_local(&mut self, local_path: PathBuf) {
+        self.transfer_slots = Arc::new(Semaphore::new(self.transfer.max_concurrent_transfers.max(1) as usize));
         let Some(connection) = self.connection.clone() else {
             self.status = "Connect to a remote server before uploading".into();
             return;
@@ -459,6 +460,7 @@ impl SftpApp {
     }
 
     fn queue_dropped_remote(&mut self, remote_path: String) {
+        self.transfer_slots = Arc::new(Semaphore::new(self.transfer.max_concurrent_transfers.max(1) as usize));
         let Some(connection) = self.connection.clone() else { return; };
         let name = remote_path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(&remote_path).to_owned();
         let destination = self.path.join(&name);
