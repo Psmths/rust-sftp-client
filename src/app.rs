@@ -607,7 +607,7 @@ impl SftpApp {
                         egui::Button::selectable(
                             selected,
                             egui::RichText::new(&entry.name).monospace(),
-                        ).halign(egui::Align::LEFT),
+                        ),
                     );
                     if response.clicked() {
                         let multi = response.ctx.input(|input| input.modifiers.ctrl || input.modifiers.command);
