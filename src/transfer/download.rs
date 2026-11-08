@@ -1,6 +1,7 @@
 //! Bounded, retrying SFTP range-download engine.
 //!
-//! Each segment is fetched through its own SFTP file handle and written
+//! Each segment is fetched through its own SFTP file handle (segments are
+//! spread round-robin over the connection's SFTP channels) and written
 //! directly into its assigned byte range in one pre-sized temporary file.
 //! Positional writes avoid a shared seek cursor and are safe for concurrent
 //! workers on both Unix and Windows.
@@ -81,12 +82,15 @@ pub enum DownloadError {
 /// changes a shared file cursor, and the output handle remains open until all
 /// workers have stopped. The file is flushed and validated before publication.
 pub async fn download_file(
-    sftp: Arc<SftpSession>,
+    sessions: Vec<Arc<SftpSession>>,
     remote_path: &str,
     destination: &Path,
     settings: TransferSettings,
     progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
 ) -> Result<DownloadResult, DownloadError> {
+    let Some(sftp) = sessions.first().cloned() else {
+        return Err(DownloadError::Worker("no SFTP channel available".into()));
+    };
     let metadata = sftp.metadata(remote_path.to_owned()).await
         .map_err(|e| DownloadError::Sftp(e.to_string()))?;
     let size = metadata.size.ok_or(DownloadError::UnknownSize)?;
@@ -146,7 +150,7 @@ pub async fn download_file(
     let mut workers = JoinSet::new();
 
     for range in plan.segments.iter().copied() {
-        let session = Arc::clone(&sftp);
+        let session = Arc::clone(&sessions[range.index as usize % sessions.len()]);
         let remote = remote_path.to_owned();
         let output_file = Arc::clone(&output);
         let permit_pool = Arc::clone(&permits);

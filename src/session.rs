@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    connection::{ConnectError, ConnectionProfile, SftpConnection},
+    connection::{ConnectError, ConnectionProfile, NetworkSettings, SftpConnection},
     logging::{Category, Logger, SessionLog, Severity},
     transfer::{DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
 };
@@ -130,7 +130,8 @@ pub struct Session {
     pub pending_password: Option<String>,
     pub pending_fingerprint: Option<String>,
     connect_rx: Option<std_mpsc::Receiver<Result<SftpConnection, ConnectError>>>,
-    list_rx: Option<std_mpsc::Receiver<Result<Vec<RemoteEntry>, String>>>,
+    /// A listing in progress: resolves to (absolute path, entries).
+    list_rx: Option<std_mpsc::Receiver<Result<(String, Vec<RemoteEntry>), String>>>,
 
     pub transfers: Vec<TransferItem>,
     pub queue_tab: QueueTab,
@@ -237,7 +238,13 @@ impl Session {
 
     // ----- connection -----
 
-    pub fn start_connect(&mut self, profile: ConnectionProfile, password: Option<String>, trusted: Option<String>) {
+    pub fn start_connect(
+        &mut self,
+        profile: ConnectionProfile,
+        password: Option<String>,
+        trusted: Option<String>,
+        network: NetworkSettings,
+    ) {
         self.log = SessionLog {
             id: self.id,
             remote: format!("{}@{}:{}", profile.username, profile.host, profile.port),
@@ -255,7 +262,7 @@ impl Session {
         self.connect_rx = Some(rx);
         self.status = format!("Connecting to {}:{} …", profile.host, profile.port);
         self.runtime.spawn(async move {
-            let result = SftpConnection::connect(&profile, password.as_deref(), trusted.as_deref()).await;
+            let result = SftpConnection::connect(&profile, password.as_deref(), trusted.as_deref(), network).await;
             let _ = tx.send(result);
         });
     }
@@ -269,12 +276,16 @@ impl Session {
                     Category::Connection,
                     Severity::Notice,
                     "CONNECT",
-                    &format!("Connected to {} (host key {})", self.log.remote, connection.fingerprint),
+                    &format!(
+                        "Connected to {} (host key {}, {} SFTP channel(s))",
+                        self.log.remote, connection.fingerprint, connection.channel_count()
+                    ),
                 );
                 let host = connection.host.clone();
                 self.connection = Some(Arc::new(connection));
                 self.pending_password = None;
-                self.remote_path = ".".into();
+                // Filled in with the absolute home directory once listed.
+                self.remote_path = String::new();
                 self.remote_selected.clear();
                 self.status = format!("Connected to {host}");
                 self.load_remote(".");
@@ -324,14 +335,21 @@ impl Session {
 
     // ----- remote side -----
 
+    /// Lists `path` in the background. Relative paths and `.`/`..` are
+    /// resolved on the server first, so `remote_path` is always absolute.
     pub fn load_remote(&mut self, path: &str) {
         let Some(connection) = self.connection.clone() else { return; };
-        let path = path.to_owned();
+        let requested = if path.is_empty() { ".".to_owned() } else { path.to_owned() };
         let (tx, rx) = std_mpsc::channel();
         self.list_rx = Some(rx);
-        self.status = format!("Reading remote directory {path} …");
+        self.status = format!("Reading remote directory {requested} …");
         self.runtime.spawn(async move {
             let result = async {
+                let path = if needs_canonical_path(&requested) {
+                    connection.canonicalize(&requested).await.map_err(|e| e.to_string())?
+                } else {
+                    requested
+                };
                 let read_dir = connection.list_dir(&path).await.map_err(|e| e.to_string())?;
                 let mut entries = Vec::new();
                 for entry in read_dir {
@@ -348,7 +366,7 @@ impl Session {
                     });
                 }
                 entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-                Ok(entries)
+                Ok((path, entries))
             }.await;
             let _ = tx.send(result);
         });
@@ -359,12 +377,14 @@ impl Session {
         self.load_remote(&path);
     }
 
-    /// Returns an error message if the listing failed.
+    /// Returns an error message if the listing failed. The current path only
+    /// changes when a listing succeeds.
     pub fn poll_remote_listing(&mut self) -> Option<String> {
         let result = self.list_rx.as_ref().and_then(|rx| rx.try_recv().ok())?;
         self.list_rx = None;
         match result {
-            Ok(entries) => {
+            Ok((path, entries)) => {
+                self.remote_path = path;
                 self.remote_entries = entries;
                 self.remote_selected.clear();
                 self.status = format!("Remote directory loaded · {} entries", self.remote_entries.len());
@@ -375,7 +395,6 @@ impl Session {
     }
 
     pub fn navigate_remote(&mut self, path: String) {
-        self.remote_path = path.clone();
         self.remote_selected.clear();
         self.load_remote(&path);
     }
@@ -668,3 +687,25 @@ impl Session {
     }
 }
 
+
+/// True unless `path` is already absolute and free of `.`/`..` segments.
+fn needs_canonical_path(path: &str) -> bool {
+    !path.starts_with('/') || path.split('/').any(|part| part == "." || part == "..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_canonical_path;
+
+    #[test]
+    fn only_clean_absolute_paths_skip_canonicalisation() {
+        assert!(needs_canonical_path("."));
+        assert!(needs_canonical_path(".."));
+        assert!(needs_canonical_path("docs"));
+        assert!(needs_canonical_path("/home/alice/.."));
+        assert!(needs_canonical_path("/home/./alice"));
+        assert!(!needs_canonical_path("/"));
+        assert!(!needs_canonical_path("/home/alice/.config"));
+        assert!(!needs_canonical_path("/C:/Users/alice"));
+    }
+}

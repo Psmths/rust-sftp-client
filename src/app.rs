@@ -10,9 +10,10 @@ use std::{
 };
 
 use eframe::egui;
-use tokio::io::AsyncReadExt as _;
 
-use crate::connection::{load_trusted_fingerprint, trust_host_key, AuthMethod, ConnectionProfile};
+use crate::connection::{
+    load_trusted_fingerprint, trust_host_key, AuthMethod, CipherPreference, ConnectionProfile, NetworkSettings,
+};
 use crate::logging::{default_log_dir, Logger};
 use crate::session::{ConnectOutcome, LocalEntry, QueueTab, RemoteEntry, Session};
 use crate::settings::AppSettings;
@@ -132,16 +133,18 @@ enum RowAction {
 enum SettingsPage {
     Transfers,
     Segmentation,
+    Network,
     Logging,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 3] = [SettingsPage::Transfers, SettingsPage::Segmentation, SettingsPage::Logging];
+    const ALL: [SettingsPage; 4] = [SettingsPage::Transfers, SettingsPage::Segmentation, SettingsPage::Network, SettingsPage::Logging];
 
     fn title(self) -> &'static str {
         match self {
             SettingsPage::Transfers => "Transfers",
             SettingsPage::Segmentation => "Segmented downloads",
+            SettingsPage::Network => "Network Settings",
             SettingsPage::Logging => "Logging",
         }
     }
@@ -154,6 +157,15 @@ struct SettingsDraft {
     threshold_mib: String,
     segment_mib: String,
     workers: String,
+    sftp_channels: String,
+    pipelined_requests: String,
+    sftp_packet_kib: String,
+    ssh_window_mib: String,
+    cipher: Option<CipherPreference>,
+    compression: bool,
+    keepalive_secs: String,
+    request_timeout_secs: String,
+    parallel_files: String,
     logging_enabled: bool,
     log_connections: bool,
     log_transfers: bool,
@@ -164,12 +176,22 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         let transfer = &settings.transfer;
+        let network = &settings.network;
         let logging = &settings.logging;
         Self {
             concurrent: transfer.max_concurrent_transfers.to_string(),
             threshold_mib: (transfer.segmentation_threshold_bytes / MIB).to_string(),
             segment_mib: (transfer.target_segment_size_bytes / MIB).to_string(),
             workers: transfer.max_segments_per_file.to_string(),
+            sftp_channels: network.sftp_channels.to_string(),
+            pipelined_requests: network.pipelined_requests.to_string(),
+            sftp_packet_kib: network.sftp_packet_kib.to_string(),
+            ssh_window_mib: network.ssh_window_mib.to_string(),
+            cipher: Some(network.cipher),
+            compression: network.compression,
+            keepalive_secs: network.keepalive_secs.to_string(),
+            request_timeout_secs: network.request_timeout_secs.to_string(),
+            parallel_files: network.parallel_files.to_string(),
             logging_enabled: logging.enabled,
             log_connections: logging.log_connections,
             log_transfers: logging.log_transfers,
@@ -185,6 +207,17 @@ impl SettingsDraft {
             target_segment_size_bytes: parse_setting(&self.segment_mib, "Segment size", 1, 4096)? * MIB,
             max_segments_per_file: parse_setting(&self.workers, "Workers per file", 1, 32)? as u32,
         };
+        let network = NetworkSettings {
+            sftp_channels: parse_setting(&self.sftp_channels, "SFTP channels", 1, 16)? as u32,
+            pipelined_requests: parse_setting(&self.pipelined_requests, "Requests in flight", 1, 256)? as u32,
+            sftp_packet_kib: parse_setting(&self.sftp_packet_kib, "SFTP packet size", 32, 256)? as u32,
+            ssh_window_mib: parse_setting(&self.ssh_window_mib, "SSH window size", 1, 1024)? as u32,
+            cipher: self.cipher.unwrap_or(CipherPreference::AesGcm),
+            compression: self.compression,
+            keepalive_secs: parse_setting(&self.keepalive_secs, "Keepalive interval", 0, 3600)? as u32,
+            request_timeout_secs: parse_setting(&self.request_timeout_secs, "Request timeout", 5, 3600)? as u32,
+            parallel_files: parse_setting(&self.parallel_files, "Parallel files", 1, 32)? as u32,
+        };
         let directory = self.log_directory.trim();
         if self.logging_enabled && directory.is_empty() {
             return Err("Choose a log directory.".into());
@@ -196,11 +229,51 @@ impl SettingsDraft {
             directory: if directory.is_empty() { default_log_dir() } else { PathBuf::from(directory) },
             split_sessions: self.split_sessions,
         };
-        Ok(AppSettings { transfer, logging })
+        Ok(AppSettings { transfer, network, logging })
     }
 }
 
 const MIB: u64 = 1024 * 1024;
+
+const NETWORK_TIP_CHANNELS: &str = "Number of SFTP channels opened inside each SSH connection. Download \
+segments and the files of folder transfers are spread across them, and every channel has its own flow-control \
+window, so more channels keep more data moving at once.\n\nServers limit how many channels a connection may open \
+(OpenSSH: MaxSessions, 10 by default); channels beyond the limit are skipped without an error.\n\nDefault: 4.";
+
+const NETWORK_TIP_PARALLEL_FILES: &str = "How many files of one folder upload or download are transferred at \
+the same time.\n\nRaising this speeds up folders with many small files, where opening and closing each file \
+(several network round trips) costs more than moving the data. Large single files are not affected; they are \
+sped up by segmented downloads instead.\n\nDefault: 4.";
+
+const NETWORK_TIP_PIPELINE: &str = "Number of SFTP read or write requests sent ahead for each open file \
+without waiting for the server's replies.\n\nEvery request waits a full network round trip, so on high-latency \
+links more requests in flight means higher throughput, at the cost of some memory per transfer.\n\nDefault: 64.";
+
+const NETWORK_TIP_PACKET: &str = "Largest amount of file data carried by a single SFTP read or write request. \
+Bigger packets mean fewer requests and less protocol overhead.\n\nServers that announce their own limit (OpenSSH \
+does) are respected automatically. Lower this to 32 KiB if uploads fail on a server that does not.\n\nDefault: 256 KiB.";
+
+const NETWORK_TIP_WINDOW: &str = "How much data the server may send on a channel before it has to wait for \
+this client to acknowledge it.\n\nA channel can never be faster than window size ÷ round-trip time: 16 MiB at \
+100 ms latency allows about 160 MiB/s, 2 MiB only about 20 MiB/s. Raise it for fast, long-distance links.\n\nDefault: 16 MiB.";
+
+const NETWORK_TIP_KEEPALIVE: &str = "Sends an SSH keepalive message after this many seconds without traffic. \
+This stops routers, NAT gateways and firewalls from dropping idle connections, and detects connections that \
+have silently died.\n\n0 turns keepalives off. Default: 30 s.";
+
+const NETWORK_TIP_TIMEOUT: &str = "How long to wait for the server to answer a single SFTP request before \
+treating it as failed. A failed download segment is retried; other operations report an error.\n\nRaise this \
+for slow or heavily loaded servers. Default: 30 s.";
+
+const NETWORK_TIP_CIPHER: &str = "The encryption algorithm offered to the server first; the other one is still \
+offered as a fallback. Both are secure.\n\nAES-GCM is fastest on processors with AES instructions (practically \
+all modern x86-64 and ARM CPUs). ChaCha20-Poly1305 is faster on older or low-power processors without \
+them.\n\nDefault: AES-GCM.";
+
+const NETWORK_TIP_COMPRESSION: &str = "Compresses all SSH traffic with zlib.\n\nThis only helps on slow links \
+(a few MB/s or less) when moving compressible data such as text, logs or source code. On fast links, or with \
+files that are already compressed (archives, video, images), it costs CPU time and makes transfers \
+slower.\n\nDefault: off.";
 
 fn parse_setting(value: &str, label: &str, min: u64, max: u64) -> Result<u64, String> {
     match value.trim().parse::<u64>() {
@@ -503,28 +576,6 @@ impl SftpApp {
         });
     }
 
-    fn start_remote_hash(&mut self, entry: &RemoteEntry, algorithm: HashAlgorithm) {
-        let Some(connection) = self.session().connection.clone() else { return; };
-        let (done, cancel, tx) = self.push_hash_job(entry.name.clone(), entry.path.clone(), entry.size, algorithm);
-        let path = entry.path.clone();
-        self.runtime.spawn(async move {
-            let result: Result<String, String> = async {
-                let mut file = connection.open_read(&path).await.map_err(|e| e.to_string())?;
-                let mut hasher = Hasher::new(algorithm);
-                let mut buffer = vec![0_u8; HASH_BUFFER];
-                loop {
-                    if cancel.load(Ordering::Relaxed) { return Err("Cancelled".into()); }
-                    let read = file.read(&mut buffer).await.map_err(|e| e.to_string())?;
-                    if read == 0 { break; }
-                    hasher.update(&buffer[..read]);
-                    done.fetch_add(read as u64, Ordering::Relaxed);
-                }
-                Ok(hasher.finish())
-            }.await;
-            let _ = tx.send(result);
-        });
-    }
-
     fn begin_delete(&mut self, target: FileTarget) {
         if target.items().is_empty() { return; }
         self.file_target = Some(target);
@@ -798,7 +849,8 @@ impl SftpApp {
         };
         self.active = index;
         let trusted = load_trusted_fingerprint(&profile.host, profile.port);
-        self.sessions[index].start_connect(profile, password, trusted);
+        let network = self.settings.network;
+        self.sessions[index].start_connect(profile, password, trusted, network);
     }
 
     fn accept_host_key(&mut self) {
@@ -815,7 +867,7 @@ impl SftpApp {
         }
         session.log_host_key_decision(&fingerprint, true);
         let password = session.pending_password.clone();
-        session.start_connect(profile, password, Some(fingerprint));
+        session.start_connect(profile, password, Some(fingerprint), self.settings.network);
     }
 
     fn reject_host_key(&mut self) {
@@ -916,7 +968,7 @@ impl SftpApp {
                         if entry.name != ".." {
                             response.context_menu(|ui| {
                                 let label = if connected { "Upload to remote" } else { "Upload to remote (not connected)" };
-                                action = row_context_menu(ui, entry.dir, label, connected, true);
+                                action = row_context_menu(ui, entry.dir, label, connected, true, true);
                             });
                         }
                         match action {
@@ -1033,7 +1085,8 @@ impl SftpApp {
                         if entry.name != ".." {
                             response.context_menu(|ui| {
                                 let label = if count > 1 { format!("Download {count} items") } else { "Download".to_owned() };
-                                action = row_context_menu(ui, entry.dir, &label, true, count == 1);
+                                // Hashing is local-only: a remote hash would have to download the file.
+                                action = row_context_menu(ui, entry.dir, &label, true, count == 1, false);
                             });
                         }
                         let targets = || -> Vec<RemoteEntry> {
@@ -1048,13 +1101,12 @@ impl SftpApp {
                             Some(RowAction::Transfer) => {
                                 for target in targets() { self.sessions[a].queue_download(target.path, self.settings.transfer); }
                             }
-                            Some(RowAction::Hash(algorithm)) => self.start_remote_hash(&entry, algorithm),
                             Some(RowAction::Rename) => self.begin_rename(FileTarget::Remote(vec![entry.clone()])),
                             Some(RowAction::Delete) => {
                                 let targets = targets();
                                 self.begin_delete(FileTarget::Remote(targets));
                             }
-                            None => {}
+                            Some(RowAction::Hash(_)) | None => {}
                         }
                         if response.double_clicked() && entry.dir { self.sessions[a].navigate_remote(entry.path.clone()); }
                         file_row_details(ui, entry.dir, entry.size, &entry.modified);
@@ -1294,7 +1346,7 @@ impl SftpApp {
         let id = egui::ViewportId::from_hash_of("rust-sftp-client-settings");
         let builder = egui::ViewportBuilder::default()
             .with_title("Settings")
-            .with_inner_size([640.0, 380.0])
+            .with_inner_size([680.0, 470.0])
             .with_min_inner_size([520.0, 300.0]);
         let mut close = false;
         let mut apply = false;
@@ -1339,6 +1391,50 @@ impl SftpApp {
                                 });
                                 ui.add_space(6.0);
                                 ui.weak("Large downloads are split into segments that are fetched in parallel by several workers.");
+                            }
+                            SettingsPage::Network => {
+                                let info_row = |ui: &mut egui::Ui, label: &str, value: &mut String, unit: &str, tip: &str| {
+                                    ui.label(label);
+                                    win32::text_edit(ui, egui::TextEdit::singleline(value).desired_width(70.0));
+                                    ui.weak(unit);
+                                    win32::info_tip(ui, tip);
+                                    ui.end_row();
+                                };
+                                egui::Grid::new("settings_network").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+                                    info_row(ui, "SFTP channels per connection:", &mut draft.sftp_channels, "1–16", NETWORK_TIP_CHANNELS);
+                                    info_row(ui, "Parallel files per folder transfer:", &mut draft.parallel_files, "1–32", NETWORK_TIP_PARALLEL_FILES);
+                                    info_row(ui, "Requests in flight per file:", &mut draft.pipelined_requests, "1–256", NETWORK_TIP_PIPELINE);
+                                    info_row(ui, "SFTP packet size:", &mut draft.sftp_packet_kib, "KiB (32–256)", NETWORK_TIP_PACKET);
+                                    info_row(ui, "SSH window size:", &mut draft.ssh_window_mib, "MiB (1–1024)", NETWORK_TIP_WINDOW);
+                                    info_row(ui, "Keepalive interval:", &mut draft.keepalive_secs, "s (0 = off)", NETWORK_TIP_KEEPALIVE);
+                                    info_row(ui, "Request timeout:", &mut draft.request_timeout_secs, "s (5–3600)", NETWORK_TIP_TIMEOUT);
+
+                                    ui.label("Preferred cipher:");
+                                    let selected = match draft.cipher {
+                                        Some(CipherPreference::ChaCha20) => "ChaCha20-Poly1305",
+                                        _ => "AES-GCM",
+                                    };
+                                    egui::ComboBox::from_id_salt("network_cipher")
+                                        .width(150.0)
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut draft.cipher, Some(CipherPreference::AesGcm), "AES-GCM");
+                                            ui.selectable_value(&mut draft.cipher, Some(CipherPreference::ChaCha20), "ChaCha20-Poly1305");
+                                        });
+                                    ui.label("");
+                                    win32::info_tip(ui, NETWORK_TIP_CIPHER);
+                                    ui.end_row();
+
+                                    ui.label("SSH compression:");
+                                    ui.checkbox(&mut draft.compression, "Enable (zlib)");
+                                    ui.label("");
+                                    win32::info_tip(ui, NETWORK_TIP_COMPRESSION);
+                                    ui.end_row();
+                                });
+                                ui.add_space(6.0);
+                                ui.weak("Hover an information icon for details about a setting.");
+                                ui.add_space(4.0);
+                                ui.colored_label(win32::WARN_AMBER, "Network settings apply to new connections.");
                             }
                             SettingsPage::Logging => {
                                 ui.checkbox(&mut draft.logging_enabled, "Enable logging");
@@ -1640,7 +1736,14 @@ fn dialog_buttons(ui: &mut egui::Ui, add_buttons: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-fn row_context_menu(ui: &mut egui::Ui, dir: bool, transfer_label: &str, transfer_enabled: bool, single: bool) -> Option<RowAction> {
+fn row_context_menu(
+    ui: &mut egui::Ui,
+    dir: bool,
+    transfer_label: &str,
+    transfer_enabled: bool,
+    single: bool,
+    hashable: bool,
+) -> Option<RowAction> {
     win32::menu_item_style(ui.style_mut());
     let mut action = None;
     let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, value: RowAction| {
@@ -1651,9 +1754,11 @@ fn row_context_menu(ui: &mut egui::Ui, dir: bool, transfer_label: &str, transfer
     };
     if dir { item(ui, true, "Open", RowAction::Open); }
     item(ui, transfer_enabled, transfer_label, RowAction::Transfer);
-    ui.separator();
-    for algorithm in HashAlgorithm::ALL {
-        item(ui, !dir && single, &format!("Calculate {}", algorithm.label()), RowAction::Hash(algorithm));
+    if hashable {
+        ui.separator();
+        for algorithm in HashAlgorithm::ALL {
+            item(ui, !dir && single, &format!("Calculate {}", algorithm.label()), RowAction::Hash(algorithm));
+        }
     }
     ui.separator();
     item(ui, single, "Rename", RowAction::Rename);

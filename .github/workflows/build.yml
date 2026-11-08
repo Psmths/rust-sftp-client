@@ -59,6 +59,18 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Check the Windows binary needs no Visual C++ runtime DLLs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # DLL imports are stored as plain ASCII names in the executable.
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("target/release/rust-sftp-client.exe")
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          $found = [regex]::Matches($text, '(?i)(vcruntime\d+\.dll|msvcp\d+\.dll|api-ms-win-crt-[a-z0-9-]+\.dll)') |
+            ForEach-Object { $_.Value } | Sort-Object -Unique
+          if ($found) { throw "Binary depends on the Visual C++ runtime: $($found -join ', ')" }
+          Write-Host "No Visual C++ runtime DLL imports found."
+
       - name: Package (Linux)
         if: runner.os == 'Linux'
         # Tar keeps the executable bit, which artifact zips would drop.
@@ -80,3 +92,42 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish release
+    # Only pushes to main publish; manual runs just build.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: |
+          sha256sum rust-sftp-client-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # One release per push, e.g. tag v0.1.0-build.42 for Cargo.toml version
+        # 0.1.0 and workflow run 42. Notes list the changes since the previous
+        # release. gh uploads the assets before publishing the release.
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "rust-sftp-client ${version} (build ${GITHUB_RUN_NUMBER})" \
+            --generate-notes \
+            --latest

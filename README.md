@@ -28,6 +28,11 @@ Every push to `main` is built and tested on Linux and Windows by GitHub Actions
 run as artifacts (`rust-sftp-client-linux-x86_64.tar.gz` and `rust-sftp-client-windows-x86_64.exe`)
 and kept for 30 days. A build can also be started by hand from the Actions tab.
 
+When both builds succeed on a push to `main`, a GitHub Release is published automatically,
+tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.1.0-build.42`), with both binaries,
+a `SHA256SUMS.txt` file and notes listing the changes since the previous release. Manual runs
+only build.
+
 ## Implemented workflows
 
 - Save and load non-secret connection profiles.

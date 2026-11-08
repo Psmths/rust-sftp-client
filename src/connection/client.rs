@@ -1,10 +1,16 @@
-use std::{path::{Path, PathBuf}, sync::{Arc, Mutex}};
+use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex}};
 use russh::{client, keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate}};
 use russh::keys::ssh_key::HashAlg;
 use russh_sftp::client::{fs::ReadDir, SftpSession};
-use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, Semaphore}, task::JoinSet};
 
-use crate::{connection::{AuthMethod, ConnectionProfile}, transfer::{download_file, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings}};
+use crate::{
+    connection::{AuthMethod, ConnectionProfile, NetworkSettings},
+    transfer::{download_file, DownloadError, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
+};
+
+/// Read buffer for uploads; large enough to keep the SFTP write pipeline full.
+const UPLOAD_BUFFER: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -49,7 +55,12 @@ impl client::Handler for VerifyHostKey {
 /// Retain the SSH handle for the lifetime of the SFTP channel.
 pub struct SftpConnection {
     _ssh: client::Handle<VerifyHostKey>,
+    /// Primary channel, used for listings and file operations.
     sftp: Arc<SftpSession>,
+    /// Every SFTP channel (the primary first); transfers are spread over them.
+    channels: Vec<Arc<SftpSession>>,
+    next_channel: AtomicUsize,
+    network: NetworkSettings,
     pub host: String,
     pub port: u16,
     pub fingerprint: String,
@@ -63,6 +74,7 @@ impl SftpConnection {
         profile: &ConnectionProfile,
         password: Option<&str>,
         trusted_fingerprint: Option<&str>,
+        network: NetworkSettings,
     ) -> Result<Self, ConnectError> {
         profile.validate().map_err(|e| ConnectError::Ssh(e.to_string()))?;
         if profile.auth_method == AuthMethod::SshAgent {
@@ -74,8 +86,7 @@ impl SftpConnection {
             expected: trusted_fingerprint.map(str::to_owned),
             observed: Arc::clone(&observed),
         };
-        let mut config = client::Config::default();
-        config.nodelay = true;
+        let config = network.ssh_config();
         let mut ssh = match client::connect(Arc::new(config), (profile.host.as_str(), profile.port), handler).await {
             Ok(session) => session,
             Err(error) => {
@@ -116,19 +127,40 @@ impl SftpConnection {
             return Err(ConnectError::AuthenticationFailed);
         }
 
-        let channel = ssh.channel_open_session().await.map_err(|e| ConnectError::Ssh(e.to_string()))?;
-        channel.request_subsystem(true, "sftp").await
-            .map_err(|e| ConnectError::Ssh(e.to_string()))?;
-        let sftp = SftpSession::new(channel.into_stream()).await
-            .map_err(|e| ConnectError::Sftp(e.to_string()))?;
+        let sftp = Arc::new(open_sftp_channel(&ssh, &network).await?);
+        let mut channels = vec![Arc::clone(&sftp)];
+        // Extra channels are an optimisation: stop quietly at the server's
+        // session limit (OpenSSH MaxSessions defaults to 10).
+        while channels.len() < network.channel_count() {
+            match open_sftp_channel(&ssh, &network).await {
+                Ok(extra) => channels.push(Arc::new(extra)),
+                Err(_) => break,
+            }
+        }
 
         Ok(Self {
             _ssh: ssh,
-            sftp: Arc::new(sftp),
+            sftp,
+            channels,
+            next_channel: AtomicUsize::new(0),
+            network,
             host: profile.host.clone(),
             port: profile.port,
             fingerprint: trusted_fingerprint.unwrap_or_default().to_owned(),
         })
+    }
+
+    /// All SFTP channels, starting at the next one in round-robin order, so
+    /// consecutive transfers begin on different channels.
+    fn transfer_sessions(&self) -> Vec<Arc<SftpSession>> {
+        let start = self.next_channel.fetch_add(1, Ordering::Relaxed);
+        let count = self.channels.len();
+        (0..count).map(|offset| Arc::clone(&self.channels[(start + offset) % count])).collect()
+    }
+
+    /// Number of SFTP channels actually opened.
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<ReadDir, ConnectError> {
@@ -199,50 +231,58 @@ impl SftpConnection {
                 });
             }
         }
-        let mut transferred = 0_u64;
-        let mut buffer = vec![0_u8; 256 * 1024];
+        let transferred_total = Arc::new(AtomicU64::new(0));
+        let parallel = Arc::new(Semaphore::new(self.network.file_parallelism()));
+        let mut workers = JoinSet::new();
         for (local, remote, file_size) in files {
-            let relative_path = local.strip_prefix(local_path).unwrap_or(&local);
-            let relative = if relative_path.as_os_str().is_empty() {
-                local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
-            } else {
-                relative_path.to_string_lossy().to_string()
-            };
-            let mut file_transferred = 0_u64;
-            let mut input = fs::File::open(&local).await
-                .map_err(crate::transfer::DownloadError::Io)?;
-            let mut output = self.sftp.create(remote).await
-                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
-            loop {
-                let count = input.read(&mut buffer).await
-                    .map_err(crate::transfer::DownloadError::Io)?;
-                if count == 0 { break; }
-                output.write_all(&buffer[..count]).await
-                    .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
-                transferred = transferred.saturating_add(count as u64);
-                file_transferred = file_transferred.saturating_add(count as u64);
+            let relative = relative_name(&local, local_path);
+            let Some(sftp) = self.transfer_sessions().into_iter().next() else { break; };
+            let parallel = Arc::clone(&parallel);
+            let transferred_total = Arc::clone(&transferred_total);
+            let progress = progress.clone();
+            workers.spawn(async move {
+                let _permit = parallel.acquire_owned().await.map_err(|e| DownloadError::Worker(e.to_string()))?;
+                let mut buffer = vec![0_u8; UPLOAD_BUFFER];
+                let mut file_transferred = 0_u64;
+                let mut input = fs::File::open(&local).await.map_err(DownloadError::Io)?;
+                let mut output = sftp.create(remote).await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
+                loop {
+                    let count = input.read(&mut buffer).await.map_err(DownloadError::Io)?;
+                    if count == 0 { break; }
+                    output.write_all(&buffer[..count]).await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
+                    transferred_total.fetch_add(count as u64, Ordering::Relaxed);
+                    file_transferred = file_transferred.saturating_add(count as u64);
+                    if let Some(tx) = &progress {
+                        let _ = tx.send(DownloadProgress {
+                            total_bytes: file_size,
+                            transferred_bytes: file_transferred,
+                            completed_segments: 0,
+                            total_segments: 0,
+                            segment: None,
+                            file_path: Some(relative.clone()),
+                            file_complete: false,
+                        });
+                    }
+                }
+                output.close().await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
                 if let Some(tx) = &progress {
                     let _ = tx.send(DownloadProgress {
-                        total_bytes: file_size,
-                        transferred_bytes: file_transferred,
-                        completed_segments: 0,
-                        total_segments: 0,
-                        segment: None,
-                        file_path: Some(relative.clone()),
-                        file_complete: false,
+                        total_bytes: file_size, transferred_bytes: file_transferred,
+                        completed_segments: 0, total_segments: 0, segment: None,
+                        file_path: Some(relative), file_complete: true,
                     });
                 }
-            }
-            output.close().await
-                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
-            if let Some(tx) = &progress {
-                let _ = tx.send(DownloadProgress {
-                    total_bytes: file_size, transferred_bytes: file_transferred,
-                    completed_segments: 0, total_segments: 0, segment: None,
-                    file_path: Some(relative), file_complete: true,
-                });
+                Ok::<(), DownloadError>(())
+            });
+        }
+        while let Some(joined) = workers.join_next().await {
+            let result = joined.unwrap_or_else(|error| Err(DownloadError::Worker(error.to_string())));
+            if let Err(error) = result {
+                workers.abort_all();
+                return Err(error);
             }
         }
+        let transferred = transferred_total.load(Ordering::Relaxed);
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: transferred,
@@ -312,55 +352,68 @@ impl SftpConnection {
                 });
             }
         }
+        let parallel = Arc::new(Semaphore::new(self.network.file_parallelism()));
+        let mut workers = JoinSet::new();
+        for (remote, local, file_size) in files {
+            let relative = relative_name(&local, destination);
+            let sessions = self.transfer_sessions();
+            let parallel = Arc::clone(&parallel);
+            let progress = progress.clone();
+            workers.spawn(async move {
+                let _permit = parallel.acquire_owned().await.map_err(|e| DownloadError::Worker(e.to_string()))?;
+                let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
+                let download = download_file(sessions, &remote, &local, settings, Some(inner_tx));
+                tokio::pin!(download);
+                loop {
+                    tokio::select! {
+                        result = &mut download => {
+                            let result = result?;
+                            if let Some(tx) = &progress {
+                                let _ = tx.send(DownloadProgress {
+                                    total_bytes: result.bytes, transferred_bytes: result.bytes,
+                                    completed_segments: result.segments, total_segments: result.segments,
+                                    segment: None, file_path: Some(relative.clone()), file_complete: true,
+                                });
+                            }
+                            return Ok::<DownloadResult, DownloadError>(result);
+                        }
+                        update = inner_rx.recv() => {
+                            if let (Some(tx), Some(update)) = (&progress, update) {
+                                let segment = update.segment.map(|segment| SegmentProgress {
+                                    index: segment.index,
+                                    start: segment.start,
+                                    end_exclusive: segment.end_exclusive,
+                                    transferred_bytes: segment.transferred_bytes,
+                                    complete: segment.complete,
+                                    failed: segment.failed,
+                                });
+                                let _ = tx.send(DownloadProgress {
+                                    total_bytes: file_size,
+                                    transferred_bytes: update.transferred_bytes,
+                                    completed_segments: update.completed_segments,
+                                    total_segments: update.total_segments,
+                                    segment,
+                                    file_path: Some(relative.clone()), file_complete: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+        }
         let mut completed = 0_u64;
         let mut segment_count = 0_u32;
         let mut segmented = false;
-        for (remote, local, file_size) in files {
-            let relative_path = local.strip_prefix(destination).unwrap_or(&local);
-            let relative = if relative_path.as_os_str().is_empty() {
-                local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
-            } else {
-                relative_path.to_string_lossy().to_string()
-            };
-            let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
-            let download = download_file(Arc::clone(&self.sftp), &remote, &local, settings, Some(inner_tx));
-            tokio::pin!(download);
-            loop {
-                tokio::select! {
-                    result = &mut download => {
-                        let result = result?;
-                        completed = completed.saturating_add(result.bytes);
-                        segment_count = segment_count.saturating_add(result.segments);
-                        segmented |= result.segmented;
-                        if let Some(tx) = &progress {
-                            let _ = tx.send(DownloadProgress {
-                                total_bytes: result.bytes, transferred_bytes: result.bytes,
-                                completed_segments: result.segments, total_segments: result.segments,
-                                segment: None, file_path: Some(relative.clone()), file_complete: true,
-                            });
-                        }
-                        break;
-                    }
-                    update = inner_rx.recv() => {
-                        if let (Some(tx), Some(update)) = (&progress, update) {
-                            let segment = update.segment.map(|segment| SegmentProgress {
-                                index: segment.index,
-                                start: segment.start,
-                                end_exclusive: segment.end_exclusive,
-                                transferred_bytes: segment.transferred_bytes,
-                                complete: segment.complete,
-                                failed: segment.failed,
-                            });
-                            let _ = tx.send(DownloadProgress {
-                                total_bytes: file_size,
-                                transferred_bytes: update.transferred_bytes,
-                                completed_segments: update.completed_segments,
-                                total_segments: update.total_segments,
-                                segment,
-                                file_path: Some(relative.clone()), file_complete: false,
-                            });
-                        }
-                    }
+        while let Some(joined) = workers.join_next().await {
+            match joined.unwrap_or_else(|error| Err(DownloadError::Worker(error.to_string()))) {
+                Ok(result) => {
+                    completed = completed.saturating_add(result.bytes);
+                    segment_count = segment_count.saturating_add(result.segments);
+                    segmented |= result.segmented;
+                }
+                Err(error) => {
+                    workers.abort_all();
+                    return Err(error);
                 }
             }
         }
@@ -372,11 +425,6 @@ impl SftpConnection {
             });
         }
         Ok(DownloadResult { bytes: completed, segments: segment_count, segmented })
-    }
-
-    /// Opens a remote file for sequential reading.
-    pub async fn open_read(&self, path: &str) -> Result<russh_sftp::client::fs::File, ConnectError> {
-        self.sftp.open(path.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
     }
 
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), ConnectError> {
@@ -422,7 +470,30 @@ impl SftpConnection {
         settings: TransferSettings,
         progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
     ) -> Result<DownloadResult, crate::transfer::DownloadError> {
-        download_file(Arc::clone(&self.sftp), remote_path, destination, settings, progress).await
+        download_file(self.transfer_sessions(), remote_path, destination, settings, progress).await
+    }
+}
+
+/// Opens one SSH session channel running the SFTP subsystem.
+async fn open_sftp_channel(
+    ssh: &client::Handle<VerifyHostKey>,
+    network: &NetworkSettings,
+) -> Result<SftpSession, ConnectError> {
+    let channel = ssh.channel_open_session().await.map_err(|e| ConnectError::Ssh(e.to_string()))?;
+    channel.request_subsystem(true, "sftp").await
+        .map_err(|e| ConnectError::Ssh(e.to_string()))?;
+    SftpSession::new_with_config(channel.into_stream(), network.sftp_config()).await
+        .map_err(|e| ConnectError::Sftp(e.to_string()))
+}
+
+/// Path of `path` relative to the transfer root, or its file name when the
+/// root is the file itself.
+fn relative_name(path: &Path, root: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if relative.as_os_str().is_empty() {
+        path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+    } else {
+        relative.to_string_lossy().into_owned()
     }
 }
 

@@ -422,6 +422,7 @@ pub enum Icon {
     Upload,
     Download,
     Warning,
+    Information,
 }
 
 /// Paint `icon` into `rect` (any square size; drawn on a 16-unit grid).
@@ -544,6 +545,12 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
             fill_rect(7.2, 5.0, 8.8, 10.5, Color32::BLACK);
             fill_rect(7.2, 11.8, 8.8, 13.4, Color32::BLACK);
         }
+        Icon::Information => {
+            let center = p(8.0, 8.0);
+            painter.circle(center, 7.2 * scale, c(Color32::from_rgb(30, 90, 200)), Stroke::new(scale.max(1.0), c(Color32::from_rgb(10, 50, 130))));
+            painter.circle_filled(p(8.0, 4.3), 1.2 * scale, Color32::WHITE);
+            fill_rect(7.0, 6.6, 9.0, 12.2, Color32::WHITE);
+        }
     }
 }
 
@@ -570,4 +577,13 @@ pub fn icon_button(ui: &mut Ui, enabled: bool, icon: Icon, tooltip: &str) -> Res
 pub fn message_icon(ui: &mut Ui, icon: Icon) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), Sense::hover());
     paint_icon(ui.painter(), rect, icon, true);
+}
+
+/// Small "Information" icon that explains a setting in its tooltip.
+pub fn info_tip(ui: &mut Ui, text: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        paint_icon(ui.painter(), rect, Icon::Information, true);
+    }
+    response.on_hover_text(text)
 }

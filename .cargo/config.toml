@@ -1,0 +1,8 @@
+# Link the Visual C++ runtime statically on Windows, so the .exe runs on PCs
+# without the "Visual C++ Redistributable" (VCRUNTIME140.dll and the UCRT DLLs).
+# aws-lc-sys (the C crypto library behind russh) honours this flag as well.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
