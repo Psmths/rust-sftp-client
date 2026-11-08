@@ -430,6 +430,7 @@ impl SftpApp {
         });
         let slots = self.transfer_slots.clone();
         let tx = self.queue_tx.clone();
+        let remote_destination_for_task = remote_destination.clone();
         self.runtime.spawn(async move {
             let _permit = match slots.acquire_owned().await {
                 Ok(permit) => permit,
@@ -440,7 +441,7 @@ impl SftpApp {
             };
             let _ = tx.send(QueueEvent::Started { id, state: "Uploading".into() });
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-            let upload = connection.upload_path(&local_path, &remote_destination, Some(progress_tx));
+            let upload = connection.upload_path(&local_path, &remote_destination_for_task, Some(progress_tx));
             tokio::pin!(upload);
             loop {
                 tokio::select! {
@@ -475,6 +476,8 @@ impl SftpApp {
         let settings = self.transfer;
         let slots = self.transfer_slots.clone();
         let tx = self.queue_tx.clone();
+        let remote_path_for_task = remote_path.clone();
+        let destination_for_task = destination.clone();
         self.runtime.spawn(async move {
             let _permit = match slots.acquire_owned().await {
                 Ok(permit) => permit,
@@ -485,7 +488,7 @@ impl SftpApp {
             };
             let _ = tx.send(QueueEvent::Started { id, state: "Downloading".into() });
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-            let download = connection.download_path(&remote_path, &destination, settings, Some(progress_tx));
+            let download = connection.download_path(&remote_path_for_task, &destination_for_task, settings, Some(progress_tx));
             tokio::pin!(download);
             loop {
                 tokio::select! {
