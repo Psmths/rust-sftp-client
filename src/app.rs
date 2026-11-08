@@ -590,7 +590,8 @@ impl SftpApp {
         let filter = self.remote_filter.to_lowercase();
         let mut rows: Vec<RemoteEntry> = self.remote_entries.iter()
             .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
-        if self.remote_path.trim_end_matches('/') != "/" {
+        let remote_path_trimmed = self.remote_path.trim_end_matches('/');
+        if !remote_path_trimmed.is_empty() && remote_path_trimmed != "/" {
             rows.insert(0, RemoteEntry {
                 name: "..".into(), path: remote_parent(&self.remote_path), dir: true,
                 size: 0, modified: "—".into(),
