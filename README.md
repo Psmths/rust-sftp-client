@@ -1,12 +1,12 @@
 # Rust SFTP Client
 
-A native Rust desktop SFTP client with an information-dense, analyst-workstation interface inspired by the Tiramisu-TL WebUI. The application is rendered directly with egui; it does not embed a web frontend.
+A native Rust desktop SFTP client with an information-dense, analyst-workstation interface inspired by the Tiramisu-TL WebUI. The application is rendered directly with eframe/egui; it does not embed a web frontend.
 
-> **Status:** Early development. The native desktop shell and local filesystem pane are implemented. The Rust core contains validated connection-profile types, a tested segmented-download planner, and a streaming range-download engine. The desktop connection/profile/remote-browser workflow is still being integrated.
+> **Status:** The native dual-pane UI, local and remote filesystem browsing, password and private-key SSH authentication, explicit SSH host-key pinning, and segmented download queue are integrated. Upload, SSH-agent authentication, and transfer cancellation are not implemented yet. Build and runtime verification are still required on the target system.
 
 ## Technology
 
-- **eframe + egui** for the native Rust desktop interface.
+- **eframe + egui** for the native desktop interface.
 - **Tokio** for asynchronous networking and transfer orchestration.
 - **russh 0.63.x** for SSH transport and authentication.
 - **russh-sftp 3.0.1** for SFTP v3.
@@ -16,61 +16,52 @@ There is no Tauri, React, TypeScript, Vite, Node.js, or NPM build step.
 
 ## Build
 
-Run these commands from the repository root:
-
 ```bash
-cargo run --release
-```
-
-Build an optimized binary without launching it:
-
-```bash
+cargo test
 cargo build --release
 ```
 
 The executable is written to `target/release/rust-sftp-client`.
 
-## Interface
+## Implemented workflows
 
-- Dense dual-pane local/remote workspace.
-- Compact file rows with size, modification time, and type.
-- Local filesystem navigation, parent navigation, and filtering.
-- Persistent session/navigation sidebar.
-- Transfer activity panel and connection status.
-- Connection profile form and segmented-transfer settings.
+- Save and load non-secret connection profiles.
+- Authenticate with SSH passwords or an unencrypted private-key file.
+- Verify server keys using SHA-256 fingerprints. Unknown keys are rejected until explicitly trusted; a changed pinned key is rejected and cannot be silently replaced.
+- Store trusted fingerprints in `~/.config/rust-sftp-client/known_hosts.json`.
+- Browse remote directories, navigate into directories and to the parent, and filter remote entries.
+- Select multiple remote files with Ctrl/Command-click and download them into the current local pane directory.
+- Show queued, active, completed, and failed downloads with byte progress.
+- Download large files through the existing bounded, retrying segmented range-download engine.
+- Open connection, password, host-key trust, error, and transfer-settings prompts in separate native windows.
 
 ## Segmented downloads
 
-The transfer core now includes a streaming SFTP range-download engine:
+1. Read remote metadata and obtain the file size.
+2. Split large files into contiguous, non-overlapping byte ranges.
+3. Open an independent SFTP file handle for each range and seek to its starting offset.
+4. Stream each range to a temporary part file using a bounded memory buffer.
+5. Retry failed ranges up to three times.
+6. Assemble parts in byte order, flush the output, validate the final size, and rename it into place.
+7. Emit byte and segment progress to the desktop transfer queue.
 
-1. Reads remote file metadata and obtains its size.
-2. Uses the existing range planner to split large files into contiguous, non-overlapping byte ranges.
-3. Opens an independent SFTP file handle for each range and seeks to its starting offset.
-4. Streams each range to a separate temporary part file using a bounded memory buffer.
-5. Retries failed ranges up to three times.
-6. Assembles completed parts in byte order, flushes the output, checks the final byte count, and renames the completed file into place.
-7. Emits byte and segment progress through a Tokio unbounded channel.
+All segments share one authenticated SFTP session and use independent SFTP file handles. Persistent cross-process resume and parallel independent SSH sessions are not implemented.
 
-Files below the configured threshold use a single range. Zero-byte files are handled without issuing a range read. A failed segment prevents finalization, so an incomplete download is never presented as a completed destination file.
-
-The engine is exposed as `transfer::download_file`; the desktop queue still needs to invoke it and render its progress events. Persistent cross-process resume and parallel independent SSH sessions are not implemented yet; segments currently share one authenticated SFTP session while using separate SFTP file handles.
-
-## Initial defaults
+## Initial transfer defaults
 
 | Setting | Default |
 |---|---:|
 | Segmentation threshold | 64 MiB |
-| Concurrent segments per file | 8 |
 | Target segment size | 8 MiB |
+| Maximum segments per file | 8 |
 | Maximum concurrent transfers | 4 |
 | Segment retry attempts | 3 |
 
-## Security
+## Security notes
 
-- Never store plaintext passwords in connection profiles.
-- Verify SSH host keys and make trust changes explicit; changed keys must never be silently accepted.
-- Keep private-key material out of logs and UI state.
-- Use restrictive permissions for temporary transfer state and partial files.
-- Treat remote filenames and server-provided metadata as untrusted input.
+- Passwords are not persisted in connection profiles.
+- Unknown SSH host keys require an explicit trust action.
+- Changed host keys are rejected; the existing pin is not overwritten.
+- Private-key contents and passwords are not written to profile storage.
 
-See `docs/architecture.md` and `docs/transfer-engine.md` for implementation constraints.
+The trust-store file should be protected by the local user's filesystem permissions. Encrypted private-key passphrases, OS keychain integration, SSH-agent authentication, upload, and transfer cancellation remain future work.
