@@ -229,6 +229,7 @@ impl SftpConnection {
                         total_segments: 0,
                         segment: None,
                         file_path: Some(relative.clone()),
+                        file_complete: false,
                     });
                 }
             }
@@ -245,7 +246,8 @@ impl SftpConnection {
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: transferred,
-                completed_segments: 0, total_segments: 0, segment: None, file_path: None,
+                completed_segments: 0, total_segments: 0, segment: None,
+                file_path: None, file_complete: false,
             });
         }
         Ok(DownloadResult { bytes: transferred, segments: 0, segmented: false })
@@ -366,7 +368,7 @@ impl SftpConnection {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: completed,
                 completed_segments: segment_count, total_segments: segment_count,
-                segment: None, file_path: None,
+                segment: None, file_path: None, file_complete: false,
             });
         }
         Ok(DownloadResult { bytes: completed, segments: segment_count, segmented })
