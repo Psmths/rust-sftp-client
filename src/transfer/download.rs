@@ -186,10 +186,16 @@ pub async fn download_file(
     output.sync_all()?;
     drop(output);
 
+    // The file is pre-sized, so metadata length alone cannot prove every byte
+    // was received. Verify the successful segment byte count as well.
+    let written = transferred.load(std::sync::atomic::Ordering::Relaxed);
     let actual = fs::metadata(&temp_destination).await?.len();
-    if actual != size {
+    if written != size || actual != size {
         let _ = fs::remove_file(&temp_destination).await;
-        return Err(DownloadError::SizeMismatch { expected: size, actual });
+        return Err(DownloadError::SizeMismatch {
+            expected: size,
+            actual: written.min(actual),
+        });
     }
 
     publish_temporary_file(&temp_destination, destination).await?;
