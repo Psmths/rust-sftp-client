@@ -117,9 +117,8 @@ impl SftpConnection {
         }
 
         let channel = ssh.channel_open_session().await.map_err(|e| ConnectError::Ssh(e.to_string()))?;
-        if !channel.request_subsystem(true, "sftp").await.map_err(|e| ConnectError::Ssh(e.to_string()))? {
-            return Err(ConnectError::SubsystemRejected);
-        }
+        channel.request_subsystem(true, "sftp").await
+            .map_err(|e| ConnectError::Ssh(e.to_string()))?;
         let sftp = SftpSession::new(channel.into_stream()).await
             .map_err(|e| ConnectError::Sftp(e.to_string()))?;
 

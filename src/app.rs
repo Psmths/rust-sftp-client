@@ -118,7 +118,7 @@ impl SftpApp {
             egui::Grid::new("local_rows").num_columns(4).striped(true).min_col_width(0.0).show(ui, |ui| {
                 for e in rows {
                     let label = egui::RichText::new(&e.name).monospace();
-                    let response = ui.add_sized([ui.available_width().max(180.0),22.0], egui::SelectableLabel::new(self.selected.as_ref()==Some(&e.path), label));
+                    let response = ui.add_sized([ui.available_width().max(180.0),22.0], egui::Button::selectable(self.selected.as_ref()==Some(&e.path), label));
                     if response.clicked() { self.selected = Some(e.path.clone()); }
                     if response.double_clicked() && e.dir { self.path=e.path.clone(); self.selected=None; self.refresh(); }
                     ui.add_sized([76.0,22.0],egui::Label::new(egui::RichText::new(if e.dir {"—".into()} else {size_text(e.size)}).small().monospace()).halign(egui::Align::LEFT));
