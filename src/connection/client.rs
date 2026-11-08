@@ -194,6 +194,13 @@ impl SftpConnection {
                 relative_path.to_string_lossy().to_string()
             };
             let mut file_transferred = 0_u64;
+            if let Some(tx) = &progress {
+                let _ = tx.send(DownloadProgress {
+                    total_bytes: file_size, transferred_bytes: 0,
+                    completed_segments: 0, total_segments: 0, segment: None,
+                    file_path: Some(relative.clone()),
+                });
+            }
             let mut input = fs::File::open(&local).await
                 .map_err(crate::transfer::DownloadError::Io)?;
             let mut output = self.sftp.create(remote).await
@@ -292,6 +299,13 @@ impl SftpConnection {
             let file_size = self.sftp.metadata(remote.clone()).await
                 .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?
                 .size.unwrap_or(0);
+            if let Some(tx) = &progress {
+                let _ = tx.send(DownloadProgress {
+                    total_bytes: file_size, transferred_bytes: 0,
+                    completed_segments: 0, total_segments: 0, segment: None,
+                    file_path: Some(relative.clone()),
+                });
+            }
             let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
             let download = download_file(Arc::clone(&self.sftp), &remote, &local, settings, Some(inner_tx));
             tokio::pin!(download);

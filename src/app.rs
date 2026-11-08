@@ -575,7 +575,7 @@ impl SftpApp {
                                 item.segments.sort_by_key(|s| s.index);
                             }
                         }
-                        if item.state != "Uploading" {
+                        if item.state != "Uploading" && item.state != "Complete" {
                             item.state = "Downloading".into();
                         }
                     }
@@ -602,11 +602,13 @@ impl SftpApp {
                         Err(error) => {
                             let mut marked = false;
                             for item in self.transfers.iter_mut().filter(|item| item.operation_id == Some(id)) {
-                                item.finished_at = Some(Instant::now());
-                                for segment in &mut item.segments {
-                                    if !segment.complete { segment.failed = true; }
+                                if item.state != "Complete" {
+                                    item.finished_at = Some(Instant::now());
+                                    for segment in &mut item.segments {
+                                        if !segment.complete { segment.failed = true; }
+                                    }
+                                    item.state = format!("Failed: {error}");
                                 }
-                                item.state = format!("Failed: {error}");
                                 marked = true;
                             }
                             if !marked {
