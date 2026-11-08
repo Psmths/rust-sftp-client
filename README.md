@@ -33,6 +33,15 @@ tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.1.0-build.42`), with
 a `SHA256SUMS.txt` file and notes listing the changes since the previous release. Manual runs
 only build.
 
+## Troubleshooting startup
+
+The Windows build draws with Direct3D 12 (via wgpu), which also works in virtual machines without GPU
+drivers; Linux uses OpenGL. If the preferred renderer fails, the app restarts itself once with the other
+one. If both fail, an error dialog explains why and the details are appended to
+`startup-error.log` in the config folder (`~/.config/rust-sftp-client/` or
+`%USERPROFILE%\.config\rust-sftp-client\`). A renderer can be forced with the
+`RUST_SFTP_CLIENT_RENDERER` environment variable (`wgpu` or `glow`).
+
 ## Implemented workflows
 
 - Save and load non-secret connection profiles.
