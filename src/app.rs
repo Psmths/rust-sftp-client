@@ -777,7 +777,7 @@ impl eframe::App for SftpApp {
                     egui::Grid::new("transfer_queue").num_columns(4).striped(true).show(ui, |ui| {
                         for item in &self.transfers {
                             ui.label(egui::RichText::new(&item.name).monospace().small());
-                            if item.segments.is_empty() {
+                            if item.segments.len() <= 1 {
                                 let fraction = if item.total == 0 { if item.state == "Complete" { 1.0 } else { 0.0 } }
                                     else { item.transferred as f32 / item.total as f32 };
                                 ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(180.0)
@@ -799,16 +799,27 @@ impl eframe::App for SftpApp {
                                         egui::pos2(x0, bar_rect.top()),
                                         egui::vec2(segment_width.max(1.0), bar_rect.height())
                                     );
-                                    let color = if segment.failed {
+                                    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(48, 53, 62));
+                                    let fill_fraction = if segment.complete {
+                                        1.0
+                                    } else {
+                                        segment.transferred_bytes as f32
+                                            / (segment.end_exclusive - segment.start).max(1) as f32
+                                    }.clamp(0.0, 1.0);
+                                    let fill_color = if segment.failed {
                                         egui::Color32::from_rgb(190, 65, 65)
                                     } else if segment.complete {
                                         egui::Color32::from_rgb(65, 170, 105)
-                                    } else if segment.transferred_bytes > 0 {
-                                        egui::Color32::from_rgb(65, 135, 205)
                                     } else {
-                                        egui::Color32::from_rgb(65, 70, 80)
+                                        egui::Color32::from_rgb(65, 135, 205)
                                     };
-                                    painter.rect_filled(rect, 2.0, color);
+                                    if fill_fraction > 0.0 || segment.failed {
+                                        let fill_width = if segment.failed { rect.width() } else { rect.width() * fill_fraction };
+                                        let fill_rect = egui::Rect::from_min_size(
+                                            rect.min, egui::vec2(fill_width.max(1.0).min(rect.width()), rect.height())
+                                        );
+                                        painter.rect_filled(fill_rect, 2.0, fill_color);
+                                    }
                                 }
                                 if response.hovered() {
                                     response.on_hover_text(format!(
