@@ -20,11 +20,22 @@ const RETRIES: usize = 3;
 const BUFFER_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
+pub struct SegmentProgress {
+    pub index: u32,
+    pub start: u64,
+    pub end_exclusive: u64,
+    pub transferred_bytes: u64,
+    pub complete: bool,
+    pub failed: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct DownloadProgress {
     pub total_bytes: u64,
     pub transferred_bytes: u64,
     pub completed_segments: u32,
     pub total_segments: u32,
+    pub segment: Option<SegmentProgress>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +91,7 @@ pub async fn download_file(
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: 0, transferred_bytes: 0,
-                completed_segments: 0, total_segments: 0,
+                completed_segments: 0, total_segments: 0, segment: None,
             });
         }
         return Ok(DownloadResult { bytes: 0, segments: 0, segmented: false });
@@ -90,6 +101,25 @@ pub async fn download_file(
     fs::create_dir_all(parent).await?;
     let work_dir = temporary_directory(destination);
     fs::create_dir_all(&work_dir).await?;
+
+    if let Some(tx) = &progress {
+        for range in &plan.segments {
+            let _ = tx.send(DownloadProgress {
+                total_bytes: size,
+                transferred_bytes: 0,
+                completed_segments: 0,
+                total_segments,
+                segment: Some(SegmentProgress {
+                    index: range.index,
+                    start: range.start,
+                    end_exclusive: range.end_exclusive,
+                    transferred_bytes: 0,
+                    complete: false,
+                    failed: false,
+                }),
+            });
+        }
+    }
 
     let transferred = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -198,6 +228,10 @@ async fn fetch_segment(
                         transferred_bytes: now,
                         completed_segments: completed.load(std::sync::atomic::Ordering::Relaxed),
                         total_segments,
+                        segment: Some(SegmentProgress {
+                            index: range.index, start: range.start, end_exclusive: range.end_exclusive,
+                            transferred_bytes: attempt_transferred, complete: false, failed: false,
+                        }),
                     });
                 }
             }
@@ -216,6 +250,10 @@ async fn fetch_segment(
                         transferred_bytes: transferred.load(std::sync::atomic::Ordering::Relaxed),
                         completed_segments: done,
                         total_segments,
+                        segment: Some(SegmentProgress {
+                            index: range.index, start: range.start, end_exclusive: range.end_exclusive,
+                            transferred_bytes: range.len(), complete: true, failed: false,
+                        }),
                     });
                 }
                 return Ok(());
@@ -230,6 +268,10 @@ async fn fetch_segment(
                             transferred_bytes: transferred.load(std::sync::atomic::Ordering::Relaxed),
                             completed_segments: completed.load(std::sync::atomic::Ordering::Relaxed),
                             total_segments,
+                            segment: Some(SegmentProgress {
+                                index: range.index, start: range.start, end_exclusive: range.end_exclusive,
+                                transferred_bytes: 0, complete: false, failed: false,
+                            }),
                         });
                     }
                 }
@@ -239,6 +281,19 @@ async fn fetch_segment(
                 }
             }
         }
+    }
+
+    if let Some(tx) = &progress {
+        let _ = tx.send(DownloadProgress {
+            total_bytes: total_size,
+            transferred_bytes: transferred.load(std::sync::atomic::Ordering::Relaxed),
+            completed_segments: completed.load(std::sync::atomic::Ordering::Relaxed),
+            total_segments,
+            segment: Some(SegmentProgress {
+                index: range.index, start: range.start, end_exclusive: range.end_exclusive,
+                transferred_bytes: 0, complete: false, failed: true,
+            }),
+        });
     }
 
     Err(DownloadError::Segment {

@@ -12,7 +12,7 @@ use crate::connection::{
     load_trusted_fingerprint, trust_host_key, AuthMethod, ConnectError, ConnectionProfile,
     SftpConnection,
 };
-use crate::transfer::{DownloadProgress, DownloadResult, TransferSettings};
+use crate::transfer::{DownloadProgress, DownloadResult, SegmentProgress, TransferSettings};
 
 #[derive(Clone)]
 struct LocalEntry {
@@ -39,6 +39,7 @@ struct TransferItem {
     destination: PathBuf,
     transferred: u64,
     total: u64,
+    segments: Vec<SegmentProgress>,
     state: String,
 }
 
@@ -350,6 +351,7 @@ impl SftpApp {
                 destination: destination.clone(),
                 transferred: 0,
                 total: entry.size,
+                segments: Vec::new(),
                 state: "Queued".into(),
             });
             let connection = connection.clone();
@@ -393,6 +395,14 @@ impl SftpApp {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
                         item.transferred = progress.transferred_bytes;
                         item.total = progress.total_bytes;
+                        if let Some(segment) = progress.segment {
+                            if let Some(existing) = item.segments.iter_mut().find(|s| s.index == segment.index) {
+                                *existing = segment;
+                            } else {
+                                item.segments.push(segment);
+                                item.segments.sort_by_key(|s| s.index);
+                            }
+                        }
                         item.state = "Downloading".into();
                     }
                 }
@@ -404,7 +414,12 @@ impl SftpApp {
                                 item.total = result.bytes;
                                 item.state = "Complete".into();
                             }
-                            Err(error) => item.state = format!("Failed: {error}"),
+                            Err(error) => {
+                                for segment in &mut item.segments {
+                                    if !segment.complete { segment.failed = true; }
+                                }
+                                item.state = format!("Failed: {error}");
+                            },
                         }
                     }
                 }
@@ -762,10 +777,46 @@ impl eframe::App for SftpApp {
                     egui::Grid::new("transfer_queue").num_columns(4).striped(true).show(ui, |ui| {
                         for item in &self.transfers {
                             ui.label(egui::RichText::new(&item.name).monospace().small());
-                            let fraction = if item.total == 0 { if item.state == "Complete" { 1.0 } else { 0.0 } }
-                                else { item.transferred as f32 / item.total as f32 };
-                            ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(180.0)
-                                .text(format!("{} / {}", size_text(item.transferred), size_text(item.total))));
+                            if item.segments.is_empty() {
+                                let fraction = if item.total == 0 { if item.state == "Complete" { 1.0 } else { 0.0 } }
+                                    else { item.transferred as f32 / item.total as f32 };
+                                ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(180.0)
+                                    .text(format!("{} / {}", size_text(item.transferred), size_text(item.total))));
+                            } else {
+                                let (bar_rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(220.0, 16.0), egui::Sense::hover()
+                                );
+                                let painter = ui.painter();
+                                let gap = 2.0;
+                                let total_width = (bar_rect.width() - gap * (item.segments.len().saturating_sub(1) as f32)).max(0.0);
+                                for segment in &item.segments {
+                                    let segment_width = total_width * (segment.end_exclusive - segment.start) as f32
+                                        / item.total.max(1) as f32;
+                                    let x0 = bar_rect.left() + total_width
+                                        * segment.start as f32 / item.total.max(1) as f32
+                                        + gap * segment.index as f32;
+                                    let rect = egui::Rect::from_min_size(
+                                        egui::pos2(x0, bar_rect.top()),
+                                        egui::vec2(segment_width.max(1.0), bar_rect.height())
+                                    );
+                                    let color = if segment.failed {
+                                        egui::Color32::from_rgb(190, 65, 65)
+                                    } else if segment.complete {
+                                        egui::Color32::from_rgb(65, 170, 105)
+                                    } else if segment.transferred_bytes > 0 {
+                                        egui::Color32::from_rgb(65, 135, 205)
+                                    } else {
+                                        egui::Color32::from_rgb(65, 70, 80)
+                                    };
+                                    painter.rect_filled(rect, 2.0, color);
+                                }
+                                if response.hovered() {
+                                    response.on_hover_text(format!(
+                                        "{} segments · {} / {}",
+                                        item.segments.len(), size_text(item.transferred), size_text(item.total)
+                                    ));
+                                }
+                            }
                             ui.label(egui::RichText::new(&item.state).small());
                             ui.label(egui::RichText::new(item.destination.display().to_string()).small().weak());
                             ui.end_row();
