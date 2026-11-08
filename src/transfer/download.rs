@@ -15,7 +15,7 @@ use std::{
 use russh_sftp::client::SftpSession;
 use tokio::{
     fs,
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncSeekExt},
     sync::{mpsc, Semaphore},
     task::JoinSet,
 };
@@ -160,14 +160,22 @@ pub async fn download_file(
     while let Some(joined) = workers.join_next().await {
         match joined {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => { failure = Some(error); workers.abort_all(); break; }
-            Err(error) => { failure = Some(DownloadError::Worker(error.to_string())); workers.abort_all(); break; }
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+            Err(error) => {
+                if failure.is_none() {
+                    failure = Some(DownloadError::Worker(error.to_string()));
+                }
+            }
         }
     }
 
-    // Drain aborted workers before closing the output handle. This matters on
-    // Windows, where an open handle can prevent cleanup or rename operations.
-    while workers.join_next().await.is_some() {}
+    // Let every worker exit before closing the output handle. In particular,
+    // this ensures no spawn_blocking positional write is still active on
+    // Windows when the temporary file is cleaned up or renamed.
 
     if let Some(error) = failure {
         drop(output);
