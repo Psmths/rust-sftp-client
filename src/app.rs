@@ -137,11 +137,17 @@ impl SftpApp {
             egui::Window::new("Connection profiles").collapsible(false).resizable(false).show(ctx, |ui| {
                 if !self.saved_profiles.is_empty() {
                     let selected = self.selected_profile.map(|i| self.saved_profiles[i].name.clone()).unwrap_or_else(|| "Select saved profile".into());
+                    let mut profile_to_apply = None;
                     egui::ComboBox::from_id_salt("saved_profiles").selected_text(selected).show_ui(ui, |ui| {
-                        for (i,p) in self.saved_profiles.iter().enumerate() {
-                            if ui.selectable_label(self.selected_profile==Some(i), &p.name).clicked() { self.apply_profile(i); }
+                        for (i, p) in self.saved_profiles.iter().enumerate() {
+                            if ui.selectable_label(self.selected_profile == Some(i), &p.name).clicked() {
+                                profile_to_apply = Some(i);
+                            }
                         }
                     });
+                    if let Some(index) = profile_to_apply {
+                        self.apply_profile(index);
+                    }
                     ui.separator();
                 }
                 ui.label("PROFILE NAME");
