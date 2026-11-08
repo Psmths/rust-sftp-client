@@ -44,6 +44,8 @@ pub struct DownloadProgress {
     pub segment: Option<SegmentProgress>,
     /// Relative path of the file within a recursive transfer.
     pub file_path: Option<String>,
+    /// True only for the terminal update of an individual recursive file.
+    pub file_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +116,8 @@ pub async fn download_file(
                 total_bytes: 0, transferred_bytes: 0,
                 completed_segments: 0, total_segments: 0, segment: None,
             
-                file_path: None,});
+                file_path: None,
+                file_complete: false,});
         }
         return Ok(DownloadResult { bytes: 0, segments: 0, segmented: false });
     }
@@ -132,7 +135,8 @@ pub async fn download_file(
                     transferred_bytes: 0, complete: false, failed: false,
                 }),
             
-                file_path: None,});
+                file_path: None,
+                file_complete: false,});
         }
     }
 
@@ -272,7 +276,8 @@ async fn fetch_segment(
                             transferred_bytes: attempt_transferred, complete: false, failed: false,
                         }),
                     
-                file_path: None,});
+                file_path: None,
+                file_complete: false,});
                 }
             }
             Ok::<(), String>(())
@@ -291,7 +296,8 @@ async fn fetch_segment(
                             transferred_bytes: range.len(), complete: true, failed: false,
                         }),
                     
-                file_path: None,});
+                file_path: None,
+                file_complete: false,});
                 }
                 return Ok(());
             }
@@ -310,7 +316,8 @@ async fn fetch_segment(
                                 transferred_bytes: 0, complete: false, failed: false,
                             }),
                         
-                file_path: None,});
+                file_path: None,
+                file_complete: false,});
                     }
                 }
                 if attempt < RETRIES {
@@ -331,7 +338,8 @@ async fn fetch_segment(
                 transferred_bytes: 0, complete: false, failed: true,
             }),
         
-                file_path: None,});
+                file_path: None,
+                file_complete: false,});
     }
 
     Err(DownloadError::Segment { index: range.index, attempts: RETRIES, message: last_error })

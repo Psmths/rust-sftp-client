@@ -184,6 +184,21 @@ impl SftpConnection {
             }
         }
 
+        if let Some(tx) = &progress {
+            for (local, _, file_size) in &files {
+                let relative_path = local.strip_prefix(local_path).unwrap_or(local);
+                let relative = if relative_path.as_os_str().is_empty() {
+                    local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+                } else {
+                    relative_path.to_string_lossy().to_string()
+                };
+                let _ = tx.send(DownloadProgress {
+                    total_bytes: *file_size, transferred_bytes: 0,
+                    completed_segments: 0, total_segments: 0, segment: None,
+                    file_path: Some(relative), file_complete: false,
+                });
+            }
+        }
         let mut transferred = 0_u64;
         let mut buffer = vec![0_u8; 256 * 1024];
         for (local, remote, file_size) in files {
@@ -194,13 +209,6 @@ impl SftpConnection {
                 relative_path.to_string_lossy().to_string()
             };
             let mut file_transferred = 0_u64;
-            if let Some(tx) = &progress {
-                let _ = tx.send(DownloadProgress {
-                    total_bytes: file_size, transferred_bytes: 0,
-                    completed_segments: 0, total_segments: 0, segment: None,
-                    file_path: Some(relative.clone()),
-                });
-            }
             let mut input = fs::File::open(&local).await
                 .map_err(crate::transfer::DownloadError::Io)?;
             let mut output = self.sftp.create(remote).await
@@ -230,7 +238,7 @@ impl SftpConnection {
                 let _ = tx.send(DownloadProgress {
                     total_bytes: file_size, transferred_bytes: file_transferred,
                     completed_segments: 0, total_segments: 0, segment: None,
-                    file_path: Some(relative),
+                    file_path: Some(relative), file_complete: true,
                 });
             }
         }
@@ -255,7 +263,7 @@ impl SftpConnection {
         let root_meta = self.sftp.metadata(remote_path.to_owned()).await
             .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
         let mut directories: Vec<PathBuf> = Vec::new();
-        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
         let mut stack = vec![(remote_path.to_owned(), destination.to_path_buf(), root_meta)];
         let mut total = 0_u64;
 
@@ -272,8 +280,9 @@ impl SftpConnection {
                     stack.push((child_remote, local.join(&name), attrs));
                 }
             } else {
-                total = total.saturating_add(metadata.size.unwrap_or(0));
-                files.push((remote, local));
+                let file_size = metadata.size.unwrap_or(0);
+                total = total.saturating_add(file_size);
+                files.push((remote, local, file_size));
             }
         }
 
@@ -286,26 +295,31 @@ impl SftpConnection {
                 .map_err(crate::transfer::DownloadError::Io)?;
         }
 
+        if let Some(tx) = &progress {
+            for (_, local, file_size) in &files {
+                let relative_path = local.strip_prefix(destination).unwrap_or(local);
+                let relative = if relative_path.as_os_str().is_empty() {
+                    local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+                } else {
+                    relative_path.to_string_lossy().to_string()
+                };
+                let _ = tx.send(DownloadProgress {
+                    total_bytes: *file_size, transferred_bytes: 0,
+                    completed_segments: 0, total_segments: 0, segment: None,
+                    file_path: Some(relative), file_complete: false,
+                });
+            }
+        }
         let mut completed = 0_u64;
         let mut segment_count = 0_u32;
         let mut segmented = false;
-        for (remote, local) in files {
+        for (remote, local, file_size) in files {
             let relative_path = local.strip_prefix(destination).unwrap_or(&local);
             let relative = if relative_path.as_os_str().is_empty() {
                 local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
             } else {
                 relative_path.to_string_lossy().to_string()
             };
-            let file_size = self.sftp.metadata(remote.clone()).await
-                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?
-                .size.unwrap_or(0);
-            if let Some(tx) = &progress {
-                let _ = tx.send(DownloadProgress {
-                    total_bytes: file_size, transferred_bytes: 0,
-                    completed_segments: 0, total_segments: 0, segment: None,
-                    file_path: Some(relative.clone()),
-                });
-            }
             let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
             let download = download_file(Arc::clone(&self.sftp), &remote, &local, settings, Some(inner_tx));
             tokio::pin!(download);
@@ -320,7 +334,7 @@ impl SftpConnection {
                             let _ = tx.send(DownloadProgress {
                                 total_bytes: result.bytes, transferred_bytes: result.bytes,
                                 completed_segments: result.segments, total_segments: result.segments,
-                                segment: None, file_path: Some(relative.clone()),
+                                segment: None, file_path: Some(relative.clone()), file_complete: true,
                             });
                         }
                         break;
@@ -341,7 +355,7 @@ impl SftpConnection {
                                 completed_segments: update.completed_segments,
                                 total_segments: update.total_segments,
                                 segment,
-                                file_path: Some(relative.clone()),
+                                file_path: Some(relative.clone()), file_complete: false,
                             });
                         }
                     }

@@ -448,6 +448,9 @@ impl SftpApp {
             loop {
                 tokio::select! {
                     result = &mut upload => {
+                        while let Ok(progress) = progress_rx.try_recv() {
+                            let _ = tx.send(QueueEvent::Progress { id, progress });
+                        }
                         let _ = tx.send(QueueEvent::Finished { id, result: result.map_err(|e| e.to_string()) });
                         break;
                     }
@@ -495,6 +498,9 @@ impl SftpApp {
             loop {
                 tokio::select! {
                     result = &mut download => {
+                        while let Ok(progress) = progress_rx.try_recv() {
+                            let _ = tx.send(QueueEvent::Progress { id, progress });
+                        }
                         let _ = tx.send(QueueEvent::Finished { id, result: result.map_err(|e| e.to_string()) });
                         break;
                     }
@@ -563,7 +569,7 @@ impl SftpApp {
                         }
                         item.transferred = progress.transferred_bytes;
                         item.total = progress.total_bytes;
-                        if progress.file_path.is_some() && progress.transferred_bytes >= progress.total_bytes {
+                        if progress.file_complete {
                             item.finished_at = Some(now);
                             item.state = "Complete".into();
                         }
