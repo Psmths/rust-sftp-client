@@ -1,0 +1,23 @@
+[package]
+name = "rsftp-turbo-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Wire protocol and client of rsftp-turbo, the UDP download accelerator of Rust SFTP Client"
+publish = false
+
+[dependencies]
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+serde = { version = "1", features = ["derive"] }
+socket2 = "0.6"
+tokio = { version = "1", features = ["net", "time"] }
+# Segment verification (fast, non-cryptographic: packets are already
+# authenticated by AES-GCM; this catches corruption and changed files).
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# UDP GRO receives on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["socket", "uio", "net"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

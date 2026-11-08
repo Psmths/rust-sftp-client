@@ -10,7 +10,8 @@ pub enum AuthMethod {
     SshAgent,
 }
 
-/// A non-secret saved connection profile.
+/// A non-secret saved connection profile. Passwords are kept in the system
+/// credential store (see `credentials`), never in the profile itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionProfile {
@@ -21,6 +22,9 @@ pub struct ConnectionProfile {
     pub auth_method: AuthMethod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key_path: Option<String>,
+    /// Whether the password for this login is saved in the credential store.
+    #[serde(default)]
+    pub save_password: bool,
 }
 
 impl ConnectionProfile {
@@ -61,6 +65,7 @@ mod tests {
             name: "Lab".into(), host: "sftp.example.test".into(), port: 22,
             username: "analyst".into(), auth_method: AuthMethod::Password,
             private_key_path: None,
+            save_password: true,
         }
     }
 
@@ -79,6 +84,13 @@ mod tests {
         let mut value = profile();
         value.auth_method = AuthMethod::PrivateKey;
         assert_eq!(value.validate(), Err(ProfileError::MissingPrivateKeyPath));
+    }
+
+    #[test]
+    fn profiles_without_the_flag_do_not_save_passwords() {
+        let json = r#"{"name":"Lab","host":"h","port":22,"username":"u","authMethod":"password"}"#;
+        let parsed: ConnectionProfile = serde_json::from_str(json).expect("old profile parses");
+        assert!(!parsed.save_password);
     }
 
     #[test]

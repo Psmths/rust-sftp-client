@@ -45,19 +45,27 @@ jobs:
             build-essential cmake perl pkg-config libssl-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libasound2-dev
+            libgl1-mesa-dev libegl1-mesa-dev libasound2-dev musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Add the static Linux target for the server helper
+        if: runner.os == 'Linux'
+        run: rustup target add x86_64-unknown-linux-musl
 
       - name: Cache Cargo registry and build output
         uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Build the rsftp-turbo server helper (static)
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked -p rsftp-turbo --target x86_64-unknown-linux-musl
 
       - name: Check the Windows binary needs no Visual C++ runtime DLLs
         if: runner.os == 'Windows'
@@ -77,6 +85,11 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C target/release rust-sftp-client
+          # Server helper: static binary + systemd unit + installer.
+          mkdir -p staging/rsftp-turbo
+          cp target/x86_64-unknown-linux-musl/release/rsftp-turbo staging/rsftp-turbo/
+          cp crates/turbo-server/dist/* staging/rsftp-turbo/
+          tar -czf dist/rsftp-turbo-linux-x86_64.tar.gz -C staging rsftp-turbo
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -114,7 +127,7 @@ jobs:
       - name: Write checksums
         working-directory: dist
         run: |
-          sha256sum rust-sftp-client-* > SHA256SUMS.txt
+          sha256sum rust-sftp-client-* rsftp-turbo-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create release

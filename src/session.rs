@@ -2,7 +2,7 @@
 //! transfer queue. Each session has its own concurrency limit and log context.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{mpsc as std_mpsc, Arc},
@@ -12,13 +12,12 @@ use std::{
 use tokio::{
     runtime::Handle,
     sync::{mpsc, Semaphore},
-    task::AbortHandle,
 };
 
 use crate::{
     connection::{ConnectError, ConnectionProfile, NetworkSettings, SftpConnection},
     logging::{Category, Logger, SessionLog, Severity},
-    transfer::{DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
+    transfer::{CancelToken, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
 };
 
 #[derive(Clone)]
@@ -53,6 +52,10 @@ pub struct TransferItem {
     pub last_speed_sample_bytes: u64,
     pub speed_mib_s: f64,
     pub state: String,
+    /// "UDP" (rsftp-turbo) or "SFTP", known once data flows.
+    pub protocol: Option<&'static str>,
+    /// Diagnostic summary of a finished turbo download.
+    pub details: Option<String>,
 }
 
 impl TransferItem {
@@ -71,6 +74,8 @@ impl TransferItem {
             last_speed_sample_bytes: 0,
             speed_mib_s: 0.0,
             state: "Queued".into(),
+            protocol: None,
+            details: None,
         }
     }
 
@@ -101,7 +106,8 @@ struct TransferRecord {
 
 /// Outcome of a finished connection attempt, for the app to act on.
 pub enum ConnectOutcome {
-    Connected,
+    /// Carries the password that worked, so the app can save it if asked to.
+    Connected { password: Option<String> },
     HostKeyRequired,
     Failed(String),
 }
@@ -140,7 +146,12 @@ pub struct Session {
     queue_rx: std_mpsc::Receiver<QueueEvent>,
     transfer_slots: Arc<Semaphore>,
     transfer_records: HashMap<usize, TransferRecord>,
-    tasks: Vec<AbortHandle>,
+    /// Cancel tokens of operations that have not finished, by operation id.
+    operations: HashMap<usize, CancelToken>,
+    /// Operations the user stopped; their failure is shown as "Cancelled".
+    cancelled_operations: HashSet<usize>,
+    /// Row selected in the transfer queue.
+    pub selected_transfer: Option<usize>,
 
     pub status: String,
 }
@@ -175,7 +186,9 @@ impl Session {
             queue_rx,
             transfer_slots: Arc::new(Semaphore::new(settings.max_concurrent_transfers.max(1) as usize)),
             transfer_records: HashMap::new(),
-            tasks: Vec::new(),
+            operations: HashMap::new(),
+            cancelled_operations: HashSet::new(),
+            selected_transfer: None,
             status: "Ready · No active SFTP session".into(),
         };
         session.refresh_local();
@@ -283,13 +296,13 @@ impl Session {
                 );
                 let host = connection.host.clone();
                 self.connection = Some(Arc::new(connection));
-                self.pending_password = None;
+                let password = self.pending_password.take();
                 // Filled in with the absolute home directory once listed.
                 self.remote_path = String::new();
                 self.remote_selected.clear();
                 self.status = format!("Connected to {host}");
                 self.load_remote(".");
-                ConnectOutcome::Connected
+                ConnectOutcome::Connected { password }
             }
             Err(ConnectError::HostKeyRequired { fingerprint }) => {
                 self.log_event(
@@ -319,9 +332,8 @@ impl Session {
     /// Drops the connection and cancels this session's queued and running transfers.
     pub fn disconnect(&mut self) {
         let cancelled = self.transfers.iter().filter(|item| item.is_pending()).count();
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+        // Transfers stop cooperatively and clean up their partial files.
+        self.cancel_all();
         if self.connection.take().is_some() {
             let detail = if cancelled > 0 { format!(" ({cancelled} transfer(s) cancelled)") } else { String::new() };
             self.log_event(Category::Connection, Severity::Notice, "DISCONNECT", &format!("Disconnected from {}{detail}", self.log.remote));
@@ -418,23 +430,35 @@ impl Session {
     }
 
     /// Runs `work` once a transfer slot is free, forwarding progress to the queue.
-    fn spawn_transfer<F>(&mut self, id: usize, state: &'static str, work: impl FnOnce(mpsc::UnboundedSender<DownloadProgress>) -> F + Send + 'static)
+    fn spawn_transfer<F>(
+        &mut self,
+        id: usize,
+        state: &'static str,
+        work: impl FnOnce(mpsc::UnboundedSender<DownloadProgress>, CancelToken) -> F + Send + 'static,
+    )
     where
         F: std::future::Future<Output = Result<DownloadResult, String>> + Send + 'static,
     {
         let slots = self.transfer_slots.clone();
         let tx = self.queue_tx.clone();
-        let handle = self.runtime.spawn(async move {
-            let _permit = match slots.acquire_owned().await {
+        let cancel = CancelToken::new();
+        self.operations.insert(id, cancel.clone());
+        self.runtime.spawn(async move {
+            // A queued transfer can be stopped while it waits for a slot.
+            let permit = tokio::select! {
+                permit = slots.acquire_owned() => permit.map_err(|error| error.to_string()),
+                _ = cancel.cancelled() => Err("cancelled".to_owned()),
+            };
+            let _permit = match permit {
                 Ok(permit) => permit,
                 Err(error) => {
-                    let _ = tx.send(QueueEvent::Finished { id, result: Err(error.to_string()) });
+                    let _ = tx.send(QueueEvent::Finished { id, result: Err(error) });
                     return;
                 }
             };
             let _ = tx.send(QueueEvent::Started { id, state: state.into() });
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-            let transfer = work(progress_tx);
+            let transfer = work(progress_tx, cancel);
             tokio::pin!(transfer);
             loop {
                 tokio::select! {
@@ -453,8 +477,35 @@ impl Session {
                 }
             }
         });
-        self.tasks.retain(|task| !task.is_finished());
-        self.tasks.push(handle.abort_handle());
+    }
+
+    /// Stops an operation (a single transfer or a whole folder transfer).
+    pub fn cancel_operation(&mut self, operation: usize) {
+        if let Some(token) = self.operations.get(&operation) {
+            token.cancel();
+            self.cancelled_operations.insert(operation);
+            self.status = "Stopping transfer…".into();
+        }
+    }
+
+    /// Stops every queued and running transfer of this session.
+    pub fn cancel_all(&mut self) {
+        for (operation, token) in &self.operations {
+            token.cancel();
+            self.cancelled_operations.insert(*operation);
+        }
+        if !self.operations.is_empty() {
+            self.status = "Stopping all transfers…".into();
+        }
+    }
+
+    /// Whether an operation can still be stopped.
+    pub fn is_operation_active(&self, operation: usize) -> bool {
+        self.operations.contains_key(&operation)
+    }
+
+    pub fn has_active_operations(&self) -> bool {
+        !self.operations.is_empty()
     }
 
     /// Downloads the selected remote files (not folders) into the local folder.
@@ -475,8 +526,8 @@ impl Session {
             self.transfers.push(TransferItem::queued(id, entry.name.clone(), destination.clone(), entry.size));
             self.record(id, "download", entry.path.clone(), destination.display().to_string());
             let connection = connection.clone();
-            self.spawn_transfer(id, "Downloading", move |progress| async move {
-                connection.download(&entry.path, &destination, settings, Some(progress)).await.map_err(|e| e.to_string())
+            self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
+                connection.download(&entry.path, &destination, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
             });
         }
         self.status = format!("Queued {count} download(s) to {}", self.path.display());
@@ -498,8 +549,8 @@ impl Session {
         self.transfers.push(TransferItem::queued(id, name.clone(), local_path.clone(), total));
         self.record(id, "upload", local_path.display().to_string(), remote_destination.clone());
         let destination = remote_destination.clone();
-        self.spawn_transfer(id, "Uploading", move |progress| async move {
-            connection.upload_path(&local_path, &destination, Some(progress)).await.map_err(|e| e.to_string())
+        self.spawn_transfer(id, "Uploading", move |progress, cancel| async move {
+            connection.upload_path(&local_path, &destination, Some(progress), cancel).await.map_err(|e| e.to_string())
         });
         self.status = format!("Queued recursive upload: {name} → {remote_destination}");
     }
@@ -513,8 +564,8 @@ impl Session {
         self.transfers.push(TransferItem::queued(id, name, destination.clone(), 0));
         self.record(id, "download", remote_path.clone(), destination.display().to_string());
         let (source, target) = (remote_path.clone(), destination.clone());
-        self.spawn_transfer(id, "Downloading", move |progress| async move {
-            connection.download_path(&source, &target, settings, Some(progress)).await.map_err(|e| e.to_string())
+        self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
+            connection.download_path(&source, &target, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
         });
         self.status = format!("Queued recursive download: {remote_path} → {}", destination.display());
     }
@@ -590,6 +641,16 @@ impl Session {
             }
             item.transferred = progress.transferred_bytes;
             item.total = progress.total_bytes;
+            // Initial "queued" updates carry no bytes and say nothing about the
+            // protocol; a turbo download that falls back switches to SFTP here.
+            let moving = progress.transferred_bytes > 0
+                || progress.file_complete
+                || progress.segment.as_ref().is_some_and(|segment| segment.transferred_bytes > 0 || segment.complete);
+            if progress.accelerated {
+                item.protocol = Some("UDP");
+            } else if moving {
+                item.protocol = Some("SFTP");
+            }
             if progress.file_complete && item.state != "Complete" {
                 item.finished_at = Some(now);
                 item.state = "Complete".into();
@@ -617,17 +678,24 @@ impl Session {
 
     fn finish_transfer(&mut self, id: usize, result: Result<DownloadResult, String>) {
         let now = Instant::now();
+        self.operations.remove(&id);
+        let cancelled = self.cancelled_operations.remove(&id) && result.is_err();
         let child_exists = self.transfers.iter().any(|item| item.operation_id == Some(id));
         if let Some(record) = self.transfer_records.remove(&id) {
             let elapsed = record.started.map(|start| now.saturating_duration_since(start)).unwrap_or_default();
             let (severity, message) = match &result {
                 Ok(done) => {
                     let rate = done.bytes as f64 / elapsed.as_secs_f64().max(0.001) / (1024.0 * 1024.0);
+                    let via = if done.accelerated { "rsftp-turbo (UDP)" } else { "SFTP" };
+                    let details = done.details.as_deref().map(|details| format!(" [{details}]")).unwrap_or_default();
                     (Severity::Notice, format!(
-                        "Completed {} {} -> {}: {} bytes in {:.1} s ({rate:.2} MiB/s)",
+                        "Completed {} {} -> {} via {via}: {} bytes in {:.1} s ({rate:.2} MiB/s){details}",
                         record.direction, record.source, record.target, done.bytes, elapsed.as_secs_f64()
                     ))
                 }
+                Err(_) if cancelled => (Severity::Notice, format!(
+                    "Cancelled {} {} -> {} by user", record.direction, record.source, record.target
+                )),
                 Err(error) => (Severity::Error, format!(
                     "Failed {} {} -> {}: {error}", record.direction, record.source, record.target
                 )),
@@ -649,25 +717,35 @@ impl Session {
                     item.transferred = result.bytes;
                     item.total = result.bytes;
                     item.state = "Complete".into();
+                    item.protocol = Some(if result.accelerated { "UDP" } else { "SFTP" });
+                    item.details = result.details.clone();
                 }
             }
             Err(error) => {
+                let state = if cancelled { "Cancelled".to_owned() } else { format!("Failed: {error}") };
                 let mut marked = false;
                 for item in self.transfers.iter_mut().filter(|item| item.operation_id == Some(id)) {
                     if item.state != "Complete" {
                         item.finished_at = Some(now);
-                        for segment in &mut item.segments {
-                            if !segment.complete { segment.failed = true; }
+                        if !cancelled {
+                            for segment in &mut item.segments {
+                                if !segment.complete { segment.failed = true; }
+                            }
                         }
-                        item.state = format!("Failed: {error}");
+                        item.speed_mib_s = 0.0;
+                        item.state = state.clone();
                     }
                     marked = true;
                 }
                 if !marked {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
                         item.finished_at = Some(now);
-                        item.state = format!("Failed: {error}");
+                        item.speed_mib_s = 0.0;
+                        item.state = state;
                     }
+                }
+                if cancelled {
+                    self.status = "Transfer stopped".into();
                 }
             }
         }

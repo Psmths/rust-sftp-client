@@ -57,6 +57,7 @@ pub enum SegmentPlanError {
 /// Plan contiguous, non-overlapping ranges for a remote regular file.
 /// Files below the threshold receive one full-file range. The caller must
 /// verify file type and server support before scheduling parallel reads.
+#[cfg_attr(not(test), allow(dead_code))] // superseded by partial-file planning; kept with its tests
 pub fn plan_download_segments(
     file_size: u64,
     settings: TransferSettings,

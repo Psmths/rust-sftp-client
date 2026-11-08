@@ -41,6 +41,8 @@ pub struct NetworkSettings {
     pub request_timeout_secs: u32,
     /// Files transferred at the same time within one folder transfer.
     pub parallel_files: u32,
+    /// Download over rsftp-turbo (UDP) when the server offers it.
+    pub turbo: bool,
 }
 
 impl Default for NetworkSettings {
@@ -55,6 +57,7 @@ impl Default for NetworkSettings {
             keepalive_secs: 30,
             request_timeout_secs: 30,
             parallel_files: 4,
+            turbo: true,
         }
     }
 }

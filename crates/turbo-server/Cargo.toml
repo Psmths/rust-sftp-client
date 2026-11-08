@@ -1,0 +1,27 @@
+[package]
+name = "rsftp-turbo"
+version = "0.1.0"
+edition = "2021"
+description = "Server-side UDP download accelerator for Rust SFTP Client"
+publish = false
+
+[lib]
+name = "rsftp_turbo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsftp-turbo"
+path = "src/main.rs"
+
+[dependencies]
+rsftp-turbo-proto = { path = "../turbo-proto" }
+getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["socket", "uio", "net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

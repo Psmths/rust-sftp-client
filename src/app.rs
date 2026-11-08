@@ -12,7 +12,7 @@ use std::{
 use eframe::egui;
 
 use crate::connection::{
-    load_trusted_fingerprint, trust_host_key, AuthMethod, CipherPreference, ConnectionProfile, NetworkSettings,
+    load_trusted_fingerprint, trust_host_key, AuthMethod, CipherPreference, ConnectionProfile, NetworkSettings, TurboState,
 };
 use crate::logging::{default_log_dir, Logger};
 use crate::session::{ConnectOutcome, LocalEntry, QueueTab, RemoteEntry, Session};
@@ -166,6 +166,7 @@ struct SettingsDraft {
     keepalive_secs: String,
     request_timeout_secs: String,
     parallel_files: String,
+    turbo: bool,
     logging_enabled: bool,
     log_connections: bool,
     log_transfers: bool,
@@ -192,6 +193,7 @@ impl SettingsDraft {
             keepalive_secs: network.keepalive_secs.to_string(),
             request_timeout_secs: network.request_timeout_secs.to_string(),
             parallel_files: network.parallel_files.to_string(),
+            turbo: network.turbo,
             logging_enabled: logging.enabled,
             log_connections: logging.log_connections,
             log_transfers: logging.log_transfers,
@@ -217,6 +219,7 @@ impl SettingsDraft {
             keepalive_secs: parse_setting(&self.keepalive_secs, "Keepalive interval", 0, 3600)? as u32,
             request_timeout_secs: parse_setting(&self.request_timeout_secs, "Request timeout", 5, 3600)? as u32,
             parallel_files: parse_setting(&self.parallel_files, "Parallel files", 1, 32)? as u32,
+            turbo: self.turbo,
         };
         let directory = self.log_directory.trim();
         if self.logging_enabled && directory.is_empty() {
@@ -234,6 +237,12 @@ impl SettingsDraft {
 }
 
 const MIB: u64 = 1024 * 1024;
+
+const SAVE_PASSWORD_TIP: &str = "Stores the password in your system's credential store (Windows Credential \
+Manager, or the Secret Service keyring such as GNOME Keyring or KWallet on Linux), never in the profiles \
+file.\n\nThe password is saved after it has logged in successfully, or when you save the profile with a \
+password entered. It is shared by all profiles for the same user, host and port. Unticking the box and \
+saving the profile removes it.";
 
 const NETWORK_TIP_CHANNELS: &str = "Number of SFTP channels opened inside each SSH connection. Download \
 segments and the files of folder transfers are spread across them, and every channel has its own flow-control \
@@ -269,6 +278,13 @@ const NETWORK_TIP_CIPHER: &str = "The encryption algorithm offered to the server
 offered as a fallback. Both are secure.\n\nAES-GCM is fastest on processors with AES instructions (practically \
 all modern x86-64 and ARM CPUs). ChaCha20-Poly1305 is faster on older or low-power processors without \
 them.\n\nDefault: AES-GCM.";
+
+const NETWORK_TIP_TURBO: &str = "Downloads files over rsftp-turbo, a UDP transfer protocol, when the server \
+has its helper installed (rsftp-turbo service on UDP port 6767). Browsing, uploads and logins keep using \
+SSH/SFTP.\n\nThe transfer is authorised over your SSH session, so you can only download files your account \
+can read. Every UDP packet is encrypted and authenticated with AES-256-GCM, lost packets are re-requested, \
+and every segment is checked against a SHA-256 digest computed on the server; a bad segment is downloaded \
+again.\n\nIf the server has no helper, or UDP is blocked, downloads use SFTP automatically.\n\nDefault: on.";
 
 const NETWORK_TIP_COMPRESSION: &str = "Compresses all SSH traffic with zlib.\n\nThis only helps on slow links \
 (a few MB/s or less) when moving compressible data such as text, logs or source code. On fast links, or with \
@@ -316,6 +332,13 @@ pub struct SftpApp {
     key_path: String,
     auth: AuthMethod,
     password: String,
+    /// "Save password" checkbox of the profile editor / password prompt.
+    save_password: bool,
+    /// Background lookup of a saved password before connecting.
+    password_lookup: Option<std_mpsc::Receiver<Result<Option<String>, String>>>,
+    /// Results of background credential-store writes (status text or error).
+    credential_tx: std_mpsc::Sender<Result<String, String>>,
+    credential_rx: std_mpsc::Receiver<Result<String, String>>,
     dialog: Option<Dialog>,
     /// Session the host-key dialog belongs to.
     dialog_session: Option<u64>,
@@ -349,6 +372,7 @@ impl SftpApp {
             .expect("Tokio runtime initialization failed");
         let first_session = Session::new(1, runtime.handle().clone(), logger.clone(), path, &settings.transfer);
         let (op_tx, op_rx) = std_mpsc::channel();
+        let (credential_tx, credential_rx) = std_mpsc::channel();
         Self {
             runtime,
             logger,
@@ -366,6 +390,10 @@ impl SftpApp {
             key_path: String::new(),
             auth: AuthMethod::Password,
             password: String::new(),
+            save_password: false,
+            password_lookup: None,
+            credential_tx,
+            credential_rx,
             dialog: None,
             dialog_session: None,
             error_message: String::new(),
@@ -461,6 +489,7 @@ impl SftpApp {
             username: self.username.trim().into(),
             auth_method: self.auth,
             private_key_path: (self.auth == AuthMethod::PrivateKey).then(|| self.key_path.trim().into()),
+            save_password: self.auth == AuthMethod::Password && self.save_password,
         };
         profile.validate().map_err(|e| e.to_string())?;
         if profile.auth_method == AuthMethod::SshAgent {
@@ -479,16 +508,110 @@ impl SftpApp {
         if duplicate {
             return self.show_error(format!("A profile named \"{}\" already exists.", profile.name));
         }
-        match self.selected_profile.filter(|&index| index < self.saved_profiles.len()) {
-            Some(index) => self.saved_profiles[index] = profile,
+        let previous = match self.selected_profile.filter(|&index| index < self.saved_profiles.len()) {
+            Some(index) => Some(std::mem::replace(&mut self.saved_profiles[index], profile.clone())),
             None => {
-                self.saved_profiles.push(profile);
+                self.saved_profiles.push(profile.clone());
                 self.selected_profile = Some(self.saved_profiles.len() - 1);
+                None
+            }
+        };
+        if let Err(error) = persist_profiles(&self.saved_profiles) {
+            return self.show_error(format!("Could not save profile: {error}"));
+        }
+        self.session_mut().status = format!("Saved connection profile: {}", profile.name);
+        // Forget a password saved under the old login if it is no longer wanted there.
+        if let Some(previous) = previous.filter(|previous| previous.save_password) {
+            if !profile.save_password || crate::credentials::key(&previous) != crate::credentials::key(&profile) {
+                self.forget_password(&previous);
             }
         }
-        match persist_profiles(&self.saved_profiles) {
-            Ok(()) => self.session_mut().status = format!("Saved connection profile: {}", self.profile_name.trim()),
-            Err(error) => self.show_error(format!("Could not save profile: {error}")),
+        if profile.save_password && !self.password.is_empty() {
+            self.remember_password(&profile, self.password.clone());
+        }
+    }
+
+    /// Saves `password` for the profile's login in the background.
+    fn remember_password(&self, profile: &ConnectionProfile, password: String) {
+        let key = crate::credentials::key(profile);
+        let tx = self.credential_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::credentials::store(&key, &password)
+                .map(|()| format!("Password for {key} saved in the system credential store"))
+                .map_err(|error| format!("Could not save the password for {key}: {error}"));
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Removes the profile's saved password unless another saved profile for
+    /// the same login still wants it.
+    fn forget_password(&self, profile: &ConnectionProfile) {
+        let key = crate::credentials::key(profile);
+        let still_used = self.saved_profiles.iter()
+            .any(|other| other.save_password && crate::credentials::key(other) == key);
+        if still_used { return; }
+        let tx = self.credential_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::credentials::delete(&key)
+                .map(|()| format!("Saved password for {key} removed"))
+                .map_err(|error| format!("Could not remove the saved password for {key}: {error}"));
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Looks up the saved password before connecting; `poll_password_lookup`
+    /// connects or asks for the password when it arrives.
+    fn start_password_lookup(&mut self, profile: &ConnectionProfile) {
+        let key = crate::credentials::key(profile);
+        let (tx, rx) = std_mpsc::channel();
+        self.password_lookup = Some(rx);
+        self.session_mut().status = format!("Reading saved password for {key} …");
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::credentials::load(&key));
+        });
+    }
+
+    fn poll_password_lookup(&mut self) {
+        let Some(result) = self.password_lookup.as_ref().and_then(|rx| rx.try_recv().ok()) else { return; };
+        self.password_lookup = None;
+        match result {
+            Ok(Some(password)) => self.begin_connect(Some(password)),
+            Ok(None) => {
+                self.session_mut().status = "No saved password found".into();
+                self.dialog = Some(Dialog::Password);
+            }
+            Err(error) => {
+                self.session_mut().status = format!("Could not read the saved password: {error}");
+                self.dialog = Some(Dialog::Password);
+            }
+        }
+    }
+
+    fn poll_credentials(&mut self) {
+        while let Ok(result) = self.credential_rx.try_recv() {
+            match result {
+                Ok(message) => self.session_mut().status = message,
+                Err(error) => self.show_error(error),
+            }
+        }
+    }
+
+    /// After a successful password login: save the password if requested and
+    /// remember the choice in the matching saved profile.
+    fn on_password_login(&mut self, profile: &ConnectionProfile, password: String) {
+        if !profile.save_password { return; }
+        self.remember_password(profile, password);
+        let mut changed = false;
+        for saved in self.saved_profiles.iter_mut() {
+            if saved.name == profile.name && !saved.save_password && crate::credentials::key(saved) == crate::credentials::key(profile) {
+                saved.save_password = true;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(error) = persist_profiles(&self.saved_profiles) {
+                self.show_error(format!("Could not save profile: {error}"));
+            }
         }
     }
 
@@ -502,6 +625,7 @@ impl SftpApp {
         self.auth = AuthMethod::Password;
         self.key_path.clear();
         self.password.clear();
+        self.save_password = false;
     }
 
     fn delete_profile(&mut self) {
@@ -510,6 +634,9 @@ impl SftpApp {
         if let Err(error) = persist_profiles(&self.saved_profiles) {
             self.show_error(format!("Could not save profiles: {error}"));
             return;
+        }
+        if removed.save_password {
+            self.forget_password(&removed);
         }
         self.session_mut().status = format!("Deleted connection profile: {}", removed.name);
         if self.saved_profiles.is_empty() {
@@ -712,7 +839,12 @@ impl SftpApp {
         for index in 0..self.sessions.len() {
             let id = self.sessions[index].id;
             match self.sessions[index].poll_connection() {
-                Some(ConnectOutcome::Connected) => self.password.clear(),
+                Some(ConnectOutcome::Connected { password }) => {
+                    self.password.clear();
+                    if let (Some(password), Some(profile)) = (password, self.sessions[index].profile.clone()) {
+                        self.on_password_login(&profile, password);
+                    }
+                }
                 Some(ConnectOutcome::HostKeyRequired) => {
                     self.active = index;
                     self.dialog_session = Some(id);
@@ -822,6 +954,8 @@ impl SftpApp {
             self.username = profile.username.clone();
             self.auth = profile.auth_method;
             self.key_path = profile.private_key_path.clone().unwrap_or_default();
+            self.save_password = profile.save_password;
+            self.password.clear();
             self.selected_profile = Some(index);
         }
     }
@@ -1133,7 +1267,7 @@ impl SftpApp {
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size(match &dialog {
-                Dialog::Profiles => [640.0, 380.0],
+                Dialog::Profiles => [660.0, 430.0],
                 Dialog::TrustHostKey => [470.0, 260.0],
                 Dialog::ConfirmDelete => [440.0, 170.0],
                 Dialog::Rename => [420.0, 160.0],
@@ -1216,6 +1350,21 @@ impl SftpApp {
                                         win32::text_edit(ui, egui::TextEdit::singleline(&mut self.key_path).desired_width(field_width));
                                         ui.end_row();
                                     }
+                                    if self.auth == AuthMethod::Password {
+                                        ui.label("Password:");
+                                        let hint = if self.save_password { "Leave empty to use the saved password" } else { "Asked for when connecting" };
+                                        win32::text_edit(ui, egui::TextEdit::singleline(&mut self.password)
+                                            .password(true)
+                                            .hint_text(hint)
+                                            .desired_width(field_width));
+                                        ui.end_row();
+                                        ui.label("");
+                                        ui.horizontal(|ui| {
+                                            ui.checkbox(&mut self.save_password, "Save password");
+                                            win32::info_tip(ui, SAVE_PASSWORD_TIP);
+                                        });
+                                        ui.end_row();
+                                    }
                                 });
                             });
                         });
@@ -1236,7 +1385,14 @@ impl SftpApp {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("Password:");
-                            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.password).password(true).desired_width(f32::INFINITY));
+                            let response = win32::text_edit(ui, egui::TextEdit::singleline(&mut self.password).password(true).desired_width(f32::INFINITY));
+                            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                                password_value = Some(self.password.clone());
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.save_password, "Save password");
+                            win32::info_tip(ui, SAVE_PASSWORD_TIP);
                         });
                         dialog_buttons(ui, |ui| {
                             if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
@@ -1316,7 +1472,16 @@ impl SftpApp {
             match self.profile_value() {
                 Ok(profile) => {
                     if profile.auth_method == AuthMethod::Password {
-                        self.dialog = Some(Dialog::Password);
+                        if !self.password.is_empty() {
+                            // Typed in the profile editor: use it (and save it once it works).
+                            self.dialog = None;
+                            self.begin_connect(Some(self.password.clone()));
+                        } else if profile.save_password {
+                            self.dialog = None;
+                            self.start_password_lookup(&profile);
+                        } else {
+                            self.dialog = Some(Dialog::Password);
+                        }
                     } else {
                         self.dialog = None;
                         self.begin_connect(None);
@@ -1430,6 +1595,12 @@ impl SftpApp {
                                     ui.label("");
                                     win32::info_tip(ui, NETWORK_TIP_COMPRESSION);
                                     ui.end_row();
+
+                                    ui.label("UDP downloads:");
+                                    ui.checkbox(&mut draft.turbo, "Use rsftp-turbo when available");
+                                    ui.label("");
+                                    win32::info_tip(ui, NETWORK_TIP_TURBO);
+                                    ui.end_row();
                                 });
                                 ui.add_space(6.0);
                                 ui.weak("Hover an information icon for details about a setting.");
@@ -1511,6 +1682,8 @@ impl eframe::App for SftpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_sessions();
         self.poll_ops();
+        self.poll_password_lookup();
+        self.poll_credentials();
 
         let connected = self.session().is_connected();
         let can_close = self.can_close_active();
@@ -1580,10 +1753,12 @@ impl eframe::App for SftpApp {
                 // Totals over every session, not just the visible one.
                 let speed = |state: &str| -> f64 { self.sessions.iter().map(|session| session.speed(state)).sum() };
                 let speeds = format!("↓ {}   ↑ {}", speed_text(speed("Downloading")), speed_text(speed("Uploading")));
-                let fixed = 200.0 + 180.0 + 130.0 + 3.0 * ui.spacing().item_spacing.x;
+                let (turbo_text, turbo_details) = turbo_status_text(self.session());
+                let fixed = 200.0 + 220.0 + 180.0 + 130.0 + 4.0 * ui.spacing().item_spacing.x;
                 let message_width = (ui.available_width() - fixed).max(120.0);
                 win32::status_pane(ui, message_width, self.session().status.as_str());
                 win32::status_pane(ui, 200.0, connection);
+                win32::status_pane(ui, 220.0, turbo_text).on_hover_text(turbo_details);
                 win32::status_pane(ui, 180.0, speeds);
                 win32::status_pane(ui, 130.0, format!("{active} active transfer{}", if active == 1 { "" } else { "s" }))
                     .on_hover_text("Across all sessions");
@@ -1616,16 +1791,18 @@ impl eframe::App for SftpApp {
             let list_height = ui.available_height().max(40.0);
             win32::list_view(ui, list_height, |ui| {
                 let file_width = 220.0;
+                let protocol_width = 70.0;
                 let percent_width = 80.0;
                 let speed_width = 95.0;
                 let elapsed_width = 90.0;
                 let remaining_width = 105.0;
                 let header_height = 19.0;
                 let row_height = 18.0;
-                let fixed = file_width + percent_width + speed_width + elapsed_width + remaining_width;
+                let fixed = file_width + protocol_width + percent_width + speed_width + elapsed_width + remaining_width;
                 let progress_width = (ui.available_width() - fixed - ui.spacing().scroll.bar_width).max(160.0);
                 ui.horizontal(|ui| {
                     win32::header_cell(ui, file_width, header_height, "File");
+                    win32::header_cell(ui, protocol_width, header_height, "Protocol");
                     win32::header_cell(ui, progress_width, header_height, "Progress");
                     win32::header_cell(ui, percent_width, header_height, "Complete");
                     win32::header_cell(ui, speed_width, header_height, "Speed (MiB/s)");
@@ -1641,10 +1818,42 @@ impl eframe::App for SftpApp {
                         ui.horizontal(|ui| { ui.add_space(6.0); ui.weak(empty); });
                         return;
                     }
-                    for item in self.sessions[a].transfers.iter().filter(|item| item.is_pending() == show_pending) {
-                        ui.horizontal(|ui| {
+                    let session = &self.sessions[a];
+                    let any_active = session.has_active_operations();
+                    let mut select = None;
+                    let mut stop = None;
+                    for item in session.transfers.iter().filter(|item| item.is_pending() == show_pending) {
+                        // The whole row is one click target; the cells are drawn on top of it.
+                        let (row_rect, row_response) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_height), egui::Sense::click()
+                        );
+                        if session.selected_transfer == Some(item.id) {
+                            ui.painter().rect_filled(row_rect, 0.0, QUEUE_SELECTION);
+                        }
+                        if row_response.clicked() || row_response.secondary_clicked() {
+                            select = Some(item.id);
+                        }
+                        // Rows of a folder transfer stop the whole folder transfer.
+                        let operation = item.operation_id.unwrap_or(item.id);
+                        row_response.context_menu(|ui| {
+                            win32::menu_item_style(ui.style_mut());
+                            let label = if item.operation_id.is_some() { "Stop folder transfer" } else { "Stop transfer" };
+                            if ui.add_enabled(session.is_operation_active(operation), egui::Button::new(label)).clicked() {
+                                stop = Some(Some(operation));
+                                ui.close();
+                            }
+                            if ui.add_enabled(any_active, egui::Button::new("Stop all transfers")).clicked() {
+                                stop = Some(None);
+                                ui.close();
+                            }
+                        });
+                        let row_layout = egui::UiBuilder::new()
+                            .max_rect(row_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center));
+                        ui.scope_builder(row_layout, |ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             file_text_cell(ui, file_width, row_height, &item.name, false);
+                            file_text_cell(ui, protocol_width, row_height, item.protocol.unwrap_or("—"), false);
                             let (cell_rect, response) = ui.allocate_exact_size(
                                 egui::vec2(progress_width, row_height), egui::Sense::hover()
                             );
@@ -1671,11 +1880,18 @@ impl eframe::App for SftpApp {
                                 vec![Piece { start: 0, end: total, done, failed }]
                             };
                             let total = if item.segments.is_empty() || item.total == 0 { item.total.max(1) } else { item.total };
-                            let fill = if complete { win32::OK_GREEN } else { PIECE_FILL };
+                            let fill = if complete {
+                                win32::OK_GREEN
+                            } else if item.state == "Cancelled" {
+                                win32::SHADOW
+                            } else {
+                                PIECE_FILL
+                            };
                             paint_piece_bar(painter, bar_rect, total, &pieces, fill);
                             if response.hovered() {
+                                let details = item.details.as_deref().map(|details| format!("\n\n{details}")).unwrap_or_default();
                                 response.on_hover_text(format!(
-                                    "{} / {} · {} segments\n{}",
+                                    "{} / {} · {} segments\n{}{details}",
                                     size_text(item.transferred), size_text(item.total), item.segments.len(), item.state
                                 ));
                             }
@@ -1698,10 +1914,21 @@ impl eframe::App for SftpApp {
                                 })
                             } else { None };
                             let remaining = remaining.map(duration_text).unwrap_or_else(|| {
-                                if failed { "Failed".into() } else if item.state == "Queued" { "Queued".into() } else { "Calculating…".into() }
+                                if failed { "Failed".into() }
+                                else if item.state == "Cancelled" { "Cancelled".into() }
+                                else if item.state == "Queued" { "Queued".into() }
+                                else { "Calculating…".into() }
                             });
                             file_text_cell(ui, remaining_width, row_height, &remaining, false);
                         });
+                    }
+                    if let Some(id) = select {
+                        self.sessions[a].selected_transfer = Some(id);
+                    }
+                    match stop {
+                        Some(Some(operation)) => self.sessions[a].cancel_operation(operation),
+                        Some(None) => self.sessions[a].cancel_all(),
+                        None => {}
                     }
                 });
             });
@@ -1719,7 +1946,7 @@ impl eframe::App for SftpApp {
         if self.ops_pending > 0 || self.hash_jobs.iter().any(|job| job.result.is_none()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if self.sessions.iter().any(Session::is_busy) {
+        if self.sessions.iter().any(Session::is_busy) || self.password_lookup.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1774,6 +2001,39 @@ fn delete_message(target: &FileTarget) -> String {
         [(name, false)] => format!("Are you sure you want to permanently delete \"{name}\"{location}?"),
         _ => format!("Are you sure you want to permanently delete these {} items{location}?", items.len()),
     }
+}
+
+/// Short status-bar text and a longer tooltip for the session's rsftp-turbo state.
+fn turbo_status_text(session: &Session) -> (String, String) {
+    let Some(connection) = &session.connection else {
+        return ("Turbo: —".into(), "Not connected.".into());
+    };
+    let info = connection.turbo_info();
+    let (short, mut details) = match &info.state {
+        TurboState::Disabled => (
+            "Turbo: off".to_owned(),
+            "UDP downloads are turned off (Settings → Network Settings → UDP downloads).".to_owned(),
+        ),
+        TurboState::Untested => (
+            "Turbo: not tried yet".to_owned(),
+            "rsftp-turbo is tried on the next download from this server.".to_owned(),
+        ),
+        TurboState::Active => (
+            "Turbo: active (UDP)".to_owned(),
+            "Downloads from this server use rsftp-turbo over UDP.".to_owned(),
+        ),
+        TurboState::Unavailable(reason) => (
+            format!("Turbo: unavailable — {reason}"),
+            format!(
+                "Downloads from this server use SFTP.\n\nReason: {reason}\n\nAfter fixing the server, disconnect and \
+                 reconnect to try rsftp-turbo again."
+            ),
+        ),
+    };
+    if let Some(fallback) = &info.last_fallback {
+        details.push_str(&format!("\n\nLast file that fell back to SFTP: {fallback}"));
+    }
+    (short, details)
 }
 
 fn speed_text(mib_per_second: f64) -> String {
@@ -1873,6 +2133,8 @@ fn file_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, right_
 }
 
 const PIECE_FILL: egui::Color32 = egui::Color32::from_rgb(40, 100, 210);
+/// Selected transfer row: light enough to keep black text readable.
+const QUEUE_SELECTION: egui::Color32 = egui::Color32::from_rgb(204, 220, 245);
 
 /// A byte range of a transfer and how much of it (from its start) is done.
 struct Piece {

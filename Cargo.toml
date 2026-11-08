@@ -9,6 +9,11 @@ edition = "2021"
 name = "rust-sftp-client"
 path = "src/main.rs"
 
+[workspace]
+members = [".", "crates/turbo-proto", "crates/turbo-server"]
+# `cargo build` / `cargo run` at the top level build the desktop client only.
+default-members = ["."]
+
 [dependencies]
 eframe = { version = "0.33", features = ["wgpu"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,3 +26,7 @@ russh-sftp = "3.0.1"
 md5 = "0.8"
 sha1 = { version = "0.11", default-features = false }
 sha2 = { version = "0.11", default-features = false }
+# Saved passwords: Windows Credential Manager / Secret Service / macOS Keychain.
+keyring = "4"
+# UDP download accelerator (client side and wire protocol).
+rsftp-turbo-proto = { path = "crates/turbo-proto" }

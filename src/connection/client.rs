@@ -1,13 +1,82 @@
-use std::{path::{Path, PathBuf}, sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex}};
-use russh::{client, keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate}};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex},
+    time::Duration,
+};
+use russh::{client, keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate}, ChannelMsg};
 use russh::keys::ssh_key::HashAlg;
 use russh_sftp::client::{fs::ReadDir, SftpSession};
 use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, sync::{mpsc, Semaphore}, task::JoinSet};
 
 use crate::{
     connection::{AuthMethod, ConnectionProfile, NetworkSettings},
-    transfer::{download_file, DownloadError, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
+    transfer::{
+        download_file,
+        partial::Partial,
+        turbo::{self, TurboError},
+        CancelToken, DownloadError, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings,
+    },
 };
+use rsftp_turbo_proto::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_STREAM_COMMAND};
+
+/// How long to wait for `rsftp-turbo ticket` on the server.
+const TICKET_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether the server offers rsftp-turbo, learned on first use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurboState {
+    /// Turned off in the network settings.
+    Disabled,
+    /// No download has tried it yet on this connection.
+    Untested,
+    /// At least one download went over UDP.
+    Active,
+    /// Not usable on this connection; downloads use SFTP. Holds the reason.
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurboInfo {
+    pub state: TurboState,
+    /// Why the most recent file fell back to SFTP although turbo is usable.
+    pub last_fallback: Option<String>,
+}
+
+/// A long-running `rsftp-turbo ticket --stream` on the server: one SSH
+/// channel, reserved at connect time, that issues tickets for every download.
+struct TicketStream {
+    channel: russh::Channel<client::Msg>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Opens the ticket channel and starts the helper on it.
+async fn open_ticket_stream(ssh: &client::Handle<VerifyHostKey>) -> Result<TicketStream, String> {
+    let channel = ssh.channel_open_session().await
+        .map_err(|error| format!("cannot open an SSH channel for rsftp-turbo: {error}"))?;
+    channel.exec(true, TICKET_STREAM_COMMAND).await
+        .map_err(|error| format!("cannot start rsftp-turbo: {error}"))?;
+    Ok(TicketStream { channel, stdout: Vec::new(), stderr: Vec::new() })
+}
+
+/// What a turbo attempt achieved for one file.
+enum TurboOutcome {
+    /// The whole file arrived over turbo.
+    Done(DownloadResult),
+    /// The user stopped the transfer.
+    Cancelled,
+    /// Turbo was not used or did not finish; SFTP does the rest.
+    NotUsed,
+}
+
+/// Why no ticket was issued.
+enum TicketError {
+    /// The helper is not installed, its service is not running, or exec is refused.
+    Unavailable(String),
+    /// The helper ran but refused this file (e.g. permission denied).
+    Refused(String),
+}
 
 /// Read buffer for uploads; large enough to keep the SFTP write pipeline full.
 const UPLOAD_BUFFER: usize = 1024 * 1024;
@@ -54,13 +123,16 @@ impl client::Handler for VerifyHostKey {
 
 /// Retain the SSH handle for the lifetime of the SFTP channel.
 pub struct SftpConnection {
-    _ssh: client::Handle<VerifyHostKey>,
+    ssh: client::Handle<VerifyHostKey>,
     /// Primary channel, used for listings and file operations.
     sftp: Arc<SftpSession>,
     /// Every SFTP channel (the primary first); transfers are spread over them.
     channels: Vec<Arc<SftpSession>>,
     next_channel: AtomicUsize,
     network: NetworkSettings,
+    turbo: Mutex<TurboInfo>,
+    /// The ticket helper; `None` once it has exited or failed.
+    tickets: tokio::sync::Mutex<Option<TicketStream>>,
     pub host: String,
     pub port: u16,
     pub fingerprint: String,
@@ -128,6 +200,16 @@ impl SftpConnection {
         }
 
         let sftp = Arc::new(open_sftp_channel(&ssh, &network).await?);
+        // Reserve the rsftp-turbo ticket channel before the extra SFTP
+        // channels take the remaining session slots (OpenSSH MaxSessions).
+        let (tickets, turbo_state) = if network.turbo {
+            match open_ticket_stream(&ssh).await {
+                Ok(stream) => (Some(stream), TurboState::Untested),
+                Err(reason) => (None, TurboState::Unavailable(reason)),
+            }
+        } else {
+            (None, TurboState::Disabled)
+        };
         let mut channels = vec![Arc::clone(&sftp)];
         // Extra channels are an optimisation: stop quietly at the server's
         // session limit (OpenSSH MaxSessions defaults to 10).
@@ -139,11 +221,13 @@ impl SftpConnection {
         }
 
         Ok(Self {
-            _ssh: ssh,
+            ssh,
             sftp,
             channels,
             next_channel: AtomicUsize::new(0),
             network,
+            turbo: Mutex::new(TurboInfo { state: turbo_state, last_fallback: None }),
+            tickets: tokio::sync::Mutex::new(tickets),
             host: profile.host.clone(),
             port: profile.port,
             fingerprint: trusted_fingerprint.unwrap_or_default().to_owned(),
@@ -179,6 +263,7 @@ impl SftpConnection {
         local_path: &Path,
         remote_path: &str,
         progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+        cancel: CancelToken,
     ) -> Result<DownloadResult, crate::transfer::DownloadError> {
         let mut directories: Vec<(PathBuf, String)> = Vec::new();
         let mut files: Vec<(PathBuf, String, u64)> = Vec::new();
@@ -227,7 +312,7 @@ impl SftpConnection {
                 let _ = tx.send(DownloadProgress {
                     total_bytes: *file_size, transferred_bytes: 0,
                     completed_segments: 0, total_segments: 0, segment: None,
-                    file_path: Some(relative), file_complete: false,
+                    file_path: Some(relative), file_complete: false, accelerated: false,
                 });
             }
         }
@@ -240,13 +325,23 @@ impl SftpConnection {
             let parallel = Arc::clone(&parallel);
             let transferred_total = Arc::clone(&transferred_total);
             let progress = progress.clone();
+            let cancel = cancel.clone();
             workers.spawn(async move {
-                let _permit = parallel.acquire_owned().await.map_err(|e| DownloadError::Worker(e.to_string()))?;
+                let _permit = tokio::select! {
+                    permit = parallel.acquire_owned() => permit.map_err(|e| DownloadError::Worker(e.to_string()))?,
+                    _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
+                };
                 let mut buffer = vec![0_u8; UPLOAD_BUFFER];
                 let mut file_transferred = 0_u64;
                 let mut input = fs::File::open(&local).await.map_err(DownloadError::Io)?;
-                let mut output = sftp.create(remote).await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
+                let mut output = sftp.create(remote.clone()).await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
                 loop {
+                    if cancel.is_cancelled() {
+                        // Don't leave a truncated file behind on the server.
+                        drop(output);
+                        let _ = sftp.remove_file(remote).await;
+                        return Err(DownloadError::Cancelled);
+                    }
                     let count = input.read(&mut buffer).await.map_err(DownloadError::Io)?;
                     if count == 0 { break; }
                     output.write_all(&buffer[..count]).await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
@@ -260,7 +355,7 @@ impl SftpConnection {
                             total_segments: 0,
                             segment: None,
                             file_path: Some(relative.clone()),
-                            file_complete: false,
+                            file_complete: false, accelerated: false,
                         });
                     }
                 }
@@ -269,38 +364,45 @@ impl SftpConnection {
                     let _ = tx.send(DownloadProgress {
                         total_bytes: file_size, transferred_bytes: file_transferred,
                         completed_segments: 0, total_segments: 0, segment: None,
-                        file_path: Some(relative), file_complete: true,
+                        file_path: Some(relative), file_complete: true, accelerated: false,
                     });
                 }
                 Ok::<(), DownloadError>(())
             });
         }
+        let mut failure = None;
         while let Some(joined) = workers.join_next().await {
             let result = joined.unwrap_or_else(|error| Err(DownloadError::Worker(error.to_string())));
             if let Err(error) = result {
-                workers.abort_all();
-                return Err(error);
+                // Stop the other files cleanly (they remove partial uploads) and
+                // report the first error once they have finished.
+                cancel.cancel();
+                failure.get_or_insert(error);
             }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         let transferred = transferred_total.load(Ordering::Relaxed);
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: transferred,
                 completed_segments: 0, total_segments: 0, segment: None,
-                file_path: None, file_complete: false,
+                file_path: None, file_complete: false, accelerated: false,
             });
         }
-        Ok(DownloadResult { bytes: transferred, segments: 0, segmented: false })
+        Ok(DownloadResult { bytes: transferred, segments: 0, segmented: false, accelerated: false, details: None })
     }
 
     /// Recursively download a remote file or directory. Each file uses the
     /// existing segmented downloader; progress is reported separately for each file.
     pub async fn download_path(
-        &self,
+        self: Arc<Self>,
         remote_path: &str,
         destination: &Path,
         settings: TransferSettings,
         progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+        cancel: CancelToken,
     ) -> Result<DownloadResult, crate::transfer::DownloadError> {
         let root_meta = self.sftp.metadata(remote_path.to_owned()).await
             .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
@@ -348,7 +450,7 @@ impl SftpConnection {
                 let _ = tx.send(DownloadProgress {
                     total_bytes: *file_size, transferred_bytes: 0,
                     completed_segments: 0, total_segments: 0, segment: None,
-                    file_path: Some(relative), file_complete: false,
+                    file_path: Some(relative), file_complete: false, accelerated: false,
                 });
             }
         }
@@ -356,13 +458,17 @@ impl SftpConnection {
         let mut workers = JoinSet::new();
         for (remote, local, file_size) in files {
             let relative = relative_name(&local, destination);
-            let sessions = self.transfer_sessions();
+            let connection = Arc::clone(&self);
             let parallel = Arc::clone(&parallel);
             let progress = progress.clone();
+            let cancel = cancel.clone();
             workers.spawn(async move {
-                let _permit = parallel.acquire_owned().await.map_err(|e| DownloadError::Worker(e.to_string()))?;
+                let _permit = tokio::select! {
+                    permit = parallel.acquire_owned() => permit.map_err(|e| DownloadError::Worker(e.to_string()))?,
+                    _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
+                };
                 let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
-                let download = download_file(sessions, &remote, &local, settings, Some(inner_tx));
+                let download = connection.download_one(&remote, &local, settings, Some(inner_tx), cancel);
                 tokio::pin!(download);
                 loop {
                     tokio::select! {
@@ -372,7 +478,7 @@ impl SftpConnection {
                                 let _ = tx.send(DownloadProgress {
                                     total_bytes: result.bytes, transferred_bytes: result.bytes,
                                     completed_segments: result.segments, total_segments: result.segments,
-                                    segment: None, file_path: Some(relative.clone()), file_complete: true,
+                                    segment: None, file_path: Some(relative.clone()), file_complete: true, accelerated: result.accelerated,
                                 });
                             }
                             return Ok::<DownloadResult, DownloadError>(result);
@@ -393,7 +499,7 @@ impl SftpConnection {
                                     completed_segments: update.completed_segments,
                                     total_segments: update.total_segments,
                                     segment,
-                                    file_path: Some(relative.clone()), file_complete: false,
+                                    file_path: Some(relative.clone()), file_complete: false, accelerated: update.accelerated,
                                 });
                             }
                         }
@@ -404,27 +510,44 @@ impl SftpConnection {
         let mut completed = 0_u64;
         let mut segment_count = 0_u32;
         let mut segmented = false;
+        let mut accelerated = false;
+        let mut details: Vec<String> = Vec::new();
+        let mut failure = None;
         while let Some(joined) = workers.join_next().await {
             match joined.unwrap_or_else(|error| Err(DownloadError::Worker(error.to_string()))) {
                 Ok(result) => {
                     completed = completed.saturating_add(result.bytes);
                     segment_count = segment_count.saturating_add(result.segments);
                     segmented |= result.segmented;
+                    accelerated |= result.accelerated;
+                    details.extend(result.details);
                 }
                 Err(error) => {
-                    workers.abort_all();
-                    return Err(error);
+                    // Let the other files stop cleanly (removing their temporary
+                    // files) and report the first error afterwards.
+                    cancel.cancel();
+                    failure.get_or_insert(error);
                 }
             }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: completed,
                 completed_segments: segment_count, total_segments: segment_count,
-                segment: None, file_path: None, file_complete: false,
+                segment: None, file_path: None, file_complete: false, accelerated: false,
             });
         }
-        Ok(DownloadResult { bytes: completed, segments: segment_count, segmented })
+        // A single file (the usual right-click / drag download) keeps its own
+        // statistics; for folders, list them per file.
+        let details = match details.len() {
+            0 => None,
+            1 => details.pop(),
+            _ => Some(details.join("; ")),
+        };
+        Ok(DownloadResult { bytes: completed, segments: segment_count, segmented, accelerated, details })
     }
 
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), ConnectError> {
@@ -464,14 +587,247 @@ impl SftpConnection {
     }
 
     pub async fn download(
+        self: Arc<Self>,
+        remote_path: &str,
+        destination: &Path,
+        settings: TransferSettings,
+        progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+        cancel: CancelToken,
+    ) -> Result<DownloadResult, crate::transfer::DownloadError> {
+        self.download_one(remote_path, destination, settings, progress, cancel).await
+    }
+
+    /// Downloads one regular file: over rsftp-turbo (UDP) when the server
+    /// offers it, otherwise (or if turbo fails) over SFTP.
+    async fn download_one(
         &self,
         remote_path: &str,
         destination: &Path,
         settings: TransferSettings,
         progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
-    ) -> Result<DownloadResult, crate::transfer::DownloadError> {
-        download_file(self.transfer_sessions(), remote_path, destination, settings, progress).await
+        cancel: CancelToken,
+    ) -> Result<DownloadResult, DownloadError> {
+        if cancel.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
+        let metadata = self.sftp.metadata(remote_path.to_owned()).await
+            .map_err(|e| DownloadError::Sftp(e.to_string()))?;
+        let size = metadata.size.ok_or(DownloadError::UnknownSize)?;
+        let mtime = metadata.mtime.map(u64::from);
+        // Resumes an earlier attempt of the same, unchanged file.
+        let partial = Partial::open(destination, remote_path, size, mtime)?;
+        partial.announce(&progress);
+
+        let mut details = None;
+        let mut accelerated = false;
+        if !partial.is_complete() {
+            match self.try_turbo(remote_path, &partial, settings, progress.clone(), cancel.clone()).await {
+                TurboOutcome::Done(result) => {
+                    accelerated = true;
+                    details = result.details;
+                }
+                TurboOutcome::Cancelled => {
+                    partial.discard();
+                    return Err(DownloadError::Cancelled);
+                }
+                TurboOutcome::NotUsed => {}
+            }
+        }
+        if !partial.is_complete() {
+            let resumed_from = partial.done_bytes();
+            match download_file(self.transfer_sessions(), remote_path, &partial, settings, progress, cancel).await {
+                Ok(_) => {
+                    if resumed_from > 0 {
+                        let note = format!("resumed: {resumed_from} of {size} bytes were already downloaded");
+                        details = Some(match details {
+                            Some(turbo) => format!("{turbo}; {note}"),
+                            None => note,
+                        });
+                    }
+                }
+                Err(DownloadError::Cancelled) => {
+                    partial.discard();
+                    return Err(DownloadError::Cancelled);
+                }
+                // Completed pieces stay on disk; the next attempt resumes.
+                Err(error) => return Err(error),
+            }
+        }
+        partial.finish(destination).await?;
+        let pieces = partial.pieces_used();
+        Ok(DownloadResult { bytes: size, segments: pieces, segmented: pieces > 1, accelerated, details })
     }
+
+    /// Turbo state of this connection, for display.
+    pub fn turbo_info(&self) -> TurboInfo {
+        self.turbo.lock().map(|info| info.clone()).unwrap_or(TurboInfo {
+            state: TurboState::Unavailable("internal error".into()),
+            last_fallback: None,
+        })
+    }
+
+    fn set_turbo_state(&self, state: TurboState) {
+        if let Ok(mut info) = self.turbo.lock() {
+            info.state = state;
+        }
+    }
+
+    fn note_turbo_fallback(&self, reason: String) {
+        if let Ok(mut info) = self.turbo.lock() {
+            info.last_fallback = Some(reason);
+        }
+    }
+
+    /// `None` means "use SFTP"; `Some` is the final result of a turbo download.
+    /// Downloads as much of `partial` as possible over rsftp-turbo.
+    async fn try_turbo(
+        &self,
+        remote_path: &str,
+        partial: &Arc<Partial>,
+        settings: TransferSettings,
+        progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+        cancel: CancelToken,
+    ) -> TurboOutcome {
+        if matches!(self.turbo_info().state, TurboState::Disabled | TurboState::Unavailable(_)) {
+            return TurboOutcome::NotUsed;
+        }
+        let ticket = match self.request_turbo_ticket(remote_path).await {
+            Ok(ticket) => ticket,
+            Err(TicketError::Unavailable(reason)) => {
+                self.set_turbo_state(TurboState::Unavailable(reason));
+                return TurboOutcome::NotUsed;
+            }
+            // SFTP will report the real problem (e.g. permission denied).
+            Err(TicketError::Refused(reason)) => {
+                self.note_turbo_fallback(format!("{remote_path}: {reason}"));
+                return TurboOutcome::NotUsed;
+            }
+        };
+        if ticket.size != partial.size {
+            self.note_turbo_fallback(format!("{remote_path}: the file changed size while starting the download"));
+            return TurboOutcome::NotUsed;
+        }
+        let Some(server) = self.turbo_address(&ticket).await else {
+            self.set_turbo_state(TurboState::Unavailable(format!("cannot resolve {} for UDP", self.host)));
+            return TurboOutcome::NotUsed;
+        };
+        match turbo::download(server, &ticket, partial, settings, progress, cancel).await {
+            Ok(result) => {
+                self.set_turbo_state(TurboState::Active);
+                TurboOutcome::Done(result)
+            }
+            Err(TurboError::Failed(DownloadError::Cancelled)) => TurboOutcome::Cancelled,
+            // UDP blocked or service down: stop trying on this connection.
+            Err(TurboError::Unavailable(_)) => {
+                self.set_turbo_state(TurboState::Unavailable(format!(
+                    "no answer from {server} over UDP (is port {}/udp open and the service listening on that address?)",
+                    server.port()
+                )));
+                TurboOutcome::NotUsed
+            }
+            // Anything else: SFTP finishes the missing pieces of this file.
+            Err(TurboError::Failed(error)) => {
+                self.note_turbo_fallback(format!(
+                    "{remote_path}: {error} (finished over SFTP from byte {} of {})",
+                    partial.done_bytes(),
+                    partial.size
+                ));
+                TurboOutcome::NotUsed
+            }
+        }
+    }
+
+    /// UDP address of the turbo service: the host this client connected to
+    /// over SSH, on the ticket's port.
+    ///
+    /// The address in the ticket comes from `SSH_CONNECTION` and is the
+    /// server's *own* address, which behind NAT or port forwarding is a
+    /// private one the client cannot reach; it is only used if the host name
+    /// cannot be resolved.
+    async fn turbo_address(&self, ticket: &Ticket) -> Option<SocketAddr> {
+        if let Ok(mut addresses) = tokio::net::lookup_host((self.host.as_str(), ticket.port)).await {
+            if let Some(address) = addresses.next() {
+                return Some(address);
+            }
+        }
+        let ip = ticket.address.as_deref()?.parse::<std::net::IpAddr>().ok()?;
+        Some(SocketAddr::new(ip, ticket.port))
+    }
+
+    /// Asks the ticket helper for a ticket: writes the path as one line and
+    /// reads one JSON reply line. Requests are serialised on the one channel.
+    async fn request_turbo_ticket(&self, remote_path: &str) -> Result<Ticket, TicketError> {
+        if remote_path.contains('\n') {
+            return Err(TicketError::Refused("file names containing a newline are not supported".into()));
+        }
+        let mut guard = self.tickets.lock().await;
+        let Some(stream) = guard.as_mut() else {
+            return Err(TicketError::Unavailable("the rsftp-turbo helper is not running".into()));
+        };
+        let exchange = async {
+            stream.channel.data(format!("{remote_path}\n").as_bytes()).await
+                .map_err(|error| TicketError::Unavailable(format!("rsftp-turbo channel failed: {error}")))?;
+            let mut exit_status = None;
+            loop {
+                if let Some(end) = stream.stdout.iter().position(|&byte| byte == b'\n') {
+                    let line: Vec<u8> = stream.stdout.drain(..=end).collect();
+                    return parse_reply(&line);
+                }
+                match stream.channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => stream.stdout.extend_from_slice(&data),
+                    Some(ChannelMsg::ExtendedData { data, .. }) => stream.stderr.extend_from_slice(&data),
+                    Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
+                    Some(ChannelMsg::Failure) => {
+                        return Err(TicketError::Unavailable("the server refused to run rsftp-turbo".into()));
+                    }
+                    // Eof may come before the exit status; wait for Close.
+                    Some(ChannelMsg::Close) | None => return Err(helper_exited(exit_status, &stream.stderr)),
+                    Some(_) => {}
+                }
+            }
+        };
+        let result = match tokio::time::timeout(TICKET_TIMEOUT, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(TicketError::Unavailable(
+                "timed out waiting for the rsftp-turbo helper (is rsftp-turbo on the server up to date?)".into(),
+            )),
+        };
+        // A helper that died or stopped answering is unusable from now on.
+        if matches!(result, Err(TicketError::Unavailable(_))) {
+            *guard = None;
+        }
+        result
+    }
+}
+
+/// Interprets one reply line of `rsftp-turbo ticket --stream`.
+fn parse_reply(line: &[u8]) -> Result<Ticket, TicketError> {
+    let reply: StreamReply = serde_json::from_slice(line)
+        .map_err(|error| TicketError::Unavailable(format!("unexpected reply from rsftp-turbo: {error}")))?;
+    match (reply.ticket, reply.error) {
+        (Some(ticket), _) if ticket.version == PROTOCOL_VERSION => Ok(ticket),
+        (Some(ticket), _) => Err(TicketError::Unavailable(format!(
+            "server speaks rsftp-turbo protocol {}, this client {PROTOCOL_VERSION}",
+            ticket.version
+        ))),
+        (None, Some(error)) if reply.service_unavailable => Err(TicketError::Unavailable(error)),
+        (None, Some(error)) => Err(TicketError::Refused(error)),
+        (None, None) => Err(TicketError::Unavailable("empty reply from rsftp-turbo".into())),
+    }
+}
+
+/// Reason text for a ticket helper that exited.
+fn helper_exited(exit_status: Option<u32>, stderr: &[u8]) -> TicketError {
+    let stderr = String::from_utf8_lossy(stderr).trim().trim_start_matches("rsftp-turbo: ").to_owned();
+    TicketError::Unavailable(match exit_status {
+        Some(127) => "rsftp-turbo is not installed on the server (or not on the SSH session's PATH)".into(),
+        _ if stderr.contains("unknown") || stderr.contains("usage") => {
+            "the server's rsftp-turbo is too old (it needs `ticket --stream`); update it".into()
+        }
+        Some(status) if stderr.is_empty() => format!("rsftp-turbo exited with status {status}"),
+        _ if stderr.is_empty() => "rsftp-turbo exited unexpectedly".into(),
+        _ => stderr,
+    })
 }
 
 /// Opens one SSH session channel running the SFTP subsystem.

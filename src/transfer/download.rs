@@ -1,17 +1,12 @@
 //! Bounded, retrying SFTP range-download engine.
 //!
-//! Each segment is fetched through its own SFTP file handle (segments are
-//! spread round-robin over the connection's SFTP channels) and written
-//! directly into its assigned byte range in one pre-sized temporary file.
+//! Each piece is fetched through its own SFTP file handle (pieces are spread
+//! round-robin over the connection's SFTP channels) and written directly into
+//! its byte range of the pre-sized partial file (see `partial.rs`).
 //! Positional writes avoid a shared seek cursor and are safe for concurrent
 //! workers on both Unix and Windows.
 
-use std::{
-    fs::OpenOptions as StdOpenOptions,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use russh_sftp::client::SftpSession;
 use tokio::{
@@ -21,7 +16,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{plan_download_segments, SegmentRange, TransferSettings};
+use super::{partial::Partial, CancelToken, SegmentRange, TransferSettings};
 
 const RETRIES: usize = 3;
 const BUFFER_SIZE: usize = 256 * 1024;
@@ -47,6 +42,8 @@ pub struct DownloadProgress {
     pub file_path: Option<String>,
     /// True only for the terminal update of an individual recursive file.
     pub file_complete: bool,
+    /// The bytes are arriving over rsftp-turbo (UDP) rather than SSH/SFTP.
+    pub accelerated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +51,10 @@ pub struct DownloadResult {
     pub bytes: u64,
     pub segments: u32,
     pub segmented: bool,
+    /// Downloaded over rsftp-turbo (UDP) rather than SFTP.
+    pub accelerated: bool,
+    /// Diagnostic summary (rsftp-turbo statistics), for logs and tooltips.
+    pub details: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,65 +73,62 @@ pub enum DownloadError {
     Worker(String),
     #[error("download size mismatch: expected {expected} bytes, wrote {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
+    #[error("cancelled")]
+    Cancelled,
+    #[error("rsftp-turbo: {0}")]
+    Turbo(String),
 }
 
-/// Download a remote regular file using concurrent positional writes.
+/// Downloads the missing ranges of `partial` over SFTP.
 ///
-/// The temporary output is created and sized once. Each worker writes only
-/// within its non-overlapping range using platform-native positional I/O:
-/// FileExt::write_at on Unix and FileExt::seek_write on Windows. No worker
-/// changes a shared file cursor, and the output handle remains open until all
-/// workers have stopped. The file is flushed and validated before publication.
+/// Missing ranges are split into a few large pieces (one per worker, each at
+/// least the configured segment size) that workers fetch through their own
+/// SFTP handles and write with positional writes. Completed pieces are
+/// recorded in `partial`; the caller publishes the file when it is complete.
 pub async fn download_file(
     sessions: Vec<Arc<SftpSession>>,
     remote_path: &str,
-    destination: &Path,
+    partial: &Arc<Partial>,
     settings: TransferSettings,
     progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+    cancel: CancelToken,
 ) -> Result<DownloadResult, DownloadError> {
-    let Some(sftp) = sessions.first().cloned() else {
-        return Err(DownloadError::Worker("no SFTP channel available".into()));
-    };
-    let metadata = sftp.metadata(remote_path.to_owned()).await
-        .map_err(|e| DownloadError::Sftp(e.to_string()))?;
-    let size = metadata.size.ok_or(DownloadError::UnknownSize)?;
-    let plan = plan_download_segments(size, settings)?;
-    let total_segments = plan.segments.len() as u32;
-
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).await?;
-    let temp_destination = temporary_destination(destination);
-
-    // create_new prevents accidentally reusing a stale temporary file. On
-    // Windows the handle is deliberately kept open until every worker exits.
-    let output = StdOpenOptions::new()
-        .write(true)
-        .read(true)
-        .create_new(true)
-        .open(&temp_destination)?;
-    output.set_len(size)?;
-    let output = Arc::new(output);
-
-    if size == 0 {
-        output.sync_all()?;
-        drop(output);
-        publish_temporary_file(&temp_destination, destination).await?;
-        if let Some(tx) = &progress {
-            let _ = tx.send(DownloadProgress {
-                total_bytes: 0, transferred_bytes: 0,
-                completed_segments: 0, total_segments: 0, segment: None,
-            
-                file_path: None,
-                file_complete: false,});
-        }
-        return Ok(DownloadResult { bytes: 0, segments: 0, segmented: false });
+    if cancel.is_cancelled() {
+        return Err(DownloadError::Cancelled);
     }
+    if sessions.is_empty() {
+        return Err(DownloadError::Worker("no SFTP channel available".into()));
+    }
+    let size = partial.size;
+    let missing = partial.missing();
+    let missing_bytes: u64 = missing.iter().map(|(start, end)| end - start).sum();
+    if missing_bytes == 0 {
+        return Ok(DownloadResult { bytes: size, segments: 0, segmented: false, accelerated: false, details: None });
+    }
+    if settings.target_segment_size_bytes == 0 || settings.max_segments_per_file == 0 {
+        return Err(DownloadError::Plan(super::SegmentPlanError::ZeroSegmentSize));
+    }
+    // Few, large pieces: each SFTP handle reads ahead past its piece's end,
+    // so many small pieces would waste bandwidth.
+    let piece_len = if missing_bytes < settings.segmentation_threshold_bytes {
+        u64::MAX
+    } else {
+        settings
+            .target_segment_size_bytes
+            .max(missing_bytes.div_ceil(u64::from(settings.max_segments_per_file)))
+    };
+    let pieces: Vec<SegmentRange> = super::partial::split(&missing, piece_len)
+        .into_iter()
+        .map(|(start, end_exclusive)| SegmentRange { index: partial.next_index(), start, end_exclusive })
+        .collect();
+    let total_segments = pieces.len() as u32;
 
     if let Some(tx) = &progress {
-        for range in &plan.segments {
+        let done = partial.done_bytes();
+        for range in &pieces {
             let _ = tx.send(DownloadProgress {
                 total_bytes: size,
-                transferred_bytes: 0,
+                transferred_bytes: done,
                 completed_segments: 0,
                 total_segments,
                 segment: Some(SegmentProgress {
@@ -138,18 +136,19 @@ pub async fn download_file(
                     end_exclusive: range.end_exclusive,
                     transferred_bytes: 0, complete: false, failed: false,
                 }),
-            
                 file_path: None,
-                file_complete: false,});
+                file_complete: false, accelerated: false,
+            });
         }
     }
 
-    let transferred = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let output = partial.file();
+    let transferred = Arc::new(std::sync::atomic::AtomicU64::new(partial.done_bytes()));
     let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let permits = Arc::new(Semaphore::new(settings.max_segments_per_file.max(1) as usize));
     let mut workers = JoinSet::new();
 
-    for range in plan.segments.iter().copied() {
+    for range in pieces.iter().copied() {
         let session = Arc::clone(&sessions[range.index as usize % sessions.len()]);
         let remote = remote_path.to_owned();
         let output_file = Arc::clone(&output);
@@ -157,64 +156,39 @@ pub async fn download_file(
         let progress_tx = progress.clone();
         let transferred_bytes = Arc::clone(&transferred);
         let completed_segments = Arc::clone(&completed);
+        let cancel = cancel.clone();
+        let partial = Arc::clone(partial);
 
         workers.spawn(async move {
-            let _permit = permit_pool.acquire_owned().await
-                .map_err(|e| DownloadError::Worker(e.to_string()))?;
+            let _permit = tokio::select! {
+                permit = permit_pool.acquire_owned() => permit.map_err(|e| DownloadError::Worker(e.to_string()))?,
+                _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
+            };
             fetch_segment(
                 session, &remote, output_file, range, size,
-                progress_tx, transferred_bytes, completed_segments, total_segments,
-            ).await
+                progress_tx, transferred_bytes, completed_segments, total_segments, cancel,
+            ).await?;
+            partial.mark_done(range.start, range.end_exclusive);
+            Ok(())
         });
     }
 
+    // Every worker is joined before returning, so no positional write is
+    // still running when the caller publishes or discards the file.
     let mut failure = None;
     while let Some(joined) = workers.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
-            }
-            Err(error) => {
-                if failure.is_none() {
-                    failure = Some(DownloadError::Worker(error.to_string()));
-                }
-            }
+        let result = joined.unwrap_or_else(|error| Err(DownloadError::Worker(error.to_string())));
+        if let Err(error) = result {
+            failure.get_or_insert(error);
         }
     }
-
-    // Let every worker exit before closing the output handle. In particular,
-    // this ensures no spawn_blocking positional write is still active on
-    // Windows when the temporary file is cleaned up or renamed.
-
     if let Some(error) = failure {
-        drop(output);
-        let _ = fs::remove_file(&temp_destination).await;
         return Err(error);
     }
-
-    output.sync_all()?;
-    drop(output);
-
-    // The file is pre-sized, so metadata length alone cannot prove every byte
-    // was received. Verify the successful segment byte count as well.
-    let written = transferred.load(std::sync::atomic::Ordering::Relaxed);
-    let actual = fs::metadata(&temp_destination).await?.len();
-    if written != size || actual != size {
-        let _ = fs::remove_file(&temp_destination).await;
-        return Err(DownloadError::SizeMismatch {
-            expected: size,
-            actual: written.min(actual),
-        });
-    }
-
-    publish_temporary_file(&temp_destination, destination).await?;
-    Ok(DownloadResult { bytes: size, segments: total_segments, segmented: plan.is_segmented() })
+    Ok(DownloadResult { bytes: size, segments: total_segments, segmented: total_segments > 1, accelerated: false, details: None })
 }
 
-async fn publish_temporary_file(temp: &Path, destination: &Path) -> Result<(), DownloadError> {
+pub(crate) async fn publish_temporary_file(temp: &Path, destination: &Path) -> Result<(), DownloadError> {
     // std::fs::rename does not replace an existing destination on Windows.
     // Close our handles first, then remove the old file and rename. If another
     // process has it open without delete sharing, Windows returns an I/O error.
@@ -235,6 +209,7 @@ async fn fetch_segment(
     transferred: Arc<std::sync::atomic::AtomicU64>,
     completed: Arc<std::sync::atomic::AtomicU32>,
     total_segments: u32,
+    cancel: CancelToken,
 ) -> Result<(), DownloadError> {
     let mut last_error = String::new();
 
@@ -252,7 +227,10 @@ async fn fetch_segment(
 
             while remaining > 0 {
                 let wanted = remaining.min(buffer.len() as u64) as usize;
-                let read = remote.read(&mut buffer[..wanted]).await.map_err(|e| e.to_string())?;
+                let read = tokio::select! {
+                    read = remote.read(&mut buffer[..wanted]) => read.map_err(|e| e.to_string())?,
+                    _ = cancel.cancelled() => return Err("cancelled".to_owned()),
+                };
                 if read == 0 {
                     return Err(format!("unexpected EOF at byte {offset}"));
                 }
@@ -281,7 +259,7 @@ async fn fetch_segment(
                         }),
                     
                 file_path: None,
-                file_complete: false,});
+                file_complete: false, accelerated: false,});
                 }
             }
             Ok::<(), String>(())
@@ -301,7 +279,7 @@ async fn fetch_segment(
                         }),
                     
                 file_path: None,
-                file_complete: false,});
+                file_complete: false, accelerated: false,});
                 }
                 return Ok(());
             }
@@ -321,8 +299,12 @@ async fn fetch_segment(
                             }),
                         
                 file_path: None,
-                file_complete: false,});
+                file_complete: false, accelerated: false,});
                     }
+                }
+                // A cancelled segment is not retried or reported as failed.
+                if cancel.is_cancelled() {
+                    return Err(DownloadError::Cancelled);
                 }
                 if attempt < RETRIES {
                     tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
@@ -343,14 +325,14 @@ async fn fetch_segment(
             }),
         
                 file_path: None,
-                file_complete: false,});
+                file_complete: false, accelerated: false,});
     }
 
     Err(DownloadError::Segment { index: range.index, attempts: RETRIES, message: last_error })
 }
 
 #[cfg(unix)]
-fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     while !buffer.is_empty() {
         let written = file.write_at(buffer, offset)?;
@@ -364,7 +346,7 @@ fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std
 }
 
 #[cfg(windows)]
-fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buffer.is_empty() {
         let written = file.seek_write(buffer, offset)?;
@@ -377,7 +359,3 @@ fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std
     Ok(())
 }
 
-fn temporary_destination(destination: &Path) -> PathBuf {
-    let name = destination.file_name().unwrap_or_default().to_string_lossy();
-    destination.with_file_name(format!(".{name}.sftp-download-{}.tmp", std::process::id()))
-}
