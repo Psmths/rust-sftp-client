@@ -42,6 +42,9 @@ struct TransferItem {
     segments: Vec<SegmentProgress>,
     started_at: Option<Instant>,
     finished_at: Option<Instant>,
+    last_speed_sample_at: Option<Instant>,
+    last_speed_sample_bytes: u64,
+    speed_mib_s: f64,
     state: String,
 }
 
@@ -357,6 +360,9 @@ impl SftpApp {
                 segments: Vec::new(),
                 started_at: None,
                 finished_at: None,
+                last_speed_sample_at: None,
+                last_speed_sample_bytes: 0,
+                speed_mib_s: 0.0,
                 state: "Queued".into(),
             });
             let connection = connection.clone();
@@ -399,12 +405,34 @@ impl SftpApp {
             match event {
                 QueueEvent::Started { id } => {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
-                        item.started_at = Some(Instant::now());
+                        let now = Instant::now();
+                        item.started_at = Some(now);
+                        item.last_speed_sample_at = Some(now);
+                        item.last_speed_sample_bytes = 0;
+                        item.speed_mib_s = 0.0;
                         item.state = "Downloading".into();
                     }
                 }
                 QueueEvent::Progress { id, progress } => {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+                        let now = Instant::now();
+                        if progress.transferred_bytes < item.last_speed_sample_bytes {
+                            // A segment retry rolled the aggregate counter back.
+                            item.last_speed_sample_bytes = progress.transferred_bytes;
+                            item.last_speed_sample_at = Some(now);
+                            item.speed_mib_s = 0.0;
+                        } else if let Some(sampled_at) = item.last_speed_sample_at {
+                            let elapsed = now.saturating_duration_since(sampled_at);
+                            if elapsed >= Duration::from_millis(250) {
+                                let delta = progress.transferred_bytes - item.last_speed_sample_bytes;
+                                item.speed_mib_s = delta as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+                                item.last_speed_sample_bytes = progress.transferred_bytes;
+                                item.last_speed_sample_at = Some(now);
+                            }
+                        } else {
+                            item.last_speed_sample_at = Some(now);
+                            item.last_speed_sample_bytes = progress.transferred_bytes;
+                        }
                         item.transferred = progress.transferred_bytes;
                         item.total = progress.total_bytes;
                         if let Some(segment) = progress.segment {
@@ -451,40 +479,66 @@ impl SftpApp {
         });
         ui.horizontal(|ui| {
             if ui.small_button("Parent").clicked() {
-                if let Some(parent) = self.path.parent() { self.path = parent.to_path_buf(); self.refresh_local(); }
+                if let Some(parent) = self.path.parent() { self.path = parent.to_path_buf(); self.local_selected = None; self.refresh_local(); }
             }
             ui.add(egui::TextEdit::singleline(&mut self.local_filter).hint_text("Filter files").desired_width(f32::INFINITY));
         });
         ui.label(egui::RichText::new(self.path.display().to_string()).small().monospace().color(egui::Color32::from_rgb(115,165,205)));
         ui.separator();
-        egui::Grid::new("local_header").num_columns(4).show(ui, |ui| {
-            for (header, width) in [("NAME", 0.0), ("SIZE", 76.0), ("MODIFIED (UTC)", 178.0), ("TYPE", 42.0)] {
-                let label = egui::RichText::new(header).small().strong().monospace();
-                if width == 0.0 { ui.label(label); } else { ui.add_sized([width, 18.0], egui::Label::new(label).halign(egui::Align::LEFT)); }
-            }
-            ui.end_row();
+
+        const SIZE_WIDTH: f32 = 76.0;
+        const MODIFIED_WIDTH: f32 = 178.0;
+        const TYPE_WIDTH: f32 = 42.0;
+        let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([name_width, 18.0], egui::Label::new(egui::RichText::new("NAME").small().strong().monospace()).halign(egui::Align::LEFT));
+            ui.add_sized([SIZE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("SIZE").small().strong().monospace()).halign(egui::Align::LEFT));
+            ui.add_sized([MODIFIED_WIDTH, 18.0], egui::Label::new(egui::RichText::new("MODIFIED (UTC)").small().strong().monospace()).halign(egui::Align::LEFT));
+            ui.add_sized([TYPE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("TYPE").small().strong().monospace()).halign(egui::Align::LEFT));
         });
         ui.separator();
+
         let filter = self.local_filter.to_lowercase();
-        let rows: Vec<LocalEntry> = self.local_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        let mut rows: Vec<LocalEntry> = self.local_entries.iter()
+            .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        if let Some(parent) = self.path.parent() {
+            rows.insert(0, LocalEntry {
+                name: "..".into(), path: parent.to_path_buf(), dir: true,
+                size: 0, modified: "—".into(),
+            });
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("local_rows").num_columns(4).striped(true).min_col_width(0.0).show(ui, |ui| {
-                for entry in rows {
+            for entry in rows {
+                let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
+                ui.horizontal(|ui| {
                     let response = ui.add_sized(
-                        [ui.available_width().max(180.0), 22.0],
-                        egui::Button::selectable(self.local_selected.as_ref() == Some(&entry.path), egui::RichText::new(&entry.name).monospace()),
+                        [name_width, 22.0],
+                        egui::Button::selectable(
+                            self.local_selected.as_ref() == Some(&entry.path),
+                            egui::RichText::new(&entry.name).monospace(),
+                        ).halign(egui::Align::LEFT),
                     );
                     if response.clicked() { self.local_selected = Some(entry.path.clone()); }
-                    if response.double_clicked() && entry.dir { self.path = entry.path.clone(); self.local_selected = None; self.refresh_local(); }
-                    ui.add_sized([76.0, 22.0], egui::Label::new(egui::RichText::new(if entry.dir { "—".into() } else { size_text(entry.size) }).small().monospace()).halign(egui::Align::LEFT));
-                    ui.add_sized([178.0, 22.0], egui::Label::new(egui::RichText::new(entry.modified).small().monospace()).halign(egui::Align::LEFT));
-                    ui.add_sized([42.0, 22.0], egui::Label::new(egui::RichText::new(if entry.dir { "DIR" } else { "FILE" }).small().monospace()).halign(egui::Align::LEFT));
-                    ui.end_row();
-                }
-            });
+                    if response.double_clicked() && entry.dir {
+                        self.path = entry.path.clone();
+                        self.local_selected = None;
+                        self.refresh_local();
+                    }
+                    ui.add_sized([SIZE_WIDTH, 22.0], egui::Label::new(
+                        egui::RichText::new(if entry.dir { "—".into() } else { size_text(entry.size) }).small().monospace()
+                    ).halign(egui::Align::LEFT));
+                    ui.add_sized([MODIFIED_WIDTH, 22.0], egui::Label::new(
+                        egui::RichText::new(entry.modified).small().monospace()
+                    ).halign(egui::Align::LEFT));
+                    ui.add_sized([TYPE_WIDTH, 22.0], egui::Label::new(
+                        egui::RichText::new(if entry.dir { "DIR" } else { "FILE" }).small().monospace()
+                    ).halign(egui::Align::LEFT));
+                });
+            }
         });
         ui.separator();
-        ui.label(egui::RichText::new(format!("{} visible entries", self.local_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count())).small().weak());
+        let visible = self.local_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
+        ui.label(egui::RichText::new(format!("{visible} visible entries")).small().weak());
     }
 
     fn remote_pane(&mut self, ui: &mut egui::Ui) {
@@ -511,12 +565,16 @@ impl SftpApp {
         });
         ui.label(egui::RichText::new(&self.remote_path).small().monospace().color(egui::Color32::from_rgb(115, 165, 205)));
         ui.separator();
-        egui::Grid::new("remote_header").num_columns(4).show(ui, |ui| {
-            for (header, width) in [("NAME", 0.0), ("SIZE", 76.0), ("MODIFIED (UTC)", 178.0), ("TYPE", 42.0)] {
-                let label = egui::RichText::new(header).small().strong().monospace();
-                if width == 0.0 { ui.label(label); } else { ui.add_sized([width, 18.0], egui::Label::new(label).halign(egui::Align::LEFT)); }
-            }
-            ui.end_row();
+
+        const SIZE_WIDTH: f32 = 76.0;
+        const MODIFIED_WIDTH: f32 = 178.0;
+        const TYPE_WIDTH: f32 = 42.0;
+        let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([name_width, 18.0], egui::Label::new(egui::RichText::new("NAME").small().strong().monospace()).halign(egui::Align::LEFT));
+            ui.add_sized([SIZE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("SIZE").small().strong().monospace()).halign(egui::Align::LEFT));
+            ui.add_sized([MODIFIED_WIDTH, 18.0], egui::Label::new(egui::RichText::new("MODIFIED (UTC)").small().strong().monospace()).halign(egui::Align::LEFT));
+            ui.add_sized([TYPE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("TYPE").small().strong().monospace()).halign(egui::Align::LEFT));
         });
         ui.separator();
         if self.connection.is_none() {
@@ -528,15 +586,27 @@ impl SftpApp {
             });
             return;
         }
+
         let filter = self.remote_filter.to_lowercase();
-        let rows: Vec<RemoteEntry> = self.remote_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        let mut rows: Vec<RemoteEntry> = self.remote_entries.iter()
+            .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        if self.remote_path.trim_end_matches('/') != "/" {
+            rows.insert(0, RemoteEntry {
+                name: "..".into(), path: remote_parent(&self.remote_path), dir: true,
+                size: 0, modified: "—".into(),
+            });
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("remote_rows").num_columns(4).striped(true).min_col_width(0.0).show(ui, |ui| {
-                for entry in rows {
+            for entry in rows {
+                let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
+                ui.horizontal(|ui| {
                     let selected = self.remote_selected.contains(&entry.path);
                     let response = ui.add_sized(
-                        [ui.available_width().max(180.0), 22.0],
-                        egui::Button::selectable(selected, egui::RichText::new(&entry.name).monospace()),
+                        [name_width, 22.0],
+                        egui::Button::selectable(
+                            selected,
+                            egui::RichText::new(&entry.name).monospace(),
+                        ).halign(egui::Align::LEFT),
                     );
                     if response.clicked() {
                         let multi = response.ctx.input(|input| input.modifiers.ctrl || input.modifiers.command);
@@ -549,15 +619,21 @@ impl SftpApp {
                         }
                     }
                     if response.double_clicked() && entry.dir { self.navigate_remote(entry.path.clone()); }
-                    ui.add_sized([76.0, 22.0], egui::Label::new(egui::RichText::new(if entry.dir { "—".into() } else { size_text(entry.size) }).small().monospace()).halign(egui::Align::LEFT));
-                    ui.add_sized([178.0, 22.0], egui::Label::new(egui::RichText::new(entry.modified).small().monospace()).halign(egui::Align::LEFT));
-                    ui.add_sized([42.0, 22.0], egui::Label::new(egui::RichText::new(if entry.dir { "DIR" } else { "FILE" }).small().monospace()).halign(egui::Align::LEFT));
-                    ui.end_row();
-                }
-            });
+                    ui.add_sized([SIZE_WIDTH, 22.0], egui::Label::new(
+                        egui::RichText::new(if entry.dir { "—".into() } else { size_text(entry.size) }).small().monospace()
+                    ).halign(egui::Align::LEFT));
+                    ui.add_sized([MODIFIED_WIDTH, 22.0], egui::Label::new(
+                        egui::RichText::new(entry.modified).small().monospace()
+                    ).halign(egui::Align::LEFT));
+                    ui.add_sized([TYPE_WIDTH, 22.0], egui::Label::new(
+                        egui::RichText::new(if entry.dir { "DIR" } else { "FILE" }).small().monospace()
+                    ).halign(egui::Align::LEFT));
+                });
+            }
         });
         ui.separator();
-        ui.label(egui::RichText::new(format!("{} selected · {} visible entries", self.remote_selected.len(), self.remote_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count())).small().weak());
+        let visible = self.remote_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
+        ui.label(egui::RichText::new(format!("{} selected · {visible} visible entries", self.remote_selected.len())).small().weak());
     }
 
     fn dialog_window(&mut self, ctx: &egui::Context) {
@@ -775,7 +851,12 @@ impl eframe::App for SftpApp {
                 ui.label(egui::RichText::new("v0.1.0 · NATIVE RUST").small().weak());
             });
         });
-        egui::TopBottomPanel::bottom("queue").resizable(true).default_height(150.0).min_height(80.0).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("queue")
+            .resizable(true)
+            .default_height(170.0)
+            .min_height(90.0)
+            .max_height(600.0)
+            .show(ctx, |ui| {
             let queued = self.transfers.iter().filter(|item| item.state == "Queued").count();
             let active = self.transfers.iter().filter(|item| item.state == "Downloading").count();
             let failed = self.transfers.iter().filter(|item| item.state.starts_with("Failed")).count();
@@ -790,15 +871,17 @@ impl eframe::App for SftpApp {
                 } else {
                     let file_width = 190.0;
                     let percent_width = 105.0;
+                    let speed_width = 95.0;
                     let elapsed_width = 95.0;
                     let remaining_width = 110.0;
                     let row_height = 22.0;
                     ui.horizontal(|ui| {
                         ui.add_sized([file_width, row_height], egui::Label::new(egui::RichText::new("FILE").small().strong()));
-                        let progress_width = (ui.available_width() - percent_width - elapsed_width - remaining_width - 24.0).max(220.0);
+                        let progress_width = (ui.available_width() - percent_width - speed_width - elapsed_width - remaining_width - 30.0).max(160.0);
                         ui.add_sized([progress_width, row_height], egui::Label::new(egui::RichText::new("PROGRESS").small().strong()));
-                        ui.add_sized([percent_width, row_height], egui::Label::new(egui::RichText::new("PERCENT COMPLETE").small().strong()));
-                        ui.add_sized([elapsed_width, row_height], egui::Label::new(egui::RichText::new("TIME ELAPSED").small().strong()));
+                        ui.add_sized([percent_width, row_height], egui::Label::new(egui::RichText::new("PERCENT COMPLETE").small().strong()).halign(egui::Align::LEFT));
+                        ui.add_sized([speed_width, row_height], egui::Label::new(egui::RichText::new("SPEED (MiB/s)").small().strong()).halign(egui::Align::LEFT));
+                        ui.add_sized([elapsed_width, row_height], egui::Label::new(egui::RichText::new("TIME ELAPSED").small().strong()).halign(egui::Align::LEFT));
                         ui.add_sized([remaining_width, row_height], egui::Label::new(egui::RichText::new("TIME REMAINING").small().strong()));
                     });
                     ui.separator();
@@ -807,7 +890,7 @@ impl eframe::App for SftpApp {
                             ui.add_sized([file_width, row_height], egui::Label::new(
                                 egui::RichText::new(&item.name).monospace().small()
                             ).truncate());
-                            let progress_width = (ui.available_width() - percent_width - elapsed_width - remaining_width - 24.0).max(220.0);
+                            let progress_width = (ui.available_width() - percent_width - speed_width - elapsed_width - remaining_width - 30.0).max(160.0);
                             let bar_height = 15.0;
                             let (bar_rect, response) = ui.allocate_exact_size(
                                 egui::vec2(progress_width, bar_height), egui::Sense::hover()
@@ -878,7 +961,10 @@ impl eframe::App for SftpApp {
                             } else { item.transferred as f64 * 100.0 / item.total as f64 };
                             ui.add_sized([percent_width, row_height], egui::Label::new(
                                 egui::RichText::new(format!("{percent:.1}%")).small().monospace()
-                            ));
+                            ).halign(egui::Align::LEFT));
+                            ui.add_sized([speed_width, row_height], egui::Label::new(
+                                egui::RichText::new(if item.state == "Queued" { "—".into() } else { format!("{:.2}", item.speed_mib_s) }).small().monospace()
+                            ).halign(egui::Align::LEFT));
                             let elapsed = item.started_at.map(|start| {
                                 item.finished_at.unwrap_or_else(Instant::now).saturating_duration_since(start)
                             });
@@ -953,6 +1039,8 @@ fn join_remote(parent: &str, name: &str) -> String {
 fn remote_parent(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" { return "/".into(); }
+    if trimmed == "." { return "..".into(); }
+    if trimmed == ".." { return "../..".into(); }
     match trimmed.rsplit_once('/') {
         Some(("", _)) => "/".into(),
         Some((parent, _)) if !parent.is_empty() => parent.to_owned(),
