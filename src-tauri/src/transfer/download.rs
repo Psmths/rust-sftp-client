@@ -107,7 +107,7 @@ pub async fn download_file(
 
         workers.spawn(async move {
             let _permit = permit_pool.acquire_owned().await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| DownloadError::Worker(e.to_string()))?;
             fetch_segment(
                 session, &remote, &part_path, range, size,
                 progress_tx, transferred_bytes, completed_segments, total_segments,
@@ -170,6 +170,7 @@ async fn fetch_segment(
     let mut last_error = String::new();
 
     for attempt in 1..=RETRIES {
+        let mut attempt_transferred = 0_u64;
         let result = async {
             let mut remote = sftp.open(remote_path.to_owned()).await
                 .map_err(|e| e.to_string())?;
@@ -189,6 +190,7 @@ async fn fetch_segment(
                 local.write_all(&buffer[..read]).await.map_err(|e| e.to_string())?;
                 remaining -= read as u64;
 
+                attempt_transferred += read as u64;
                 let now = transferred.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed) + read as u64;
                 if let Some(tx) = &progress {
                     let _ = tx.send(DownloadProgress {
@@ -220,6 +222,17 @@ async fn fetch_segment(
             }
             Err(error) => {
                 last_error = error;
+                if attempt_transferred > 0 {
+                    transferred.fetch_sub(attempt_transferred, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(tx) = &progress {
+                        let _ = tx.send(DownloadProgress {
+                            total_bytes: total_size,
+                            transferred_bytes: transferred.load(std::sync::atomic::Ordering::Relaxed),
+                            completed_segments: completed.load(std::sync::atomic::Ordering::Relaxed),
+                            total_segments,
+                        });
+                    }
+                }
                 let _ = fs::remove_file(part_path).await;
                 if attempt < RETRIES {
                     tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
