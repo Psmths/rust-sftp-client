@@ -186,7 +186,12 @@ impl SftpConnection {
 
         let mut transferred = 0_u64;
         let mut buffer = vec![0_u8; 256 * 1024];
-        for (local, remote, _) in files {
+        for (local, remote, file_size) in files {
+            let relative = local.strip_prefix(local_path).ok()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| local.file_name().map(PathBuf::from).as_deref().unwrap_or(&local))
+                .to_string_lossy().to_string();
+            let mut file_transferred = 0_u64;
             let mut input = fs::File::open(&local).await
                 .map_err(crate::transfer::DownloadError::Io)?;
             let mut output = self.sftp.create(remote).await
@@ -198,18 +203,27 @@ impl SftpConnection {
                 output.write_all(&buffer[..count]).await
                     .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
                 transferred = transferred.saturating_add(count as u64);
+                file_transferred = file_transferred.saturating_add(count as u64);
                 if let Some(tx) = &progress {
                     let _ = tx.send(DownloadProgress {
-                        total_bytes: total,
-                        transferred_bytes: transferred,
+                        total_bytes: file_size,
+                        transferred_bytes: file_transferred,
                         completed_segments: 0,
                         total_segments: 0,
                         segment: None,
+                        file_path: Some(relative.clone()),
                     });
                 }
             }
             output.close().await
                 .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+            if let Some(tx) = &progress {
+                let _ = tx.send(DownloadProgress {
+                    total_bytes: file_size, transferred_bytes: file_transferred,
+                    completed_segments: 0, total_segments: 0, segment: None,
+                    file_path: Some(relative),
+                });
+            }
         }
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
@@ -267,6 +281,13 @@ impl SftpConnection {
         let mut segment_count = 0_u32;
         let mut segmented = false;
         for (remote, local) in files {
+            let relative = local.strip_prefix(destination).ok()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| local.file_name().map(PathBuf::from).as_deref().unwrap_or(&local))
+                .to_string_lossy().to_string();
+            let file_size = self.sftp.metadata(remote.clone()).await
+                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?
+                .size.unwrap_or(0);
             let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
             let download = download_file(Arc::clone(&self.sftp), &remote, &local, settings, Some(inner_tx));
             tokio::pin!(download);
@@ -279,9 +300,9 @@ impl SftpConnection {
                         segmented |= result.segmented;
                         if let Some(tx) = &progress {
                             let _ = tx.send(DownloadProgress {
-                                total_bytes: total, transferred_bytes: completed,
-                                completed_segments: segment_count, total_segments: segment_count,
-                                segment: None,
+                                total_bytes: result.bytes, transferred_bytes: result.bytes,
+                                completed_segments: result.segments, total_segments: result.segments,
+                                segment: None, file_path: Some(relative.clone()),
                             });
                         }
                         break;
@@ -289,19 +310,20 @@ impl SftpConnection {
                     update = inner_rx.recv() => {
                         if let (Some(tx), Some(update)) = (&progress, update) {
                             let segment = update.segment.map(|segment| SegmentProgress {
-                                index: segment_count.saturating_add(segment.index),
-                                start: completed.saturating_add(segment.start),
-                                end_exclusive: completed.saturating_add(segment.end_exclusive),
+                                index: segment.index,
+                                start: segment.start,
+                                end_exclusive: segment.end_exclusive,
                                 transferred_bytes: segment.transferred_bytes,
                                 complete: segment.complete,
                                 failed: segment.failed,
                             });
                             let _ = tx.send(DownloadProgress {
-                                total_bytes: total,
-                                transferred_bytes: completed.saturating_add(update.transferred_bytes),
-                                completed_segments: segment_count.saturating_add(update.completed_segments),
-                                total_segments: segment_count.saturating_add(update.total_segments),
+                                total_bytes: file_size,
+                                transferred_bytes: update.transferred_bytes,
+                                completed_segments: update.completed_segments,
+                                total_segments: update.total_segments,
                                 segment,
+                                file_path: Some(relative.clone()),
                             });
                         }
                     }

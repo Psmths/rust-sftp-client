@@ -35,6 +35,7 @@ struct RemoteEntry {
 #[derive(Clone)]
 struct TransferItem {
     id: usize,
+    operation_id: Option<usize>,
     name: String,
     destination: PathBuf,
     transferred: u64,
@@ -359,6 +360,7 @@ impl SftpApp {
             let destination = self.path.join(&entry.name);
             self.transfers.push(TransferItem {
                 id,
+                operation_id: None,
                 name: entry.name.clone(),
                 destination: destination.clone(),
                 transferred: 0,
@@ -423,7 +425,7 @@ impl SftpApp {
         let id = self.next_transfer_id;
         self.next_transfer_id += 1;
         self.transfers.push(TransferItem {
-            id, name: name.clone(), destination: local_path.clone(), transferred: 0, total,
+            id, operation_id: None, name: name.clone(), destination: local_path.clone(), transferred: 0, total,
             segments: Vec::new(), started_at: None, finished_at: None,
             last_speed_sample_at: None, last_speed_sample_bytes: 0, speed_mib_s: 0.0,
             state: "Queued".into(),
@@ -468,7 +470,7 @@ impl SftpApp {
         let id = self.next_transfer_id;
         self.next_transfer_id += 1;
         self.transfers.push(TransferItem {
-            id, name: name.clone(), destination: destination.clone(), transferred: 0, total: 0,
+            id, operation_id: None, name: name.clone(), destination: destination.clone(), transferred: 0, total: 0,
             segments: Vec::new(), started_at: None, finished_at: None,
             last_speed_sample_at: None, last_speed_sample_bytes: 0, speed_mib_s: 0.0,
             state: "Queued".into(),
@@ -521,7 +523,24 @@ impl SftpApp {
                     }
                 }
                 QueueEvent::Progress { id, progress } => {
-                    if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+                    let target_id = if let Some(relative) = progress.file_path.as_ref() {
+                        if let Some(existing) = self.transfers.iter().find(|item| item.operation_id == Some(id) && item.name == *relative) {
+                            existing.id
+                        } else {
+                            self.transfers.retain(|item| item.id != id);
+                            let child_id = self.next_transfer_id;
+                            self.next_transfer_id += 1;
+                            self.transfers.push(TransferItem {
+                                id: child_id, operation_id: Some(id), name: relative.clone(),
+                                destination: PathBuf::from(relative), transferred: 0, total: progress.total_bytes,
+                                segments: Vec::new(), started_at: Some(Instant::now()), finished_at: None,
+                                last_speed_sample_at: Some(Instant::now()), last_speed_sample_bytes: 0,
+                                speed_mib_s: 0.0, state: "Downloading".into(),
+                            });
+                            child_id
+                        }
+                    } else { id };
+                    if let Some(item) = self.transfers.iter_mut().find(|item| item.id == target_id) {
                         let now = Instant::now();
                         if progress.transferred_bytes < item.last_speed_sample_bytes {
                             // A segment retry rolled the aggregate counter back.
@@ -542,6 +561,10 @@ impl SftpApp {
                         }
                         item.transferred = progress.transferred_bytes;
                         item.total = progress.total_bytes;
+                        if progress.file_path.is_some() && progress.transferred_bytes >= progress.total_bytes {
+                            item.finished_at = Some(now);
+                            item.state = "Complete".into();
+                        }
                         if let Some(segment) = progress.segment {
                             if let Some(existing) = item.segments.iter_mut().find(|s| s.index == segment.index) {
                                 *existing = segment;
@@ -556,21 +579,40 @@ impl SftpApp {
                     }
                 }
                 QueueEvent::Finished { id, result } => {
-                    if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
-                        match result {
-                            Ok(result) => {
+                    let child_exists = self.transfers.iter().any(|item| item.operation_id == Some(id));
+                    match result {
+                        Ok(result) => {
+                            if child_exists {
+                                for item in self.transfers.iter_mut().filter(|item| item.operation_id == Some(id)) {
+                                    if item.state != "Complete" {
+                                        item.finished_at = Some(Instant::now());
+                                        item.transferred = item.total;
+                                        item.state = "Complete".into();
+                                    }
+                                }
+                            } else if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
                                 item.finished_at = Some(Instant::now());
                                 item.transferred = result.bytes;
                                 item.total = result.bytes;
                                 item.state = "Complete".into();
                             }
-                            Err(error) => {
+                        }
+                        Err(error) => {
+                            let mut marked = false;
+                            for item in self.transfers.iter_mut().filter(|item| item.operation_id == Some(id)) {
                                 item.finished_at = Some(Instant::now());
                                 for segment in &mut item.segments {
                                     if !segment.complete { segment.failed = true; }
                                 }
                                 item.state = format!("Failed: {error}");
-                            },
+                                marked = true;
+                            }
+                            if !marked {
+                                if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+                                    item.finished_at = Some(Instant::now());
+                                    item.state = format!("Failed: {error}");
+                                }
+                            }
                         }
                     }
                 }

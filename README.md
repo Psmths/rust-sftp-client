@@ -31,9 +31,9 @@ The executable is written to `target/release/rust-sftp-client`.
 - Store trusted fingerprints in `~/.config/rust-sftp-client/known_hosts.json`.
 - Browse remote directories, navigate into directories and to the parent, and filter remote entries.
 - Select multiple remote files with Ctrl/Command-click and download them into the current local pane directory.
-- Drag local files or folders onto the remote pane to upload them recursively.
-- Drag remote files or folders onto the local pane to download them recursively; large files retain segmented downloads.
-- Show queued, active, completed, and failed downloads with byte progress.
+- Drag local files or folders onto the remote pane to upload them recursively; each discovered file appears as its own transfer row.
+- Drag remote files or folders onto the local pane to download them recursively; each discovered file appears as its own transfer row and large files retain segmented downloads.
+- Show per-file queued, active, completed, and failed transfers with independent byte progress, elapsed time, and ETA.
 - Download large files through the existing bounded, retrying segmented range-download engine.
 - Open connection, password, host-key trust, error, and transfer-settings prompts in separate native windows.
 

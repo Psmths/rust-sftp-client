@@ -42,6 +42,8 @@ pub struct DownloadProgress {
     pub completed_segments: u32,
     pub total_segments: u32,
     pub segment: Option<SegmentProgress>,
+    /// Relative path of the file within a recursive transfer.
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +113,8 @@ pub async fn download_file(
             let _ = tx.send(DownloadProgress {
                 total_bytes: 0, transferred_bytes: 0,
                 completed_segments: 0, total_segments: 0, segment: None,
-            });
+            
+                file_path: None,});
         }
         return Ok(DownloadResult { bytes: 0, segments: 0, segmented: false });
     }
@@ -128,7 +131,8 @@ pub async fn download_file(
                     end_exclusive: range.end_exclusive,
                     transferred_bytes: 0, complete: false, failed: false,
                 }),
-            });
+            
+                file_path: None,});
         }
     }
 
@@ -267,7 +271,8 @@ async fn fetch_segment(
                             index: range.index, start: range.start, end_exclusive: range.end_exclusive,
                             transferred_bytes: attempt_transferred, complete: false, failed: false,
                         }),
-                    });
+                    
+                file_path: None,});
                 }
             }
             Ok::<(), String>(())
@@ -285,7 +290,8 @@ async fn fetch_segment(
                             index: range.index, start: range.start, end_exclusive: range.end_exclusive,
                             transferred_bytes: range.len(), complete: true, failed: false,
                         }),
-                    });
+                    
+                file_path: None,});
                 }
                 return Ok(());
             }
@@ -303,7 +309,8 @@ async fn fetch_segment(
                                 index: range.index, start: range.start, end_exclusive: range.end_exclusive,
                                 transferred_bytes: 0, complete: false, failed: false,
                             }),
-                        });
+                        
+                file_path: None,});
                     }
                 }
                 if attempt < RETRIES {
@@ -323,7 +330,8 @@ async fn fetch_segment(
                 index: range.index, start: range.start, end_exclusive: range.end_exclusive,
                 transferred_bytes: 0, complete: false, failed: true,
             }),
-        });
+        
+                file_path: None,});
     }
 
     Err(DownloadError::Segment { index: range.index, attempts: RETRIES, message: last_error })
