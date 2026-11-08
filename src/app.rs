@@ -474,7 +474,7 @@ impl SftpApp {
                 let parent = remote_parent(&self.remote_path);
                 self.navigate_remote(parent);
             }
-            ui.add_enabled(self.connection.is_some(), egui::Button::new("Refresh")).clicked().then(|| self.load_remote(&self.remote_path.clone()));
+            if ui.add_enabled(self.connection.is_some(), egui::Button::new("Refresh")).clicked() {\n                let path = self.remote_path.clone();\n                self.load_remote(&path);\n            }
             ui.add(egui::TextEdit::singleline(&mut self.remote_filter).hint_text("Filter remote files").desired_width(f32::INFINITY));
         });
         ui.label(egui::RichText::new(&self.remote_path).small().monospace().color(egui::Color32::from_rgb(115, 165, 205)));
@@ -708,7 +708,7 @@ impl eframe::App for SftpApp {
                     self.download_selected();
                 }
                 if ui.add_enabled(self.connection.is_some(), egui::Button::new("Refresh remote")).clicked() {
-                    self.load_remote(&self.remote_path.clone());
+                    let path = self.remote_path.clone();\n                    self.load_remote(&path);
                 }
                 ui.separator();
                 ui.add_enabled(false, egui::Button::new("Delete"));
