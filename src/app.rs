@@ -545,7 +545,9 @@ impl SftpApp {
                                 item.segments.sort_by_key(|s| s.index);
                             }
                         }
-                        item.state = "Downloading".into();
+                        if item.state != "Uploading" {
+                            item.state = "Downloading".into();
+                        }
                     }
                 }
                 QueueEvent::Finished { id, result } => {
@@ -967,7 +969,7 @@ impl eframe::App for SftpApp {
             .max_height(600.0)
             .show(ctx, |ui| {
             let queued = self.transfers.iter().filter(|item| item.state == "Queued").count();
-            let active = self.transfers.iter().filter(|item| item.state == "Downloading").count();
+            let active = self.transfers.iter().filter(|item| item.state == "Downloading" || item.state == "Uploading").count();
             let failed = self.transfers.iter().filter(|item| item.state.starts_with("Failed")).count();
             ui.horizontal(|ui| {
                 ui.strong("TRANSFER ACTIVITY");
@@ -1113,7 +1115,7 @@ impl eframe::App for SftpApp {
         if self.connect_rx.is_some() || self.list_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
-        if self.transfers.iter().any(|item| item.state == "Queued" || item.state == "Downloading") {
+        if self.transfers.iter().any(|item| item.state == "Queued" || item.state == "Downloading" || item.state == "Uploading") {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
