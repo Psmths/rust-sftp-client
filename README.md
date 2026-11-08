@@ -2,7 +2,7 @@
 
 A native Rust desktop SFTP client with an information-dense, analyst-workstation interface inspired by the Tiramisu-TL WebUI. The application is rendered directly with egui; it does not embed a web frontend.
 
-> **Status:** Early development. The native desktop shell and local filesystem pane are implemented. SSH connection establishment, remote directory browsing, and transfer execution remain in progress. The Rust core contains validated connection-profile types and a tested segmented-download range planner.
+> **Status:** Early development. The native desktop shell and local filesystem pane are implemented. The Rust core contains validated connection-profile types, a tested segmented-download planner, and a streaming range-download engine. The desktop connection/profile/remote-browser workflow is still being integrated.
 
 ## Technology
 
@@ -43,9 +43,19 @@ The executable is written to `src-tauri/target/release/rust-sftp-client`.
 
 ## Segmented downloads
 
-SFTP supports offset-based reads. The client can divide a remote file into non-overlapping byte ranges and fetch them concurrently over independent SFTP channels or sessions, subject to server limits.
+The transfer core now includes a streaming SFTP range-download engine:
 
-The Rust core implements deterministic range planning. It produces contiguous half-open ranges, handles uneven file sizes without gaps or overlaps, respects a maximum segment count, and uses a single range below the configured threshold. Network workers, positional disk writes, retry logic, resume state, and finalization remain future work.
+1. Reads remote file metadata and obtains its size.
+2. Uses the existing range planner to split large files into contiguous, non-overlapping byte ranges.
+3. Opens an independent SFTP file handle for each range and seeks to its starting offset.
+4. Streams each range to a separate temporary part file using a bounded memory buffer.
+5. Retries failed ranges up to three times.
+6. Assembles completed parts in byte order, flushes the output, checks the final byte count, and renames the completed file into place.
+7. Emits byte and segment progress through a Tokio unbounded channel.
+
+Files below the configured threshold use a single range. Zero-byte files are handled without issuing a range read. A failed segment prevents finalization, so an incomplete download is never presented as a completed destination file.
+
+The engine is exposed as `transfer::download_file`; the desktop queue still needs to invoke it and render its progress events. Persistent cross-process resume and parallel independent SSH sessions are not implemented yet; segments currently share one authenticated SFTP session while using separate SFTP file handles.
 
 ## Initial defaults
 
@@ -55,7 +65,7 @@ The Rust core implements deterministic range planning. It produces contiguous ha
 | Concurrent segments per file | 8 |
 | Target segment size | 8 MiB |
 | Maximum concurrent transfers | 4 |
-| Retry attempts per segment | 3 |
+| Segment retry attempts | 3 |
 
 ## Security
 
