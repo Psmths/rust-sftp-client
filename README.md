@@ -40,10 +40,11 @@ The executable is written to `target/release/rust-sftp-client`.
 1. Read remote metadata and obtain the file size.
 2. Split large files into contiguous, non-overlapping byte ranges.
 3. Open an independent SFTP file handle for each range and seek to its starting offset.
-4. Stream each range to a temporary part file using a bounded memory buffer.
-5. Retry failed ranges up to three times.
-6. Assemble parts in byte order, flush the output, validate the final size, and rename it into place.
-7. Emit byte and segment progress to the desktop transfer queue.
+4. Create one pre-sized temporary output file.
+5. Stream each range directly to its assigned byte offsets using positional writes (Unix `write_at`, Windows `seek_write`) and a bounded memory buffer.
+6. Retry failed ranges up to three times; retries overwrite only that segment's byte range.
+7. Wait for all workers to stop, flush the output, validate its size, and rename it into place.
+8. Emit byte and segment progress to the desktop transfer queue.
 
 All segments share one authenticated SFTP session and use independent SFTP file handles. Persistent cross-process resume and parallel independent SSH sessions are not implemented.
 

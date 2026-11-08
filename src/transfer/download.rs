@@ -1,15 +1,21 @@
 //! Bounded, retrying SFTP range-download engine.
 //!
-//! Each segment is fetched through its own SFTP file handle. Segment data is
-//! streamed to disk (never buffered as a whole file), then concatenated in
-//! range order and atomically renamed into place.
+//! Each segment is fetched through its own SFTP file handle and written
+//! directly into its assigned byte range in one pre-sized temporary file.
+//! Positional writes avoid a shared seek cursor and are safe for concurrent
+//! workers on both Unix and Windows.
 
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    fs::OpenOptions as StdOpenOptions,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use russh_sftp::client::SftpSession;
 use tokio::{
-    fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    fs,
+    io::AsyncReadExt,
     sync::{mpsc, Semaphore},
     task::JoinSet,
 };
@@ -63,12 +69,13 @@ pub enum DownloadError {
     SizeMismatch { expected: u64, actual: u64 },
 }
 
-/// Download a remote regular file using the configured byte-range plan.
+/// Download a remote regular file using concurrent positional writes.
 ///
-/// The remote SFTP session is shared across independently opened file handles.
-/// Each range is streamed to a temporary part file, retried up to three times,
-/// and assembled only after every range has completed successfully. The final
-/// destination is replaced only after the assembled file has been flushed.
+/// The temporary output is created and sized once. Each worker writes only
+/// within its non-overlapping range using platform-native positional I/O:
+/// FileExt::write_at on Unix and FileExt::seek_write on Windows. No worker
+/// changes a shared file cursor, and the output handle remains open until all
+/// workers have stopped. The file is flushed and validated before publication.
 pub async fn download_file(
     sftp: Arc<SftpSession>,
     remote_path: &str,
@@ -82,12 +89,24 @@ pub async fn download_file(
     let plan = plan_download_segments(size, settings)?;
     let total_segments = plan.segments.len() as u32;
 
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).await?;
+    let temp_destination = temporary_destination(destination);
+
+    // create_new prevents accidentally reusing a stale temporary file. On
+    // Windows the handle is deliberately kept open until every worker exits.
+    let output = StdOpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(&temp_destination)?;
+    output.set_len(size)?;
+    let output = Arc::new(output);
+
     if size == 0 {
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).await?;
-        let temp = temporary_destination(destination);
-        File::create(&temp).await?.sync_all().await?;
-        fs::rename(&temp, destination).await?;
+        output.sync_all()?;
+        drop(output);
+        publish_temporary_file(&temp_destination, destination).await?;
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: 0, transferred_bytes: 0,
@@ -97,11 +116,6 @@ pub async fn download_file(
         return Ok(DownloadResult { bytes: 0, segments: 0, segmented: false });
     }
 
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).await?;
-    let work_dir = temporary_directory(destination);
-    fs::create_dir_all(&work_dir).await?;
-
     if let Some(tx) = &progress {
         for range in &plan.segments {
             let _ = tx.send(DownloadProgress {
@@ -110,12 +124,9 @@ pub async fn download_file(
                 completed_segments: 0,
                 total_segments,
                 segment: Some(SegmentProgress {
-                    index: range.index,
-                    start: range.start,
+                    index: range.index, start: range.start,
                     end_exclusive: range.end_exclusive,
-                    transferred_bytes: 0,
-                    complete: false,
-                    failed: false,
+                    transferred_bytes: 0, complete: false, failed: false,
                 }),
             });
         }
@@ -129,7 +140,7 @@ pub async fn download_file(
     for range in plan.segments.iter().copied() {
         let session = Arc::clone(&sftp);
         let remote = remote_path.to_owned();
-        let part_path = part_path(&work_dir, range.index);
+        let output_file = Arc::clone(&output);
         let permit_pool = Arc::clone(&permits);
         let progress_tx = progress.clone();
         let transferred_bytes = Arc::clone(&transferred);
@@ -139,7 +150,7 @@ pub async fn download_file(
             let _permit = permit_pool.acquire_owned().await
                 .map_err(|e| DownloadError::Worker(e.to_string()))?;
             fetch_segment(
-                session, &remote, &part_path, range, size,
+                session, &remote, output_file, range, size,
                 progress_tx, transferred_bytes, completed_segments, total_segments,
             ).await
         });
@@ -154,42 +165,44 @@ pub async fn download_file(
         }
     }
 
+    // Drain aborted workers before closing the output handle. This matters on
+    // Windows, where an open handle can prevent cleanup or rename operations.
+    while workers.join_next().await.is_some() {}
+
     if let Some(error) = failure {
-        let _ = fs::remove_dir_all(&work_dir).await;
+        drop(output);
+        let _ = fs::remove_file(&temp_destination).await;
         return Err(error);
     }
 
-    let temp_destination = temporary_destination(destination);
-    let mut assembled = OpenOptions::new().create(true).truncate(true).write(true).open(&temp_destination).await?;
-    for range in &plan.segments {
-        let mut part = File::open(part_path(&work_dir, range.index)).await?;
-        tokio::io::copy(&mut part, &mut assembled).await?;
-    }
-    assembled.flush().await?;
-    assembled.sync_all().await?;
-    drop(assembled);
+    output.sync_all()?;
+    drop(output);
 
     let actual = fs::metadata(&temp_destination).await?.len();
     if actual != size {
         let _ = fs::remove_file(&temp_destination).await;
-        let _ = fs::remove_dir_all(&work_dir).await;
         return Err(DownloadError::SizeMismatch { expected: size, actual });
     }
 
-    // Rename is atomic when source and destination are on the same filesystem.
-    if destination.exists() {
+    publish_temporary_file(&temp_destination, destination).await?;
+    Ok(DownloadResult { bytes: size, segments: total_segments, segmented: plan.is_segmented() })
+}
+
+async fn publish_temporary_file(temp: &Path, destination: &Path) -> Result<(), DownloadError> {
+    // std::fs::rename does not replace an existing destination on Windows.
+    // Close our handles first, then remove the old file and rename. If another
+    // process has it open without delete sharing, Windows returns an I/O error.
+    if fs::try_exists(destination).await? {
         fs::remove_file(destination).await?;
     }
-    fs::rename(&temp_destination, destination).await?;
-    fs::remove_dir_all(&work_dir).await?;
-
-    Ok(DownloadResult { bytes: size, segments: total_segments, segmented: plan.is_segmented() })
+    fs::rename(temp, destination).await?;
+    Ok(())
 }
 
 async fn fetch_segment(
     sftp: Arc<SftpSession>,
     remote_path: &str,
-    part_path: &Path,
+    output: Arc<std::fs::File>,
     range: SegmentRange,
     total_size: u64,
     progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
@@ -207,19 +220,27 @@ async fn fetch_segment(
             remote.seek(std::io::SeekFrom::Start(range.start)).await
                 .map_err(|e| e.to_string())?;
 
-            let mut local = File::create(part_path).await.map_err(|e| e.to_string())?;
             let mut remaining = range.len();
+            let mut offset = range.start;
             let mut buffer = vec![0_u8; BUFFER_SIZE];
 
             while remaining > 0 {
                 let wanted = remaining.min(buffer.len() as u64) as usize;
                 let read = remote.read(&mut buffer[..wanted]).await.map_err(|e| e.to_string())?;
                 if read == 0 {
-                    return Err(format!("unexpected EOF at byte {}", range.end_exclusive - remaining));
+                    return Err(format!("unexpected EOF at byte {offset}"));
                 }
-                local.write_all(&buffer[..read]).await.map_err(|e| e.to_string())?;
-                remaining -= read as u64;
 
+                let chunk = buffer[..read].to_vec();
+                let file = Arc::clone(&output);
+                let write_offset = offset;
+                tokio::task::spawn_blocking(move || write_all_at(&file, &chunk, write_offset))
+                    .await
+                    .map_err(|e| format!("local write worker failed: {e}"))?
+                    .map_err(|e| e.to_string())?;
+
+                offset += read as u64;
+                remaining -= read as u64;
                 attempt_transferred += read as u64;
                 let now = transferred.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed) + read as u64;
                 if let Some(tx) = &progress {
@@ -235,9 +256,6 @@ async fn fetch_segment(
                     });
                 }
             }
-
-            local.flush().await.map_err(|e| e.to_string())?;
-            local.sync_all().await.map_err(|e| e.to_string())?;
             Ok::<(), String>(())
         }.await;
 
@@ -248,8 +266,7 @@ async fn fetch_segment(
                     let _ = tx.send(DownloadProgress {
                         total_bytes: total_size,
                         transferred_bytes: transferred.load(std::sync::atomic::Ordering::Relaxed),
-                        completed_segments: done,
-                        total_segments,
+                        completed_segments: done, total_segments,
                         segment: Some(SegmentProgress {
                             index: range.index, start: range.start, end_exclusive: range.end_exclusive,
                             transferred_bytes: range.len(), complete: true, failed: false,
@@ -275,7 +292,6 @@ async fn fetch_segment(
                         });
                     }
                 }
-                let _ = fs::remove_file(part_path).await;
                 if attempt < RETRIES {
                     tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
                 }
@@ -296,18 +312,35 @@ async fn fetch_segment(
         });
     }
 
-    Err(DownloadError::Segment {
-        index: range.index, attempts: RETRIES, message: last_error,
-    })
+    Err(DownloadError::Segment { index: range.index, attempts: RETRIES, message: last_error })
 }
 
-fn part_path(directory: &Path, index: u32) -> PathBuf {
-    directory.join(format!("segment-{index:04}.part"))
+#[cfg(unix)]
+fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buffer.is_empty() {
+        let written = file.write_at(buffer, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write download chunk"));
+        }
+        offset += written as u64;
+        buffer = &buffer[written..];
+    }
+    Ok(())
 }
 
-fn temporary_directory(destination: &Path) -> PathBuf {
-    let name = destination.file_name().unwrap_or_default().to_string_lossy();
-    destination.with_file_name(format!(".{name}.sftp-parts-{}", std::process::id()))
+#[cfg(windows)]
+fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        let written = file.seek_write(buffer, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write download chunk"));
+        }
+        offset += written as u64;
+        buffer = &buffer[written..];
+    }
+    Ok(())
 }
 
 fn temporary_destination(destination: &Path) -> PathBuf {
