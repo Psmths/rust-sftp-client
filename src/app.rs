@@ -527,6 +527,8 @@ impl SftpApp {
                         if let Some(existing) = self.transfers.iter().find(|item| item.operation_id == Some(id) && item.name == *relative) {
                             existing.id
                         } else {
+                            let child_state = self.transfers.iter().find(|item| item.id == id)
+                                .map(|item| item.state.clone()).unwrap_or_else(|| "Downloading".into());
                             self.transfers.retain(|item| item.id != id);
                             let child_id = self.next_transfer_id;
                             self.next_transfer_id += 1;
@@ -535,7 +537,7 @@ impl SftpApp {
                                 destination: PathBuf::from(relative), transferred: 0, total: progress.total_bytes,
                                 segments: Vec::new(), started_at: Some(Instant::now()), finished_at: None,
                                 last_speed_sample_at: Some(Instant::now()), last_speed_sample_bytes: 0,
-                                speed_mib_s: 0.0, state: "Downloading".into(),
+                                speed_mib_s: 0.0, state: child_state,
                             });
                             child_id
                         }

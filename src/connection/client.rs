@@ -141,7 +141,7 @@ impl SftpConnection {
 
 
     /// Recursively upload a local file or directory to a remote destination.
-    /// Directory structure is preserved and progress covers all files.
+    /// Directory structure is preserved and progress is reported separately for each file.
     pub async fn upload_path(
         &self,
         local_path: &Path,
@@ -187,10 +187,12 @@ impl SftpConnection {
         let mut transferred = 0_u64;
         let mut buffer = vec![0_u8; 256 * 1024];
         for (local, remote, file_size) in files {
-            let relative = local.strip_prefix(local_path).ok()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| local.file_name().map(PathBuf::from).as_deref().unwrap_or(&local))
-                .to_string_lossy().to_string();
+            let relative_path = local.strip_prefix(local_path).unwrap_or(&local);
+            let relative = if relative_path.as_os_str().is_empty() {
+                local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+            } else {
+                relative_path.to_string_lossy().to_string()
+            };
             let mut file_transferred = 0_u64;
             let mut input = fs::File::open(&local).await
                 .map_err(crate::transfer::DownloadError::Io)?;
@@ -228,14 +230,14 @@ impl SftpConnection {
         if let Some(tx) = &progress {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: transferred,
-                completed_segments: 0, total_segments: 0, segment: None,
+                completed_segments: 0, total_segments: 0, segment: None, file_path: None,
             });
         }
         Ok(DownloadResult { bytes: transferred, segments: 0, segmented: false })
     }
 
     /// Recursively download a remote file or directory. Each file uses the
-    /// existing segmented downloader; folder progress is aggregated.
+    /// existing segmented downloader; progress is reported separately for each file.
     pub async fn download_path(
         &self,
         remote_path: &str,
@@ -281,10 +283,12 @@ impl SftpConnection {
         let mut segment_count = 0_u32;
         let mut segmented = false;
         for (remote, local) in files {
-            let relative = local.strip_prefix(destination).ok()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| local.file_name().map(PathBuf::from).as_deref().unwrap_or(&local))
-                .to_string_lossy().to_string();
+            let relative_path = local.strip_prefix(destination).unwrap_or(&local);
+            let relative = if relative_path.as_os_str().is_empty() {
+                local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+            } else {
+                relative_path.to_string_lossy().to_string()
+            };
             let file_size = self.sftp.metadata(remote.clone()).await
                 .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?
                 .size.unwrap_or(0);
@@ -334,7 +338,7 @@ impl SftpConnection {
             let _ = tx.send(DownloadProgress {
                 total_bytes: total, transferred_bytes: completed,
                 completed_segments: segment_count, total_segments: segment_count,
-                segment: None,
+                segment: None, file_path: None,
             });
         }
         Ok(DownloadResult { bytes: completed, segments: segment_count, segmented })
