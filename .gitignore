@@ -1,5 +1,4 @@
 /target
-/src-tauri/target
 /artifacts
 .env
 .env.*

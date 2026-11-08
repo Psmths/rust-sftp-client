@@ -16,21 +16,19 @@ There is no Tauri, React, TypeScript, Vite, Node.js, or NPM build step.
 
 ## Build
 
-From the repository root:
+Run these commands from the repository root:
 
 ```bash
-cd src-tauri
 cargo run --release
 ```
 
 Build an optimized binary without launching it:
 
 ```bash
-cd src-tauri
 cargo build --release
 ```
 
-The executable is written to `src-tauri/target/release/rust-sftp-client`.
+The executable is written to `target/release/rust-sftp-client`.
 
 ## Interface
 
