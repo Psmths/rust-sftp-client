@@ -2,7 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{mpsc as std_mpsc, Arc},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui;
@@ -40,6 +40,8 @@ struct TransferItem {
     transferred: u64,
     total: u64,
     segments: Vec<SegmentProgress>,
+    started_at: Option<Instant>,
+    finished_at: Option<Instant>,
     state: String,
 }
 
@@ -52,6 +54,7 @@ enum Dialog {
 }
 
 enum QueueEvent {
+    Started { id: usize },
     Progress { id: usize, progress: DownloadProgress },
     Finished { id: usize, result: Result<DownloadResult, String> },
 }
@@ -352,6 +355,8 @@ impl SftpApp {
                 transferred: 0,
                 total: entry.size,
                 segments: Vec::new(),
+                started_at: None,
+                finished_at: None,
                 state: "Queued".into(),
             });
             let connection = connection.clone();
@@ -366,6 +371,7 @@ impl SftpApp {
                         return;
                     }
                 };
+                let _ = tx.send(QueueEvent::Started { id });
                 let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                 let download = connection.download(&entry.path, &destination, settings, Some(progress_tx));
                 tokio::pin!(download);
@@ -391,6 +397,12 @@ impl SftpApp {
     fn poll_queue(&mut self) {
         while let Ok(event) = self.queue_rx.try_recv() {
             match event {
+                QueueEvent::Started { id } => {
+                    if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+                        item.started_at = Some(Instant::now());
+                        item.state = "Downloading".into();
+                    }
+                }
                 QueueEvent::Progress { id, progress } => {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
                         item.transferred = progress.transferred_bytes;
@@ -410,11 +422,13 @@ impl SftpApp {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
                         match result {
                             Ok(result) => {
+                                item.finished_at = Some(Instant::now());
                                 item.transferred = result.bytes;
                                 item.total = result.bytes;
                                 item.state = "Complete".into();
                             }
                             Err(error) => {
+                                item.finished_at = Some(Instant::now());
                                 for segment in &mut item.segments {
                                     if !segment.complete { segment.failed = true; }
                                 }
@@ -774,65 +788,118 @@ impl eframe::App for SftpApp {
                 if self.transfers.is_empty() {
                     ui.label(egui::RichText::new("Transfer queue is empty").small().weak());
                 } else {
-                    egui::Grid::new("transfer_queue").num_columns(4).striped(true).show(ui, |ui| {
-                        for item in &self.transfers {
-                            ui.label(egui::RichText::new(&item.name).monospace().small());
-                            if item.segments.len() <= 1 {
-                                let fraction = if item.total == 0 { if item.state == "Complete" { 1.0 } else { 0.0 } }
-                                    else { item.transferred as f32 / item.total as f32 };
-                                ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(180.0)
-                                    .text(format!("{} / {}", size_text(item.transferred), size_text(item.total))));
-                            } else {
-                                let (bar_rect, response) = ui.allocate_exact_size(
-                                    egui::vec2(220.0, 16.0), egui::Sense::hover()
-                                );
-                                let painter = ui.painter();
-                                let gap = 2.0;
-                                let total_width = (bar_rect.width() - gap * (item.segments.len().saturating_sub(1) as f32)).max(0.0);
+                    let file_width = 190.0;
+                    let percent_width = 105.0;
+                    let elapsed_width = 95.0;
+                    let remaining_width = 110.0;
+                    let row_height = 22.0;
+                    ui.horizontal(|ui| {
+                        ui.add_sized([file_width, row_height], egui::Label::new(egui::RichText::new("FILE").small().strong()));
+                        let progress_width = (ui.available_width() - percent_width - elapsed_width - remaining_width - 24.0).max(220.0);
+                        ui.add_sized([progress_width, row_height], egui::Label::new(egui::RichText::new("PROGRESS").small().strong()));
+                        ui.add_sized([percent_width, row_height], egui::Label::new(egui::RichText::new("PERCENT COMPLETE").small().strong()));
+                        ui.add_sized([elapsed_width, row_height], egui::Label::new(egui::RichText::new("TIME ELAPSED").small().strong()));
+                        ui.add_sized([remaining_width, row_height], egui::Label::new(egui::RichText::new("TIME REMAINING").small().strong()));
+                    });
+                    ui.separator();
+                    for item in &self.transfers {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([file_width, row_height], egui::Label::new(
+                                egui::RichText::new(&item.name).monospace().small()
+                            ).truncate());
+                            let progress_width = (ui.available_width() - percent_width - elapsed_width - remaining_width - 24.0).max(220.0);
+                            let bar_height = 15.0;
+                            let (bar_rect, response) = ui.allocate_exact_size(
+                                egui::vec2(progress_width, bar_height), egui::Sense::hover()
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(bar_rect, 1.0, egui::Color32::from_rgb(48, 53, 62));
+                            if item.segments.len() > 1 && item.total > 0 {
                                 for segment in &item.segments {
-                                    let segment_width = total_width * (segment.end_exclusive - segment.start) as f32
-                                        / item.total.max(1) as f32;
-                                    let x0 = bar_rect.left() + total_width
-                                        * segment.start as f32 / item.total.max(1) as f32
-                                        + gap * segment.index as f32;
-                                    let rect = egui::Rect::from_min_size(
+                                    let start_fraction = segment.start as f32 / item.total as f32;
+                                    let end_fraction = segment.end_exclusive as f32 / item.total as f32;
+                                    let x0 = bar_rect.left() + bar_rect.width() * start_fraction;
+                                    let x1 = bar_rect.left() + bar_rect.width() * end_fraction;
+                                    let segment_rect = egui::Rect::from_min_max(
                                         egui::pos2(x0, bar_rect.top()),
-                                        egui::vec2(segment_width.max(1.0), bar_rect.height())
+                                        egui::pos2(x1, bar_rect.bottom())
                                     );
-                                    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(48, 53, 62));
-                                    let fill_fraction = if segment.complete {
-                                        1.0
-                                    } else {
+                                    let fraction = if segment.complete { 1.0 } else {
                                         segment.transferred_bytes as f32
                                             / (segment.end_exclusive - segment.start).max(1) as f32
                                     }.clamp(0.0, 1.0);
-                                    let fill_color = if segment.failed {
+                                    let color = if segment.failed {
                                         egui::Color32::from_rgb(190, 65, 65)
                                     } else if segment.complete {
                                         egui::Color32::from_rgb(65, 170, 105)
                                     } else {
                                         egui::Color32::from_rgb(65, 135, 205)
                                     };
-                                    if fill_fraction > 0.0 || segment.failed {
-                                        let fill_width = if segment.failed { rect.width() } else { rect.width() * fill_fraction };
-                                        let fill_rect = egui::Rect::from_min_size(
-                                            rect.min, egui::vec2(fill_width.max(1.0).min(rect.width()), rect.height())
+                                    if fraction > 0.0 {
+                                        let fill_rect = egui::Rect::from_min_max(
+                                            segment_rect.min,
+                                            egui::pos2(segment_rect.left() + segment_rect.width() * fraction, segment_rect.bottom())
                                         );
-                                        painter.rect_filled(fill_rect, 2.0, fill_color);
+                                        painter.rect_filled(fill_rect, 0.0, color);
+                                    }
+                                    if segment.failed {
+                                        painter.rect_filled(segment_rect, 0.0, color);
+                                    }
+                                    if segment.index > 0 {
+                                        let x = segment_rect.left();
+                                        painter.line_segment(
+                                            [egui::pos2(x, bar_rect.top()), egui::pos2(x, bar_rect.bottom())],
+                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(25, 29, 35))
+                                        );
                                     }
                                 }
-                                if response.hovered() {
-                                    response.on_hover_text(format!(
-                                        "{} segments · {} / {}",
-                                        item.segments.len(), size_text(item.transferred), size_text(item.total)
-                                    ));
+                            } else {
+                                let fraction = if item.total == 0 {
+                                    if item.state == "Complete" { 1.0 } else { 0.0 }
+                                } else { item.transferred as f32 / item.total as f32 }.clamp(0.0, 1.0);
+                                if fraction > 0.0 {
+                                    let fill_rect = egui::Rect::from_min_max(
+                                        bar_rect.min,
+                                        egui::pos2(bar_rect.left() + bar_rect.width() * fraction, bar_rect.bottom())
+                                    );
+                                    painter.rect_filled(fill_rect, 1.0, if item.state == "Complete" {
+                                        egui::Color32::from_rgb(65, 170, 105)
+                                    } else { egui::Color32::from_rgb(65, 135, 205) });
                                 }
                             }
-                            ui.label(egui::RichText::new(&item.state).small());
-                            ui.label(egui::RichText::new(item.destination.display().to_string()).small().weak());
-                            ui.end_row();
-                        }
-                    });
+                            if response.hovered() {
+                                response.on_hover_text(format!(
+                                    "{} / {} · {} segments",
+                                    size_text(item.transferred), size_text(item.total), item.segments.len()
+                                ));
+                            }
+                            let percent = if item.total == 0 {
+                                if item.state == "Complete" { 100.0 } else { 0.0 }
+                            } else { item.transferred as f64 * 100.0 / item.total as f64 };
+                            ui.add_sized([percent_width, row_height], egui::Label::new(
+                                egui::RichText::new(format!("{percent:.1}%")).small().monospace()
+                            ));
+                            let elapsed = item.started_at.map(|start| {
+                                item.finished_at.unwrap_or_else(Instant::now).saturating_duration_since(start)
+                            });
+                            ui.add_sized([elapsed_width, row_height], egui::Label::new(
+                                egui::RichText::new(elapsed.map(duration_text).unwrap_or_else(|| "—".into())).small().monospace()
+                            ));
+                            let remaining = if item.state == "Complete" {
+                                Some(Duration::ZERO)
+                            } else if item.state == "Downloading" && item.transferred > 0 && item.total > item.transferred {
+                                elapsed.map(|duration| {
+                                    let rate = item.transferred as f64 / duration.as_secs_f64().max(0.001);
+                                    Duration::from_secs_f64(((item.total - item.transferred) as f64 / rate).max(0.0))
+                                })
+                            } else { None };
+                            ui.add_sized([remaining_width, row_height], egui::Label::new(
+                                egui::RichText::new(remaining.map(duration_text).unwrap_or_else(|| {
+                                    if item.state == "Queued" { "Queued".into() } else { "Calculating…".into() }
+                                })).small().monospace()
+                            ));
+                        });
+                    }
                 }
             });
         });
@@ -916,6 +983,18 @@ fn format_unix_utc(seconds: i64) -> String {
     year += if month <= 2 { 1 } else { 0 };
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         day_seconds / 3600, (day_seconds % 3600) / 60, day_seconds % 60)
+}
+
+fn duration_text(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }
 
 fn size_text(bytes: u64) -> String {
