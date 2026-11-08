@@ -516,7 +516,7 @@ impl SftpApp {
                         egui::Button::selectable(
                             self.local_selected.as_ref() == Some(&entry.path),
                             egui::RichText::new(&entry.name).monospace(),
-                        ).halign(egui::Align::LEFT),
+                        ),
                     );
                     if response.clicked() { self.local_selected = Some(entry.path.clone()); }
                     if response.double_clicked() && entry.dir {
@@ -933,7 +933,7 @@ impl eframe::App for SftpApp {
                                         let x = segment_rect.left();
                                         painter.line_segment(
                                             [egui::pos2(x, bar_rect.top()), egui::pos2(x, bar_rect.bottom())],
-                                            egui::Stroke::new(1.0, egui::Color32::from_rgb(25, 29, 35))
+                                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(25, 29, 35))
                                         );
                                     }
                                 }
