@@ -2,7 +2,7 @@
 
 A native Rust desktop SFTP client with an information-dense, analyst-workstation interface inspired by the Tiramisu-TL WebUI. The application is rendered directly with eframe/egui; it does not embed a web frontend.
 
-> **Status:** The native dual-pane UI, local and remote filesystem browsing, password and private-key SSH authentication, explicit SSH host-key pinning, and segmented download queue are integrated. Upload, SSH-agent authentication, and transfer cancellation are not implemented yet. Build and runtime verification are still required on the target system.
+> **Status:** The native dual-pane UI, local and remote filesystem browsing, password and private-key SSH authentication, explicit SSH host-key pinning, segmented downloads, and recursive drag-and-drop transfers are integrated. SSH-agent authentication and transfer cancellation are not implemented yet. Build and runtime verification are still required on the target system.
 
 ## Technology
 
@@ -31,6 +31,8 @@ The executable is written to `target/release/rust-sftp-client`.
 - Store trusted fingerprints in `~/.config/rust-sftp-client/known_hosts.json`.
 - Browse remote directories, navigate into directories and to the parent, and filter remote entries.
 - Select multiple remote files with Ctrl/Command-click and download them into the current local pane directory.
+- Drag local files or folders onto the remote pane to upload them recursively.
+- Drag remote files or folders onto the local pane to download them recursively; large files retain segmented downloads.
 - Show queued, active, completed, and failed downloads with byte progress.
 - Download large files through the existing bounded, retrying segmented range-download engine.
 - Open connection, password, host-key trust, error, and transfer-settings prompts in separate native windows.

@@ -56,8 +56,14 @@ enum Dialog {
     Error,
 }
 
+#[derive(Clone, Debug)]
+enum DragPayload {
+    Local(PathBuf),
+    Remote(String),
+}
+
 enum QueueEvent {
-    Started { id: usize },
+    Started { id: usize, state: String },
     Progress { id: usize, progress: DownloadProgress },
     Finished { id: usize, result: Result<DownloadResult, String> },
 }
@@ -377,7 +383,7 @@ impl SftpApp {
                         return;
                     }
                 };
-                let _ = tx.send(QueueEvent::Started { id });
+                let _ = tx.send(QueueEvent::Started { id, state: "Downloading".into() });
                 let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
                 let download = connection.download(&entry.path, &destination, settings, Some(progress_tx));
                 tokio::pin!(download);
@@ -400,17 +406,113 @@ impl SftpApp {
         self.status = format!("Queued {} download(s) to {}", self.remote_selected.len(), self.path.display());
     }
 
+
+    fn queue_dropped_local(&mut self, local_path: PathBuf) {
+        let Some(connection) = self.connection.clone() else {
+            self.status = "Connect to a remote server before uploading".into();
+            return;
+        };
+        let Some(name) = local_path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            self.status = "Cannot upload this filesystem path".into();
+            return;
+        };
+        let remote_destination = join_remote(&self.remote_path, &name);
+        let total = fs::metadata(&local_path)
+            .map(|meta| if meta.is_file() { meta.len() } else { 0 }).unwrap_or(0);
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        self.transfers.push(TransferItem {
+            id, name: name.clone(), destination: local_path.clone(), transferred: 0, total,
+            segments: Vec::new(), started_at: None, finished_at: None,
+            last_speed_sample_at: None, last_speed_sample_bytes: 0, speed_mib_s: 0.0,
+            state: "Queued".into(),
+        });
+        let slots = self.transfer_slots.clone();
+        let tx = self.queue_tx.clone();
+        self.runtime.spawn(async move {
+            let _permit = match slots.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let _ = tx.send(QueueEvent::Finished { id, result: Err(error.to_string()) });
+                    return;
+                }
+            };
+            let _ = tx.send(QueueEvent::Started { id, state: "Uploading".into() });
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+            let upload = connection.upload_path(&local_path, &remote_destination, Some(progress_tx));
+            tokio::pin!(upload);
+            loop {
+                tokio::select! {
+                    result = &mut upload => {
+                        let _ = tx.send(QueueEvent::Finished { id, result: result.map_err(|e| e.to_string()) });
+                        break;
+                    }
+                    progress = progress_rx.recv() => {
+                        if let Some(progress) = progress {
+                            let _ = tx.send(QueueEvent::Progress { id, progress });
+                        }
+                    }
+                }
+            }
+        });
+        self.status = format!("Queued recursive upload: {name} → {remote_destination}");
+    }
+
+    fn queue_dropped_remote(&mut self, remote_path: String) {
+        let Some(connection) = self.connection.clone() else { return; };
+        let name = remote_path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(&remote_path).to_owned();
+        let destination = self.path.join(&name);
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        self.transfers.push(TransferItem {
+            id, name: name.clone(), destination: destination.clone(), transferred: 0, total: 0,
+            segments: Vec::new(), started_at: None, finished_at: None,
+            last_speed_sample_at: None, last_speed_sample_bytes: 0, speed_mib_s: 0.0,
+            state: "Queued".into(),
+        });
+        let settings = self.transfer;
+        let slots = self.transfer_slots.clone();
+        let tx = self.queue_tx.clone();
+        self.runtime.spawn(async move {
+            let _permit = match slots.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    let _ = tx.send(QueueEvent::Finished { id, result: Err(error.to_string()) });
+                    return;
+                }
+            };
+            let _ = tx.send(QueueEvent::Started { id, state: "Downloading".into() });
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+            let download = connection.download_path(&remote_path, &destination, settings, Some(progress_tx));
+            tokio::pin!(download);
+            loop {
+                tokio::select! {
+                    result = &mut download => {
+                        let _ = tx.send(QueueEvent::Finished { id, result: result.map_err(|e| e.to_string()) });
+                        break;
+                    }
+                    progress = progress_rx.recv() => {
+                        if let Some(progress) = progress {
+                            let _ = tx.send(QueueEvent::Progress { id, progress });
+                        }
+                    }
+                }
+            }
+        });
+        self.status = format!("Queued recursive download: {remote_path} → {}", destination.display());
+    }
+
     fn poll_queue(&mut self) {
         while let Ok(event) = self.queue_rx.try_recv() {
             match event {
-                QueueEvent::Started { id } => {
+                QueueEvent::Started { id, state } => {
                     if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
                         let now = Instant::now();
                         item.started_at = Some(now);
                         item.last_speed_sample_at = Some(now);
                         item.last_speed_sample_bytes = 0;
                         item.speed_mib_s = 0.0;
-                        item.state = "Downloading".into();
+                        item.state = state;
                     }
                 }
                 QueueEvent::Progress { id, progress } => {
@@ -470,6 +572,17 @@ impl SftpApp {
     }
 
     fn local_pane(&mut self, ui: &mut egui::Ui) {
+        let (_, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
+            self.local_pane_contents(ui);
+        });
+        if let Some(payload) = dropped {
+            if let DragPayload::Remote(path) = payload.as_ref() {
+                self.queue_dropped_remote(path.clone());
+            }
+        }
+    }
+
+    fn local_pane_contents(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("LOCAL FILESYSTEM");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -518,6 +631,7 @@ impl SftpApp {
                         &entry.name,
                         self.local_selected.as_ref() == Some(&entry.path),
                     );
+                    if response.dragged() { response.dnd_set_drag_payload(DragPayload::Local(entry.path.clone())); }
                     if response.clicked() { self.local_selected = Some(entry.path.clone()); }
                     if response.double_clicked() && entry.dir {
                         self.path = entry.path.clone();
@@ -536,6 +650,17 @@ impl SftpApp {
     }
 
     fn remote_pane(&mut self, ui: &mut egui::Ui) {
+        let (_, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
+            self.remote_pane_contents(ui);
+        });
+        if let Some(payload) = dropped {
+            if let DragPayload::Local(path) = payload.as_ref() {
+                self.queue_dropped_local(path.clone());
+            }
+        }
+    }
+
+    fn remote_pane_contents(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("REMOTE SERVER");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -597,6 +722,7 @@ impl SftpApp {
                 ui.horizontal(|ui| {
                     let selected = self.remote_selected.contains(&entry.path);
                     let response = file_name_cell(ui, name_width, 22.0, &entry.name, selected);
+                    if response.dragged() { response.dnd_set_drag_payload(DragPayload::Remote(entry.path.clone())); }
                     if response.clicked() {
                         let multi = response.ctx.input(|input| input.modifiers.ctrl || input.modifiers.command);
                         if multi {
@@ -828,7 +954,7 @@ impl eframe::App for SftpApp {
             }
             ui.add_space(14.0);
             ui.label(egui::RichText::new("TRANSFER QUEUE").small().strong().weak());
-            let active = self.transfers.iter().filter(|item| item.state == "Queued" || item.state == "Downloading").count();
+            let active = self.transfers.iter().filter(|item| item.state == "Queued" || item.state == "Downloading" || item.state == "Uploading").count();
             ui.label(egui::RichText::new(format!("{active} active")).small().weak());
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.label(egui::RichText::new("v0.1.0 · NATIVE RUST").small().weak());
@@ -956,7 +1082,7 @@ impl eframe::App for SftpApp {
                             ));
                             let remaining = if item.state == "Complete" {
                                 Some(Duration::ZERO)
-                            } else if item.state == "Downloading" && item.transferred > 0 && item.total > item.transferred {
+                            } else if (item.state == "Downloading" || item.state == "Uploading") && item.transferred > 0 && item.total > item.transferred {
                                 elapsed.map(|duration| {
                                     let rate = item.transferred as f64 / duration.as_secs_f64().max(0.001);
                                     Duration::from_secs_f64(((item.total - item.transferred) as f64 / rate).max(0.0))
@@ -1002,7 +1128,7 @@ fn file_name_cell(
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width, height),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     let visuals = ui.style().interact_selectable(&response, selected);
     if visuals.bg_fill != egui::Color32::TRANSPARENT {

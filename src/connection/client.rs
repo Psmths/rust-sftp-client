@@ -2,7 +2,7 @@ use std::{path::{Path, PathBuf}, sync::{Arc, Mutex}};
 use russh::{client, keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate}};
 use russh::keys::ssh_key::HashAlg;
 use russh_sftp::client::{fs::ReadDir, SftpSession};
-use tokio::sync::mpsc;
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
 
 use crate::{connection::{AuthMethod, ConnectionProfile}, transfer::{download_file, DownloadProgress, DownloadResult, TransferSettings}};
 
@@ -137,6 +137,177 @@ impl SftpConnection {
 
     pub async fn canonicalize(&self, path: &str) -> Result<String, ConnectError> {
         self.sftp.canonicalize(path.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
+    }
+
+
+    /// Recursively upload a local file or directory to a remote destination.
+    /// Directory structure is preserved and progress covers all files.
+    pub async fn upload_path(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+    ) -> Result<DownloadResult, crate::transfer::DownloadError> {
+        let mut directories: Vec<(PathBuf, String)> = Vec::new();
+        let mut files: Vec<(PathBuf, String, u64)> = Vec::new();
+        let mut stack = vec![(local_path.to_path_buf(), remote_path.to_owned())];
+        let mut total = 0_u64;
+
+        while let Some((path, remote)) = stack.pop() {
+            let meta = fs::metadata(&path).await
+                .map_err(crate::transfer::DownloadError::Io)?;
+            if meta.is_dir() {
+                directories.push((path.clone(), remote.clone()));
+                let mut entries = fs::read_dir(&path).await
+                    .map_err(crate::transfer::DownloadError::Io)?;
+                while let Some(entry) = entries.next_entry().await
+                    .map_err(crate::transfer::DownloadError::Io)? {
+                    let file_type = entry.file_type().await
+                        .map_err(crate::transfer::DownloadError::Io)?;
+                    if file_type.is_symlink() { continue; }
+                    let child_remote = format!("{}/{}", remote.trim_end_matches('/'), entry.file_name().to_string_lossy());
+                    stack.push((entry.path(), child_remote));
+                }
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+                files.push((path, remote, meta.len()));
+            }
+        }
+
+        // Parent directories must exist before their children are uploaded.
+        directories.sort_by_key(|(path, _)| path.components().count());
+        for (_, directory) in &directories {
+            if !self.sftp.try_exists(directory.clone()).await
+                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))? {
+                self.sftp.create_dir(directory.clone()).await
+                    .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+            }
+        }
+
+        let mut transferred = 0_u64;
+        let mut buffer = vec![0_u8; 256 * 1024];
+        for (local, remote, _) in files {
+            let mut input = fs::File::open(&local).await
+                .map_err(crate::transfer::DownloadError::Io)?;
+            let mut output = self.sftp.create(remote).await
+                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+            loop {
+                let count = input.read(&mut buffer).await
+                    .map_err(crate::transfer::DownloadError::Io)?;
+                if count == 0 { break; }
+                output.write_all(&buffer[..count]).await
+                    .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+                transferred = transferred.saturating_add(count as u64);
+                if let Some(tx) = &progress {
+                    let _ = tx.send(DownloadProgress {
+                        total_bytes: total,
+                        transferred_bytes: transferred,
+                        completed_segments: 0,
+                        total_segments: 0,
+                        segment: None,
+                    });
+                }
+            }
+            output.close().await
+                .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+        }
+        if let Some(tx) = &progress {
+            let _ = tx.send(DownloadProgress {
+                total_bytes: total, transferred_bytes: transferred,
+                completed_segments: 0, total_segments: 0, segment: None,
+            });
+        }
+        Ok(DownloadResult { bytes: transferred, segments: 0, segmented: false })
+    }
+
+    /// Recursively download a remote file or directory. Each file uses the
+    /// existing segmented downloader; folder progress is aggregated.
+    pub async fn download_path(
+        &self,
+        remote_path: &str,
+        destination: &Path,
+        settings: TransferSettings,
+        progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
+    ) -> Result<DownloadResult, crate::transfer::DownloadError> {
+        let root_meta = self.sftp.metadata(remote_path.to_owned()).await
+            .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+        let mut directories: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let mut stack = vec![(remote_path.to_owned(), destination.to_path_buf(), root_meta)];
+        let mut total = 0_u64;
+
+        while let Some((remote, local, metadata)) = stack.pop() {
+            if metadata.is_dir() {
+                directories.push(local.clone());
+                let entries = self.sftp.read_dir(remote.clone()).await
+                    .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
+                for entry in entries {
+                    let name = entry.file_name();
+                    if name == "." || name == ".." { continue; }
+                    let attrs = entry.metadata();
+                    let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
+                    stack.push((child_remote, local.join(&name), attrs));
+                }
+            } else {
+                total = total.saturating_add(metadata.size.unwrap_or(0));
+                files.push((remote, local));
+            }
+        }
+
+        for directory in directories {
+            fs::create_dir_all(directory).await
+                .map_err(crate::transfer::DownloadError::Io)?;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await
+                .map_err(crate::transfer::DownloadError::Io)?;
+        }
+
+        let mut completed = 0_u64;
+        let mut segment_count = 0_u32;
+        let mut segmented = false;
+        for (remote, local) in files {
+            let (inner_tx, mut inner_rx) = mpsc::unbounded_channel();
+            let download = download_file(Arc::clone(&self.sftp), &remote, &local, settings, Some(inner_tx));
+            tokio::pin!(download);
+            loop {
+                tokio::select! {
+                    result = &mut download => {
+                        let result = result?;
+                        completed = completed.saturating_add(result.bytes);
+                        segment_count = segment_count.saturating_add(result.segments);
+                        segmented |= result.segmented;
+                        if let Some(tx) = &progress {
+                            let _ = tx.send(DownloadProgress {
+                                total_bytes: total, transferred_bytes: completed,
+                                completed_segments: segment_count, total_segments: segment_count,
+                                segment: None,
+                            });
+                        }
+                        break;
+                    }
+                    update = inner_rx.recv() => {
+                        if let (Some(tx), Some(update)) = (&progress, update) {
+                            let _ = tx.send(DownloadProgress {
+                                total_bytes: total,
+                                transferred_bytes: completed.saturating_add(update.transferred_bytes),
+                                completed_segments: update.completed_segments,
+                                total_segments: update.total_segments,
+                                segment: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(tx) = &progress {
+            let _ = tx.send(DownloadProgress {
+                total_bytes: total, transferred_bytes: completed,
+                completed_segments: segment_count, total_segments: segment_count,
+                segment: None,
+            });
+        }
+        Ok(DownloadResult { bytes: completed, segments: segment_count, segmented })
     }
 
     pub async fn download(
