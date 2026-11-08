@@ -491,10 +491,10 @@ impl SftpApp {
         const TYPE_WIDTH: f32 = 42.0;
         let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
         ui.horizontal(|ui| {
-            ui.add_sized([name_width, 18.0], egui::Label::new(egui::RichText::new("NAME").small().strong().monospace()).halign(egui::Align::LEFT));
-            ui.add_sized([SIZE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("SIZE").small().strong().monospace()).halign(egui::Align::LEFT));
-            ui.add_sized([MODIFIED_WIDTH, 18.0], egui::Label::new(egui::RichText::new("MODIFIED (UTC)").small().strong().monospace()).halign(egui::Align::LEFT));
-            ui.add_sized([TYPE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("TYPE").small().strong().monospace()).halign(egui::Align::LEFT));
+            file_text_cell(ui, name_width, 18.0, "NAME", true);
+            file_text_cell(ui, SIZE_WIDTH, 18.0, "SIZE", true);
+            file_text_cell(ui, MODIFIED_WIDTH, 18.0, "MODIFIED (UTC)", true);
+            file_text_cell(ui, TYPE_WIDTH, 18.0, "TYPE", true);
         });
         ui.separator();
 
@@ -511,12 +511,12 @@ impl SftpApp {
             for entry in rows {
                 let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
                 ui.horizontal(|ui| {
-                    let response = ui.add_sized(
-                        [name_width, 22.0],
-                        egui::Button::selectable(
-                            self.local_selected.as_ref() == Some(&entry.path),
-                            egui::RichText::new(&entry.name).monospace(),
-                        ),
+                    let response = file_name_cell(
+                        ui,
+                        name_width,
+                        22.0,
+                        &entry.name,
+                        self.local_selected.as_ref() == Some(&entry.path),
                     );
                     if response.clicked() { self.local_selected = Some(entry.path.clone()); }
                     if response.double_clicked() && entry.dir {
@@ -524,15 +524,9 @@ impl SftpApp {
                         self.local_selected = None;
                         self.refresh_local();
                     }
-                    ui.add_sized([SIZE_WIDTH, 22.0], egui::Label::new(
-                        egui::RichText::new(if entry.dir { "—".into() } else { size_text(entry.size) }).small().monospace()
-                    ).halign(egui::Align::LEFT));
-                    ui.add_sized([MODIFIED_WIDTH, 22.0], egui::Label::new(
-                        egui::RichText::new(entry.modified).small().monospace()
-                    ).halign(egui::Align::LEFT));
-                    ui.add_sized([TYPE_WIDTH, 22.0], egui::Label::new(
-                        egui::RichText::new(if entry.dir { "DIR" } else { "FILE" }).small().monospace()
-                    ).halign(egui::Align::LEFT));
+                    file_text_cell(ui, SIZE_WIDTH, 22.0, &if entry.dir { "—".into() } else { size_text(entry.size) }, false);
+                    file_text_cell(ui, MODIFIED_WIDTH, 22.0, &entry.modified, false);
+                    file_text_cell(ui, TYPE_WIDTH, 22.0, if entry.dir { "DIR" } else { "FILE" }, false);
                 });
             }
         });
@@ -571,10 +565,10 @@ impl SftpApp {
         const TYPE_WIDTH: f32 = 42.0;
         let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
         ui.horizontal(|ui| {
-            ui.add_sized([name_width, 18.0], egui::Label::new(egui::RichText::new("NAME").small().strong().monospace()).halign(egui::Align::LEFT));
-            ui.add_sized([SIZE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("SIZE").small().strong().monospace()).halign(egui::Align::LEFT));
-            ui.add_sized([MODIFIED_WIDTH, 18.0], egui::Label::new(egui::RichText::new("MODIFIED (UTC)").small().strong().monospace()).halign(egui::Align::LEFT));
-            ui.add_sized([TYPE_WIDTH, 18.0], egui::Label::new(egui::RichText::new("TYPE").small().strong().monospace()).halign(egui::Align::LEFT));
+            file_text_cell(ui, name_width, 18.0, "NAME", true);
+            file_text_cell(ui, SIZE_WIDTH, 18.0, "SIZE", true);
+            file_text_cell(ui, MODIFIED_WIDTH, 18.0, "MODIFIED (UTC)", true);
+            file_text_cell(ui, TYPE_WIDTH, 18.0, "TYPE", true);
         });
         ui.separator();
         if self.connection.is_none() {
@@ -602,13 +596,7 @@ impl SftpApp {
                 let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - 24.0).max(100.0);
                 ui.horizontal(|ui| {
                     let selected = self.remote_selected.contains(&entry.path);
-                    let response = ui.add_sized(
-                        [name_width, 22.0],
-                        egui::Button::selectable(
-                            selected,
-                            egui::RichText::new(&entry.name).monospace(),
-                        ),
-                    );
+                    let response = file_name_cell(ui, name_width, 22.0, &entry.name, selected);
                     if response.clicked() {
                         let multi = response.ctx.input(|input| input.modifiers.ctrl || input.modifiers.command);
                         if multi {
@@ -620,15 +608,9 @@ impl SftpApp {
                         }
                     }
                     if response.double_clicked() && entry.dir { self.navigate_remote(entry.path.clone()); }
-                    ui.add_sized([SIZE_WIDTH, 22.0], egui::Label::new(
-                        egui::RichText::new(if entry.dir { "—".into() } else { size_text(entry.size) }).small().monospace()
-                    ).halign(egui::Align::LEFT));
-                    ui.add_sized([MODIFIED_WIDTH, 22.0], egui::Label::new(
-                        egui::RichText::new(entry.modified).small().monospace()
-                    ).halign(egui::Align::LEFT));
-                    ui.add_sized([TYPE_WIDTH, 22.0], egui::Label::new(
-                        egui::RichText::new(if entry.dir { "DIR" } else { "FILE" }).small().monospace()
-                    ).halign(egui::Align::LEFT));
+                    file_text_cell(ui, SIZE_WIDTH, 22.0, &if entry.dir { "—".into() } else { size_text(entry.size) }, false);
+                    file_text_cell(ui, MODIFIED_WIDTH, 22.0, &entry.modified, false);
+                    file_text_cell(ui, TYPE_WIDTH, 22.0, if entry.dir { "DIR" } else { "FILE" }, false);
                 });
             }
         });
@@ -1009,6 +991,45 @@ impl eframe::App for SftpApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+}
+
+fn file_name_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    text: &str,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, height),
+        egui::Sense::click(),
+    );
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if visuals.bg_fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    ui.painter().text(
+        rect.left_center() + egui::vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::monospace(14.0),
+        visuals.fg_stroke.color,
+    );
+    response
+}
+
+fn file_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, header: bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, height),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::monospace(if header { 12.0 } else { 12.0 }),
+        ui.visuals().text_color(),
+    );
 }
 
 fn profiles_path() -> Result<PathBuf, String> {
