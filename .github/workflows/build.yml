@@ -162,8 +162,8 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        # One release per push, e.g. tag v0.2.0-build.42 for Cargo.toml version
-        # 0.2.0 and workflow run 42. Notes list the changes since the previous
+        # One release per push, e.g. tag v0.3.1-build.42 for Cargo.toml version
+        # 0.3.1 and workflow run 42. Notes list the changes since the previous
         # release. gh uploads the assets before publishing the release.
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
