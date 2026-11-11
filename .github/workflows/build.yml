@@ -103,6 +103,8 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/rsftp-turbo staging/rsftp-turbo/
           cp crates/turbo-server/dist/* staging/rsftp-turbo/
           tar -czf "dist/rsftp-turbo-$version-linux-x86_64.tar.gz" -C staging rsftp-turbo
+          # The bare server binary too, for updating an existing install.
+          cp target/x86_64-unknown-linux-musl/release/rsftp-turbo "dist/rsftp-turbo-$version-linux-x86_64"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -136,6 +138,18 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Check every release file is present
+        working-directory: dist
+        run: |
+          version=$(grep -m1 '^version' ../Cargo.toml | cut -d '"' -f2)
+          for file in \
+            "rust-sftp-client-$version-linux-x86_64.tar.gz" \
+            "rust-sftp-client-$version-windows-x86_64.exe" \
+            "rsftp-turbo-$version-linux-x86_64.tar.gz" \
+            "rsftp-turbo-$version-linux-x86_64"; do
+            test -s "$file" || { echo "::error::missing release file $file"; ls -la; exit 1; }
+          done
 
       - name: Write checksums
         working-directory: dist

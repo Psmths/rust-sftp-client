@@ -39,7 +39,7 @@ only build.
 SFTP's per-request round trips. Browsing, uploads and logins still use SSH/SFTP, and downloads fall
 back to SFTP automatically when the server has no helper or UDP is blocked.
 
-* Install on the server from the `rsftp-turbo-<version>-linux-x86_64.tar.gz` release asset (`sudo ./install.sh`)
+* Install on the server from the `rsftp-turbo-<version>-linux-x86_64.tar.gz` release asset (`sudo ./install.sh`; the bare `rsftp-turbo-<version>-linux-x86_64` binary is attached too, for updating an existing install)
   and open UDP port 6767. See [crates/turbo-server/dist/README.md](crates/turbo-server/dist/README.md).
 * Each download is authorised over the SSH session (`rsftp-turbo ticket` runs as the logged-in user,
   so only files that user can read are offered), every UDP packet is encrypted and authenticated with
