@@ -249,6 +249,39 @@ pub fn header_cell(ui: &mut Ui, width: f32, height: f32, text: &str) {
     }
 }
 
+/// COLOR_SCROLLBAR: the scroll bar track (classic Windows dithers white and
+/// button face; this is the blend).
+pub const SCROLL_TRACK: Color32 = Color32::from_rgb(234, 232, 228);
+const SCROLL_THUMB: Color32 = Color32::from_rgb(176, 172, 166);
+const SCROLL_THUMB_HOVERED: Color32 = Color32::from_rgb(150, 147, 141);
+const SCROLL_THUMB_DRAGGED: Color32 = SHADOW;
+
+/// Shows `area` with visible scroll bars.
+///
+/// egui paints the track with `extreme_bg_color` and the thumb with the
+/// widgets' `bg_fill`, both white in this theme (they are also the list and
+/// checkbox backgrounds), so the bars would be invisible. The scroll bar
+/// colours apply to the area's own `ui`; the contents get the normal visuals.
+pub fn scroll<R>(
+    ui: &mut Ui,
+    area: egui::ScrollArea,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let normal = ui.visuals().clone();
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.extreme_bg_color = SCROLL_TRACK;
+        visuals.widgets.inactive.bg_fill = SCROLL_THUMB;
+        visuals.widgets.hovered.bg_fill = SCROLL_THUMB_HOVERED;
+        visuals.widgets.active.bg_fill = SCROLL_THUMB_DRAGGED;
+        area.show(ui, |ui| {
+            *ui.visuals_mut() = normal;
+            add_contents(ui)
+        })
+    })
+    .inner
+}
+
 /// White, sunken "client edge" area — the frame around list views.
 /// `height` is the total outer height, including the 2 px edge.
 pub fn list_view<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {

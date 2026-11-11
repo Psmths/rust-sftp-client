@@ -1090,7 +1090,7 @@ impl SftpApp {
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
         win32::list_view(ui, list_height, |ui| {
             let (name_width, header) = reserve_list_header(ui);
-            let scrolled = file_list_scroll(("local_list", self.sessions[a].id)).show(ui, |ui| {
+            let scrolled = win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
                 for entry in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1200,7 +1200,7 @@ impl SftpApp {
                 paint_list_header(ui, header, name_width, 0.0);
                 return;
             }
-            let scrolled = file_list_scroll(("remote_list", self.sessions[a].id)).show(ui, |ui| {
+            let scrolled = win32::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
                 for entry in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1307,7 +1307,7 @@ impl SftpApp {
                                 ui.label("Saved profiles:");
                                 let list_height = body_height - 50.0;
                                 win32::list_view(ui, list_height, |ui| {
-                                    egui::ScrollArea::vertical().id_salt("profile_list").auto_shrink([false, false]).show(ui, |ui| {
+                                    win32::scroll(ui, egui::ScrollArea::vertical().id_salt("profile_list").auto_shrink([false, false]), |ui| {
                                         for (index, profile) in self.saved_profiles.iter().enumerate() {
                                             if win32::list_item(ui, &profile.name, self.selected_profile == Some(index)).clicked() {
                                                 apply = Some(index);
@@ -1825,7 +1825,7 @@ impl eframe::App for SftpApp {
                     let rest = ui.available_width();
                     if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
                 });
-                egui::ScrollArea::vertical().id_salt(("queue_list", self.sessions[a].id)).auto_shrink([false, false]).show(ui, |ui| {
+                win32::scroll(ui, egui::ScrollArea::vertical().id_salt(("queue_list", self.sessions[a].id)).auto_shrink([false, false]), |ui| {
                     if !self.sessions[a].transfers.iter().any(|item| item.is_pending() == show_pending) {
                         let empty = if show_pending { "There are no pending transfers." } else { "There are no completed transfers." };
                         ui.add_space(6.0);
