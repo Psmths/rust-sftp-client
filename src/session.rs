@@ -138,6 +138,9 @@ pub struct Session {
     connect_rx: Option<std_mpsc::Receiver<Result<SftpConnection, ConnectError>>>,
     /// A listing in progress: resolves to (absolute path, entries).
     list_rx: Option<std_mpsc::Receiver<Result<(String, Vec<RemoteEntry>), String>>>,
+    /// The pending listing is the profile's default folder: on failure, show
+    /// the home folder instead.
+    home_fallback: bool,
 
     pub transfers: Vec<TransferItem>,
     pub queue_tab: QueueTab,
@@ -179,6 +182,7 @@ impl Session {
             pending_fingerprint: None,
             connect_rx: None,
             list_rx: None,
+            home_fallback: false,
             transfers: Vec::new(),
             queue_tab: QueueTab::Pending,
             next_transfer_id: 1,
@@ -213,7 +217,12 @@ impl Session {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.connect_rx.is_some() || self.list_rx.is_some() || self.transfers.iter().any(TransferItem::is_pending)
+        self.connect_rx.is_some()
+            || self.list_rx.is_some()
+            || self.transfers.iter().any(TransferItem::is_pending)
+            || self.connection.as_ref().is_some_and(|connection| {
+                connection.turbo_info().state == crate::connection::TurboState::Testing
+            })
     }
 
     fn log_event(&self, category: Category, severity: Severity, msgid: &str, message: &str) {
@@ -295,13 +304,36 @@ impl Session {
                     ),
                 );
                 let host = connection.host.clone();
-                self.connection = Some(Arc::new(connection));
+                let connection = Arc::new(connection);
+                if connection.begin_turbo_probe() {
+                    let probe = Arc::clone(&connection);
+                    self.runtime.spawn(async move { probe.probe_turbo().await });
+                }
+                self.connection = Some(connection);
                 let password = self.pending_password.take();
                 // Filled in with the absolute home directory once listed.
                 self.remote_path = String::new();
                 self.remote_selected.clear();
                 self.status = format!("Connected to {host}");
-                self.load_remote(".");
+                let default_path = self
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.default_remote_path.clone())
+                    .filter(|path| !path.trim().is_empty());
+                match default_path {
+                    Some(path) => {
+                        // SFTP servers do not expand `~`; relative paths start at home.
+                        let path = path.trim();
+                        let path = match path.strip_prefix('~') {
+                            Some("") => ".",
+                            Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/'),
+                            _ => path,
+                        };
+                        self.load_remote(if path.is_empty() { "." } else { path });
+                        self.home_fallback = true;
+                    }
+                    None => self.load_remote("."),
+                }
                 ConnectOutcome::Connected { password }
             }
             Err(ConnectError::HostKeyRequired { fingerprint }) => {
@@ -340,6 +372,7 @@ impl Session {
         }
         self.connect_rx = None;
         self.list_rx = None;
+        self.home_fallback = false;
         self.remote_entries.clear();
         self.remote_selected.clear();
         self.status = "Disconnected".into();
@@ -351,6 +384,7 @@ impl Session {
     /// resolved on the server first, so `remote_path` is always absolute.
     pub fn load_remote(&mut self, path: &str) {
         let Some(connection) = self.connection.clone() else { return; };
+        self.home_fallback = false;
         let requested = if path.is_empty() { ".".to_owned() } else { path.to_owned() };
         let (tx, rx) = std_mpsc::channel();
         self.list_rx = Some(rx);
@@ -394,6 +428,7 @@ impl Session {
     pub fn poll_remote_listing(&mut self) -> Option<String> {
         let result = self.list_rx.as_ref().and_then(|rx| rx.try_recv().ok())?;
         self.list_rx = None;
+        let fall_back = std::mem::take(&mut self.home_fallback);
         match result {
             Ok((path, entries)) => {
                 self.remote_path = path;
@@ -401,6 +436,16 @@ impl Session {
                 self.remote_selected.clear();
                 self.status = format!("Remote directory loaded · {} entries", self.remote_entries.len());
                 None
+            }
+            Err(error) if fall_back => {
+                self.log_event(
+                    Category::Connection,
+                    Severity::Warning,
+                    "LIST",
+                    &format!("Default remote folder unavailable, opening the home folder: {error}"),
+                );
+                self.load_remote(".");
+                Some(format!("Could not open the default remote folder: {error}\n\nShowing the home folder instead."))
             }
             Err(error) => Some(format!("Could not list remote directory: {error}")),
         }

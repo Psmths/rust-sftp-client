@@ -46,6 +46,8 @@ const LOSS_TOLERANCE: f64 = 0.02;
 const DECREASE: f64 = 0.7;
 /// Requests are paced at this multiple of window / RTT.
 const PACING_GAIN: f64 = 1.25;
+/// Requests may run this far ahead of the pacing schedule (small bursts).
+const PACING_SLACK: Duration = Duration::from_millis(2);
 const INITIAL_RTO: Duration = Duration::from_millis(500);
 /// Floor for request timeouts: data queued behind earlier bursts arrives
 /// late, and re-requesting it too early only adds duplicate traffic.
@@ -248,18 +250,24 @@ impl Congestion {
         state.rto = (srtt + state.rttvar * 4).max(srtt * 2).clamp(MIN_RTO, MAX_RTO);
     }
 
-    /// Time at which a request for `bytes` may be sent (pacing at
-    /// `PACING_GAIN` × window / RTT).
-    pub fn pace(&self, bytes: usize, chunk: usize) -> Instant {
+    /// Pacing at `PACING_GAIN` × window / RTT. Books a slot and returns
+    /// `Ok` if a request for `bytes` may be sent now; otherwise returns the
+    /// instant to try again, without booking anything. Callers never sleep
+    /// here: a fetcher must keep draining its socket while it waits, or
+    /// replies pile up (and are dropped) and the delay inflates the RTT,
+    /// which in turn slows the pacing further.
+    pub fn pace(&self, bytes: usize, chunk: usize) -> Result<(), Instant> {
         let now = Instant::now();
-        let Ok(mut state) = self.state.lock() else { return now };
+        let Ok(mut state) = self.state.lock() else { return Ok(()) };
+        if state.next_send > now + PACING_SLACK {
+            return Err(state.next_send - PACING_SLACK);
+        }
         let srtt = state.srtt.unwrap_or(INITIAL_RTO).as_secs_f64().max(0.001);
         let window_bytes = (self.window.load(Ordering::Relaxed) * chunk) as f64;
         let rate = (window_bytes / srtt * PACING_GAIN).max(1.0);
         let interval = Duration::from_secs_f64(bytes as f64 / rate);
-        let slot = state.next_send.max(now);
-        state.next_send = slot + interval;
-        slot
+        state.next_send = state.next_send.max(now) + interval;
+        Ok(())
     }
 
     /// Feeds delivery and loss counts; about once per RTT the window is
@@ -582,6 +590,8 @@ impl SegmentFetcher {
         let mut digest_request: Option<(u32, Instant)> = None;
         let mut digest_attempts = 0_u32;
         let mut waiting_since: Option<Instant> = None;
+        // When pacing holds back the next request.
+        let mut paced_until: Option<Instant> = None;
 
         loop {
             if cancelled() {
@@ -600,8 +610,9 @@ impl SegmentFetcher {
                 waiting_since.get_or_insert_with(Instant::now);
             }
 
-            // Ask for missing chunks while the shared window has room.
-            loop {
+            // Ask for missing chunks while the shared window and pacing allow.
+            paced_until = paced_until.filter(|until| *until > Instant::now());
+            while paced_until.is_none() {
                 if chunk_count - received_chunks - *reserved == 0 {
                     break;
                 }
@@ -621,13 +632,14 @@ impl SegmentFetcher {
                     break;
                 }
                 let end = start + count;
-                *reserved += count;
                 let byte_start = start * chunk;
                 let byte_end = (end * chunk).min(len_usize);
-                let slot = conn.congestion.pace(byte_end - byte_start, chunk);
-                if slot > Instant::now() + Duration::from_millis(1) {
-                    tokio::time::sleep_until(slot.into()).await;
+                if let Err(until) = conn.congestion.pace(byte_end - byte_start, chunk) {
+                    conn.congestion.release(count);
+                    paced_until = Some(until);
+                    break;
                 }
+                *reserved += count;
                 let mut retransmission = false;
                 for index in start..end {
                     state[index] = Chunk::InFlight;
@@ -664,6 +676,7 @@ impl SegmentFetcher {
                 .iter()
                 .map(|batch| batch.deadline)
                 .chain(digest_request.map(|(_, deadline)| deadline))
+                .chain(paced_until)
                 .min()
                 .unwrap_or(now + POLL_INTERVAL);
             self.receive_batch(deadline.saturating_duration_since(now).min(POLL_INTERVAL)).await?;

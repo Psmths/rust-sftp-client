@@ -27,14 +27,23 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
-            artifact: rust-sftp-client-linux-x86_64
+            platform: linux-x86_64
           - name: Windows x86_64
             os: windows-latest
-            artifact: rust-sftp-client-windows-x86_64
+            platform: windows-x86_64
 
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      - name: Read the version
+        id: version
+        shell: bash
+        # Release file names carry the Cargo.toml version.
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact=rust-sftp-client-$version-${{ matrix.platform }}" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -83,25 +92,29 @@ jobs:
         if: runner.os == 'Linux'
         # Tar keeps the executable bit, which artifact zips would drop.
         run: |
-          mkdir -p dist
-          tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C target/release rust-sftp-client
-          # Server helper: static binary + systemd unit + installer.
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p dist package
+          cp target/release/rust-sftp-client "package/rust-sftp-client-$version"
+          tar -czf "dist/${{ steps.version.outputs.artifact }}.tar.gz" -C package "rust-sftp-client-$version"
+          # Server helper: static binary + systemd unit + installer. The binary
+          # keeps its plain name, which install.sh and the systemd unit use.
+          rm -rf staging/rsftp-turbo
           mkdir -p staging/rsftp-turbo
           cp target/x86_64-unknown-linux-musl/release/rsftp-turbo staging/rsftp-turbo/
           cp crates/turbo-server/dist/* staging/rsftp-turbo/
-          tar -czf dist/rsftp-turbo-linux-x86_64.tar.gz -C staging rsftp-turbo
+          tar -czf "dist/rsftp-turbo-$version-linux-x86_64.tar.gz" -C staging rsftp-turbo
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/rust-sftp-client.exe "dist/${{ matrix.artifact }}.exe"
+          Copy-Item target/release/rust-sftp-client.exe "dist/${{ steps.version.outputs.artifact }}.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ steps.version.outputs.artifact }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
@@ -133,8 +146,8 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        # One release per push, e.g. tag v0.1.0-build.42 for Cargo.toml version
-        # 0.1.0 and workflow run 42. Notes list the changes since the previous
+        # One release per push, e.g. tag v0.2.0-build.42 for Cargo.toml version
+        # 0.2.0 and workflow run 42. Notes list the changes since the previous
         # release. gh uploads the assets before publishing the release.
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)

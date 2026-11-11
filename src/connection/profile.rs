@@ -25,6 +25,9 @@ pub struct ConnectionProfile {
     /// Whether the password for this login is saved in the credential store.
     #[serde(default)]
     pub save_password: bool,
+    /// Remote folder opened after connecting (the login's home folder if unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_remote_path: Option<String>,
 }
 
 impl ConnectionProfile {
@@ -66,6 +69,7 @@ mod tests {
             username: "analyst".into(), auth_method: AuthMethod::Password,
             private_key_path: None,
             save_password: true,
+            default_remote_path: None,
         }
     }
 
@@ -91,6 +95,7 @@ mod tests {
         let json = r#"{"name":"Lab","host":"h","port":22,"username":"u","authMethod":"password"}"#;
         let parsed: ConnectionProfile = serde_json::from_str(json).expect("old profile parses");
         assert!(!parsed.save_password);
+        assert_eq!(parsed.default_remote_path, None);
     }
 
     #[test]

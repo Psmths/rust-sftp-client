@@ -330,6 +330,8 @@ pub struct SftpApp {
     username: String,
     profile_name: String,
     key_path: String,
+    /// Profile setting: remote folder opened after connecting.
+    remote_folder: String,
     auth: AuthMethod,
     password: String,
     /// "Save password" checkbox of the profile editor / password prompt.
@@ -388,6 +390,7 @@ impl SftpApp {
             username: String::new(),
             profile_name: "New site".into(),
             key_path: String::new(),
+            remote_folder: String::new(),
             auth: AuthMethod::Password,
             password: String::new(),
             save_password: false,
@@ -490,6 +493,7 @@ impl SftpApp {
             auth_method: self.auth,
             private_key_path: (self.auth == AuthMethod::PrivateKey).then(|| self.key_path.trim().into()),
             save_password: self.auth == AuthMethod::Password && self.save_password,
+            default_remote_path: Some(self.remote_folder.trim().to_owned()).filter(|path| !path.is_empty()),
         };
         profile.validate().map_err(|e| e.to_string())?;
         if profile.auth_method == AuthMethod::SshAgent {
@@ -624,6 +628,7 @@ impl SftpApp {
         self.username.clear();
         self.auth = AuthMethod::Password;
         self.key_path.clear();
+        self.remote_folder.clear();
         self.password.clear();
         self.save_password = false;
     }
@@ -955,6 +960,7 @@ impl SftpApp {
             self.auth = profile.auth_method;
             self.key_path = profile.private_key_path.clone().unwrap_or_default();
             self.save_password = profile.save_password;
+            self.remote_folder = profile.default_remote_path.clone().unwrap_or_default();
             self.password.clear();
             self.selected_profile = Some(index);
         }
@@ -1365,6 +1371,11 @@ impl SftpApp {
                                         });
                                         ui.end_row();
                                     }
+                                    ui.label("Remote folder:");
+                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut self.remote_folder)
+                                        .hint_text("Home folder")
+                                        .desired_width(field_width));
+                                    ui.end_row();
                                 });
                             });
                         });
@@ -2017,6 +2028,14 @@ fn turbo_status_text(session: &Session) -> (String, String) {
         TurboState::Untested => (
             "Turbo: not tried yet".to_owned(),
             "rsftp-turbo is tried on the next download from this server.".to_owned(),
+        ),
+        TurboState::Testing => (
+            "Turbo: checking…".to_owned(),
+            "Checking whether the server's rsftp-turbo service answers over UDP.".to_owned(),
+        ),
+        TurboState::Ready => (
+            "Turbo: ready (UDP)".to_owned(),
+            "rsftp-turbo answered over UDP; downloads from this server will use it.".to_owned(),
         ),
         TurboState::Active => (
             "Turbo: active (UDP)".to_owned(),

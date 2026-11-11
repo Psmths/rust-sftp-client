@@ -22,14 +22,22 @@ use rsftp_turbo_proto::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_STREAM_COM
 
 /// How long to wait for `rsftp-turbo ticket` on the server.
 const TICKET_TIMEOUT: Duration = Duration::from_secs(15);
+/// Small, world-readable regular files used to check rsftp-turbo right after
+/// connecting (the helper only issues tickets for regular files). Only the
+/// UDP handshake runs; no file data is sent.
+const TURBO_PROBE_FILES: [&str; 3] = ["/etc/hostname", "/etc/os-release", "/etc/passwd"];
 
 /// Whether the server offers rsftp-turbo, learned on first use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurboState {
     /// Turned off in the network settings.
     Disabled,
-    /// No download has tried it yet on this connection.
+    /// Not tried yet (no download yet, and the connect-time check could not run).
     Untested,
+    /// The connect-time check is running.
+    Testing,
+    /// The connect-time check reached the service over UDP.
+    Ready,
     /// At least one download went over UDP.
     Active,
     /// Not usable on this connection; downloads use SFTP. Holds the reason.
@@ -664,6 +672,61 @@ impl SftpConnection {
             state: TurboState::Unavailable("internal error".into()),
             last_fallback: None,
         })
+    }
+
+    /// Marks the connect-time turbo check as started; false if there is
+    /// nothing to check (turbo is off or already known to be unavailable).
+    pub fn begin_turbo_probe(&self) -> bool {
+        let Ok(mut info) = self.turbo.lock() else { return false };
+        if info.state != TurboState::Untested {
+            return false;
+        }
+        info.state = TurboState::Testing;
+        true
+    }
+
+    /// Checks right after connecting that rsftp-turbo answers, so its status
+    /// is known before the first download. Call after `begin_turbo_probe`.
+    pub async fn probe_turbo(&self) {
+        let state = self.turbo_probe_state().await;
+        if let Ok(mut info) = self.turbo.lock() {
+            // A download may have settled the state in the meantime.
+            if info.state == TurboState::Testing {
+                info.state = state;
+            }
+        }
+    }
+
+    async fn turbo_probe_state(&self) -> TurboState {
+        let mut ticket = None;
+        for path in TURBO_PROBE_FILES {
+            match self.request_turbo_ticket(path).await {
+                Ok(issued) => {
+                    ticket = Some(issued);
+                    break;
+                }
+                Err(TicketError::Unavailable(reason)) => return TurboState::Unavailable(reason),
+                Err(TicketError::Refused(_)) => {}
+            }
+        }
+        // No readable probe file: leave it to the first download.
+        let Some(ticket) = ticket else { return TurboState::Untested };
+        let Some(server) = self.turbo_address(&ticket).await else {
+            return TurboState::Unavailable(format!("cannot resolve {} for UDP", self.host));
+        };
+        let connection = match rsftp_turbo_proto::client::Connection::new(server, &ticket) {
+            Ok(connection) => connection,
+            Err(error) => return TurboState::Unavailable(error.to_string()),
+        };
+        let result = connection.negotiate(&|| false).await;
+        connection.close().await;
+        match result {
+            Ok(_) => TurboState::Ready,
+            Err(error) => TurboState::Unavailable(format!(
+                "no answer from {server} over UDP (is port {}/udp open and the service listening on that address?): {error}",
+                server.port()
+            )),
+        }
     }
 
     fn set_turbo_state(&self, state: TurboState) {

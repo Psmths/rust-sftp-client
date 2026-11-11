@@ -25,11 +25,11 @@ The executable is written to `target/release/rust-sftp-client`.
 
 Every push to `main` is built and tested on Linux and Windows by GitHub Actions
 ([.github/workflows/build.yml](.github/workflows/build.yml)). The binaries are attached to each
-run as artifacts (`rust-sftp-client-linux-x86_64.tar.gz` and `rust-sftp-client-windows-x86_64.exe`)
+run as artifacts (`rust-sftp-client-<version>-linux-x86_64.tar.gz` and `rust-sftp-client-<version>-windows-x86_64.exe`)
 and kept for 30 days. A build can also be started by hand from the Actions tab.
 
 When both builds succeed on a push to `main`, a GitHub Release is published automatically,
-tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.1.0-build.42`), with both binaries,
+tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.2.0-build.42`), with both binaries,
 a `SHA256SUMS.txt` file and notes listing the changes since the previous release. Manual runs
 only build.
 
@@ -39,7 +39,7 @@ only build.
 SFTP's per-request round trips. Browsing, uploads and logins still use SSH/SFTP, and downloads fall
 back to SFTP automatically when the server has no helper or UDP is blocked.
 
-* Install on the server from the `rsftp-turbo-linux-x86_64.tar.gz` release asset (`sudo ./install.sh`)
+* Install on the server from the `rsftp-turbo-<version>-linux-x86_64.tar.gz` release asset (`sudo ./install.sh`)
   and open UDP port 6767. See [crates/turbo-server/dist/README.md](crates/turbo-server/dist/README.md).
 * Each download is authorised over the SSH session (`rsftp-turbo ticket` runs as the logged-in user,
   so only files that user can read are offered), every UDP packet is encrypted and authenticated with
@@ -48,7 +48,7 @@ back to SFTP automatically when the server has no helper or UDP is blocked.
 * Downloads keep their progress in a hidden `.<name>.rsftp-part` file: if turbo fails part-way, SFTP
   finishes only the missing pieces, and an interrupted download resumes where it stopped (when the
   remote file is unchanged). Stopping a transfer deletes its partial file.
-* Toggle it under *Settings → Network Settings → UDP downloads*. The log records which protocol was used.
+* Toggle it under *Settings → Network Settings → UDP downloads*. The log records which protocol was used. Right after connecting, the client checks that the service answers over UDP (a handshake only, no file data), so the status bar shows *Turbo: ready* or the reason it is unavailable before the first download.
 
 ## Troubleshooting startup
 
@@ -61,7 +61,7 @@ one. If both fail, an error dialog explains why and the details are appended to
 
 ## Implemented workflows
 
-- Save and load non-secret connection profiles.
+- Save and load non-secret connection profiles, optionally with a remote folder to open after connecting (the home folder otherwise).
 - Authenticate with SSH passwords or an unencrypted private-key file.
 - Verify server keys using SHA-256 fingerprints. Unknown keys are rejected until explicitly trusted; a changed pinned key is rejected and cannot be silently replaced.
 - Optionally save passwords per login (user, host and port) in the system credential store: Windows Credential Manager, or a Secret Service keyring such as GNOME Keyring or KWallet on Linux. Passwords are never written to the profiles file; a password is saved only after it has logged in successfully or when a profile is saved with one entered.

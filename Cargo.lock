@@ -3531,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "rsftp-turbo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "nix",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "rsftp-turbo-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "nix",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "rust-sftp-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "keyring",

@@ -8,7 +8,7 @@ the client silently uses SFTP.
 ## Install (Linux, systemd)
 
 ```sh
-tar xzf rsftp-turbo-linux-x86_64.tar.gz
+tar xzf rsftp-turbo-<version>-linux-x86_64.tar.gz
 cd rsftp-turbo
 sudo ./install.sh
 ```

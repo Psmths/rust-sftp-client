@@ -65,6 +65,7 @@ mod tests {
             auth_method: AuthMethod::Password,
             private_key_path: None,
             save_password: true,
+            default_remote_path: None,
         };
         assert_eq!(key(&profile), "analyst@sftp.example.test:2222");
     }
