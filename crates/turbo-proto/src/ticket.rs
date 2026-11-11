@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::KEY_LEN;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 1;
 /// Command the client runs over SSH; the file path is written to its stdin.
 pub const TICKET_COMMAND: &str = "rsftp-turbo ticket";
 /// Long-lived variant: one path per line on stdin, one [`StreamReply`] JSON

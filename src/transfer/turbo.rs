@@ -1,27 +1,23 @@
-//! Downloads over rsftp-turbo (UDP).
+//! Downloads over rsftp-turbo (UDP), protocol version 1.
 //!
-//! Fills the missing ranges of a [`Partial`] download: a probe first checks
-//! that the service answers and picks the packet size, then a bounded number
-//! of workers fetch fixed-size pieces, each verified against the server's
-//! XXH3-128 digest, write them with positional writes and record them in the
-//! partial file once verified. A piece is written as soon as its data has
-//! arrived; its digest is checked while the worker fetches the next piece, and
-//! only then is it recorded as done. Failed or corrupted pieces are fetched
-//! again up to [`RETRIES`] times. Whatever is left when turbo gives up is finished by the
-//! SFTP engine.
+//! Fills the missing ranges of a [`Partial`] download: segments are fetched by
+//! a bounded number of workers, each verified against the server's SHA-256
+//! digest, written with positional writes and recorded in the partial file.
+//! Failed or corrupted segments are fetched again up to [`RETRIES`] times.
+//! Whatever is left when turbo gives up is finished by the SFTP engine.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
 
 use rsftp_turbo_proto::{
-    client::{Connection, FetchError, FetchStats, SegmentFetcher, Verification},
+    client::{Connection, FetchError, FetchStats, SegmentFetcher},
     Ticket, MAX_SEGMENT_LEN,
 };
 use tokio::{sync::mpsc, task::JoinSet};
@@ -32,11 +28,11 @@ use super::{
     CancelToken, DownloadError, DownloadProgress, DownloadResult, SegmentProgress, SegmentRange, TransferSettings,
 };
 
-/// Largest piece: each one is held in memory until all its data has arrived.
+/// Largest segment: each one is held in memory until its digest is verified.
 const MAX_TURBO_SEGMENT: u64 = 8 * 1024 * 1024;
 const MIN_TURBO_SEGMENT: u64 = 256 * 1024;
 const RETRIES: usize = 3;
-/// Progress is reported every this many bytes per piece.
+/// Progress is reported every this many bytes per segment.
 const PROGRESS_STEP: u64 = 256 * 1024;
 
 #[allow(dead_code)] // the messages are kept for debugging
@@ -58,12 +54,12 @@ impl From<std::io::Error> for TurboError {
     }
 }
 
-/// Splits missing ranges into pieces of the configured segment size (at most 8 MiB).
+/// Splits missing ranges into segments of the configured segment size (at most 8 MiB).
 pub fn plan(missing: &[(u64, u64)], settings: TransferSettings) -> Vec<(u64, u64)> {
-    let piece = settings
+    let segment = settings
         .target_segment_size_bytes
         .clamp(MIN_TURBO_SEGMENT, MAX_TURBO_SEGMENT.min(u64::from(MAX_SEGMENT_LEN)));
-    split(missing, piece)
+    split(missing, segment)
 }
 
 struct Shared {
@@ -71,6 +67,9 @@ struct Shared {
     total_segments: u32,
     transferred: AtomicU64,
     completed: AtomicU32,
+    /// Set once the server has answered; before that, silence means
+    /// "unavailable" rather than "failed".
+    reachable: AtomicBool,
     progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
     stats: Mutex<FetchStats>,
     retried_segments: AtomicU32,
@@ -94,8 +93,7 @@ impl Shared {
                     failed,
                 }),
                 file_path: None,
-                file_complete: false,
-                accelerated: true,
+                file_complete: false, accelerated: true,
             });
         }
     }
@@ -112,33 +110,32 @@ pub async fn download(
     if cancel.is_cancelled() {
         return Err(TurboError::Failed(DownloadError::Cancelled));
     }
-    let connection = Connection::new(server, ticket).map_err(|error| TurboError::Unavailable(error.to_string()))?;
-    match connection.negotiate(&|| cancel.is_cancelled()).await {
-        Ok(_) => {}
-        Err(FetchError::Cancelled) => return Err(TurboError::Failed(DownloadError::Cancelled)),
-        Err(error) => return Err(TurboError::Unavailable(error.to_string())),
-    }
-
-    let pieces: Vec<SegmentRange> = plan(&partial.missing(), settings)
+    let size = partial.size;
+    let segments: Vec<SegmentRange> = plan(&partial.missing(), settings)
         .into_iter()
         .map(|(start, end_exclusive)| SegmentRange { index: partial.next_index(), start, end_exclusive })
         .collect();
-    let workers = (settings.max_segments_per_file.max(1) as usize).min(pieces.len());
+    if segments.is_empty() {
+        return Ok(DownloadResult { bytes: size, segments: 0, segmented: false, accelerated: true, details: None });
+    }
+    let connection = Connection::new(server, ticket).map_err(|error| TurboError::Unavailable(error.to_string()))?;
+
+    let workers = (settings.max_segments_per_file.max(1) as usize).min(segments.len());
     let shared = Arc::new(Shared {
-        size: partial.size,
-        total_segments: pieces.len() as u32,
+        size,
+        total_segments: segments.len() as u32,
         transferred: AtomicU64::new(partial.done_bytes()),
         completed: AtomicU32::new(0),
+        reachable: AtomicBool::new(false),
         progress,
         stats: Mutex::new(FetchStats::default()),
         retried_segments: AtomicU32::new(0),
         workers,
     });
-    for range in &pieces {
+    for range in &segments {
         shared.report(*range, 0, false, false);
     }
-    // Each piece with the number of attempts already spent on it.
-    let queue: Arc<Queue> = Arc::new(Mutex::new(pieces.into_iter().map(|range| (range, 0)).collect()));
+    let queue = Arc::new(Mutex::new(segments.into_iter().collect::<VecDeque<_>>()));
     // Stops the remaining workers when one fails for good.
     let abort = CancelToken::new();
     let mut tasks = JoinSet::new();
@@ -169,17 +166,20 @@ pub async fn download(
             }
         }
     }
+    // A user cancellation always reports as such.
     if cancel.is_cancelled() {
         failure = Some(TurboError::Failed(DownloadError::Cancelled));
     }
+
     // Best effort: let the server forget the transfer right away.
     connection.close().await;
     if let Some(error) = failure {
-        // Completed pieces stay recorded in `partial` for SFTP or a resume.
+        // Completed segments stay recorded in `partial` for SFTP or a resume.
         return Err(error);
     }
+    // The caller checks that every byte is recorded and publishes the file.
     Ok(DownloadResult {
-        bytes: partial.size,
+        bytes: size,
         segments: shared.total_segments,
         segmented: shared.total_segments > 1,
         accelerated: true,
@@ -187,52 +187,36 @@ pub async fn download(
     })
 }
 
-/// Pieces still to fetch, with the attempts already used on each.
-type Queue = Mutex<VecDeque<(SegmentRange, usize)>>;
-
 async fn worker(
     connection: Arc<Connection>,
-    queue: Arc<Queue>,
+    queue: Arc<Mutex<VecDeque<SegmentRange>>>,
     shared: Arc<Shared>,
     partial: Arc<Partial>,
     cancel: &CancelToken,
     abort: &CancelToken,
 ) -> Result<(), TurboError> {
     let mut fetcher = SegmentFetcher::new(connection).await.map_err(|error| TurboError::Unavailable(error.to_string()))?;
-    let result = fetch_pieces(&mut fetcher, &queue, &shared, &partial, cancel, abort).await;
+    let result = fetch_segments(&mut fetcher, &queue, &shared, &partial, cancel, abort).await;
     if let Ok(mut stats) = shared.stats.lock() {
         stats.merge(&fetcher.stats());
     }
     result
 }
 
-async fn fetch_pieces(
+async fn fetch_segments(
     fetcher: &mut SegmentFetcher,
-    queue: &Queue,
+    queue: &Mutex<VecDeque<SegmentRange>>,
     shared: &Shared,
     partial: &Arc<Partial>,
     cancel: &CancelToken,
     abort: &CancelToken,
 ) -> Result<(), TurboError> {
     let stopped = || cancel.is_cancelled() || abort.is_cancelled();
-    // Pieces written to disk whose digest is still being checked: start → (range, attempts).
-    let mut unverified: HashMap<u64, (SegmentRange, usize)> = HashMap::new();
     loop {
         let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-        let Some((range, used)) = next else {
-            if unverified.is_empty() {
-                return Ok(());
-            }
-            // Nothing left to fetch: wait for the last digests. A failed one
-            // goes back into the queue and is picked up by this loop.
-            if let Err(error) = fetcher.finish_verifications(&stopped).await {
-                return Err(stop_error(error, &stopped));
-            }
-            settle(fetcher.take_verifications(), &mut unverified, queue, shared, partial)?;
-            continue;
-        };
+        let Some(range) = next else { return Ok(()) };
         let len = range.len() as u32;
-        let mut attempt = used;
+        let mut attempt = 0;
         loop {
             attempt += 1;
             let mut counted = 0_u64;
@@ -242,6 +226,7 @@ async fn fetch_pieces(
                     range.start,
                     len,
                     &mut |bytes| {
+                        shared.reachable.store(true, Ordering::Relaxed);
                         shared.transferred.fetch_add(bytes - counted, Ordering::Relaxed);
                         counted = bytes;
                         if bytes - last_report >= PROGRESS_STEP {
@@ -254,13 +239,15 @@ async fn fetch_pieces(
                 .await;
             match result {
                 Ok(data) => {
-                    // Written now, but recorded as done only once verified.
+                    shared.reachable.store(true, Ordering::Relaxed);
                     let file = partial.file();
                     let offset = range.start;
                     tokio::task::spawn_blocking(move || write_all_at(&file, &data, offset))
                         .await
                         .map_err(|error| DownloadError::Worker(error.to_string()))??;
-                    unverified.insert(range.start, (range, attempt));
+                    partial.mark_done(range.start, range.end_exclusive);
+                    shared.completed.fetch_add(1, Ordering::Relaxed);
+                    shared.report(range, range.len(), true, false);
                     break;
                 }
                 Err(error) => {
@@ -269,6 +256,9 @@ async fn fetch_pieces(
                     if matches!(error, FetchError::Cancelled) || stopped() {
                         return Err(TurboError::Failed(DownloadError::Cancelled));
                     }
+                    if matches!(error, FetchError::Unreachable) && !shared.reachable.load(Ordering::Relaxed) {
+                        return Err(TurboError::Unavailable(error.to_string()));
+                    }
                     if error.is_retryable() && attempt < RETRIES {
                         shared.retried_segments.fetch_add(1, Ordering::Relaxed);
                         shared.report(range, 0, false, false);
@@ -276,62 +266,13 @@ async fn fetch_pieces(
                         continue;
                     }
                     shared.report(range, 0, false, true);
-                    return Err(failed(range, attempt, &error));
+                    return Err(TurboError::Failed(DownloadError::Turbo(format!(
+                        "segment {} failed after {attempt} attempt(s): {error}",
+                        range.index
+                    ))));
                 }
             }
         }
-        settle(fetcher.take_verifications(), &mut unverified, queue, shared, partial)?;
-    }
-}
-
-/// Records verified pieces as done and sends failed ones back to the queue
-/// (or fails the download once a piece has used up its attempts).
-fn settle(
-    verifications: Vec<Verification>,
-    unverified: &mut HashMap<u64, (SegmentRange, usize)>,
-    queue: &Queue,
-    shared: &Shared,
-    partial: &Arc<Partial>,
-) -> Result<(), TurboError> {
-    for verification in verifications {
-        let Some((range, attempts)) = unverified.remove(&verification.offset) else { continue };
-        match verification.result {
-            Ok(()) => {
-                partial.mark_done(range.start, range.end_exclusive);
-                shared.completed.fetch_add(1, Ordering::Relaxed);
-                shared.report(range, range.len(), true, false);
-            }
-            Err(error) => {
-                // Its bytes were counted when they arrived; they don't count now.
-                shared.transferred.fetch_sub(range.len(), Ordering::Relaxed);
-                if error.is_retryable() && attempts < RETRIES {
-                    shared.retried_segments.fetch_add(1, Ordering::Relaxed);
-                    shared.report(range, 0, false, false);
-                    if let Ok(mut queue) = queue.lock() {
-                        queue.push_front((range, attempts));
-                    }
-                } else {
-                    shared.report(range, 0, false, true);
-                    return Err(failed(range, attempts, &error));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn failed(range: SegmentRange, attempts: usize, error: &FetchError) -> TurboError {
-    TurboError::Failed(DownloadError::Turbo(format!(
-        "piece at byte {} failed after {attempts} attempt(s): {error}",
-        range.start
-    )))
-}
-
-fn stop_error(error: FetchError, stopped: &dyn Fn() -> bool) -> TurboError {
-    if matches!(error, FetchError::Cancelled) || stopped() {
-        TurboError::Failed(DownloadError::Cancelled)
-    } else {
-        TurboError::Failed(DownloadError::Turbo(format!("verifying pieces failed: {error}")))
     }
 }
 
@@ -340,13 +281,11 @@ fn summary(shared: &Shared) -> String {
     let stats = shared.stats.lock().map(|stats| *stats).unwrap_or_default();
     let rtt = stats.smoothed_rtt.map(|rtt| format!("{} ms", rtt.as_millis())).unwrap_or_else(|| "?".into());
     format!(
-        "turbo: {} workers, {} pieces ({} retried), {}-byte chunks, loss {:.1}% ({} of {} chunks re-requested, \\
-         {} duplicates), {} congestion events, {} stalls, peak window {} chunks, RTT {rtt}, \\
-         waited {:.1} s for digests",
+        "turbo: {} workers, {} segments ({} retried), loss {:.1}% ({} of {} packets re-requested, {} duplicates), \
+         {} congestion events, {} stalls, peak window {} packets, RTT {rtt}, waited {:.1} s for segment hashes",
         shared.workers,
         shared.total_segments,
         shared.retried_segments.load(Ordering::Relaxed),
-        stats.chunk_size,
         stats.loss_ratio() * 100.0,
         stats.chunks_requested.saturating_sub(stats.chunks_received),
         stats.chunks_requested,
@@ -354,7 +293,7 @@ fn summary(shared: &Shared) -> String {
         stats.loss_events,
         stats.stalls,
         stats.peak_window,
-        stats.digest_wait.as_secs_f64(),
+        stats.open_wait.as_secs_f64(),
     )
 }
 
@@ -363,14 +302,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_uses_bounded_contiguous_pieces() {
+    fn plan_uses_bounded_contiguous_segments() {
         let settings = TransferSettings::default(); // 8 MiB target
         let size = 20 * 1024 * 1024 + 5;
-        let pieces = plan(&[(0, size)], settings);
-        assert_eq!(pieces.len(), 3);
-        assert!(pieces.windows(2).all(|pair| pair[0].1 == pair[1].0));
-        assert_eq!(pieces.last().unwrap().1, size);
-        assert!(pieces.iter().all(|(start, end)| end - start <= MAX_TURBO_SEGMENT));
+        let segments = plan(&[(0, size)], settings);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].0, 0);
+        assert!(segments.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        assert_eq!(segments.last().unwrap().1, size);
+        assert!(segments.iter().all(|(start, end)| end - start <= MAX_TURBO_SEGMENT));
         assert!(plan(&[], settings).is_empty());
         let huge_target = TransferSettings { target_segment_size_bytes: 1 << 40, ..settings };
         assert!(plan(&[(0, size)], huge_target).iter().all(|(start, end)| end - start <= MAX_TURBO_SEGMENT));

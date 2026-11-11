@@ -1,4 +1,4 @@
-//! Packet format (protocol version 2).
+//! Packet format.
 //!
 //! ```text
 //! +-------+------+-------------+-------------+--------------------------------+
@@ -10,15 +10,6 @@
 //! The 21-byte header is authenticated as associated data. The 96-bit nonce
 //! is `direction ‖ 0 0 0 ‖ counter`; each side increments its own counter
 //! for every packet it sends, so a nonce is never reused under one key.
-//!
-//! Data flows as soon as the client asks for it (`Read`); the client asks for
-//! a segment's XXH3-128 digest (`Digest`) once it has requested all of the
-//! segment, so verification costs no extra round trip. The chunk size is
-//! chosen per transfer with `Probe` (largest that gets through unfragmented;
-//! the server sends with "don't fragment" set, so an oversized probe reply is
-//! dropped instead of silently fragmented). A PROBE_REPLY also carries the
-//! server's largest supported chunk; servers from before that field pad with
-//! zeros, which reads as [`LEGACY_MAX_CHUNK`].
 
 use std::fmt;
 
@@ -28,56 +19,30 @@ use aes_gcm::{
 };
 
 pub const DEFAULT_PORT: u16 = 6767;
-pub const MAGIC: [u8; 4] = *b"RTB2";
+pub const MAGIC: [u8; 4] = *b"RTB1";
 pub const HEADER_LEN: usize = 4 + 1 + 8 + 8;
 pub const TAG_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
-/// Bytes a DATA packet adds around its chunk (header, offset, tag).
-pub const DATA_OVERHEAD: usize = HEADER_LEN + 8 + TAG_LEN;
-/// Chunk size that always fits: 1245-byte packets stay below the 1280-byte
-/// IPv6 minimum MTU, so they are never fragmented.
+/// File bytes per DATA packet. Header, offset and tag bring a packet to
+/// 1245 bytes, below the 1280-byte IPv6 minimum MTU, so it is never fragmented.
 pub const CHUNK_SIZE: usize = 1200;
-/// Larger chunk used when a probe shows the path carries it: 1425-byte
-/// packets fit a 1500-byte MTU and PPPoE (1492) over IPv4 and IPv6.
-pub const LARGE_CHUNK: usize = 1380;
-/// Largest chunk whose packet fits a 1500-byte MTU over IPv4
-/// (1500 − 20 IP − 8 UDP − 45 = 1427).
-pub const IPV4_FULL_CHUNK: usize = 1500 - 20 - 8 - DATA_OVERHEAD;
-/// Same over IPv6 (40-byte IP header): 1407.
-pub const IPV6_FULL_CHUNK: usize = 1500 - 40 - 8 - DATA_OVERHEAD;
-pub const MIN_CHUNK: usize = 512;
-/// Largest chunk this version sends or accepts.
-pub const MAX_CHUNK: usize = IPV4_FULL_CHUNK;
-/// Largest chunk a server from before the PROBE_REPLY `max_chunk` field accepts.
-pub const LEGACY_MAX_CHUNK: usize = 1400;
-/// Size of a DATA packet carrying a full default chunk.
-pub const DATA_PACKET_LEN: usize = CHUNK_SIZE + DATA_OVERHEAD;
 /// Largest byte range a single READ may ask for.
 pub const MAX_READ_LEN: u32 = 4 * 1024 * 1024;
-/// Largest range one DIGEST may cover.
+/// Largest segment the server hashes for one OPEN_SEGMENT.
 pub const MAX_SEGMENT_LEN: u32 = 64 * 1024 * 1024;
-/// Largest probe reply the server will produce.
-pub const MAX_PROBE_LEN: usize = 1500;
 /// Receive buffer size that fits every packet of the protocol.
 pub const MAX_PACKET: usize = 2048;
+/// Size of a DATA packet carrying a full chunk.
+pub const DATA_PACKET_LEN: usize = HEADER_LEN + 8 + CHUNK_SIZE + TAG_LEN;
 
-const KIND_DIGEST: u8 = 1;
-const KIND_DIGEST_INFO: u8 = 2;
+const KIND_OPEN_SEGMENT: u8 = 1;
+const KIND_SEGMENT_INFO: u8 = 2;
 const KIND_READ: u8 = 3;
 const KIND_DATA: u8 = 4;
 const KIND_CLOSE: u8 = 5;
 const KIND_CLOSED: u8 = 6;
 const KIND_ERROR: u8 = 7;
-const KIND_PROBE: u8 = 8;
-const KIND_PROBE_REPLY: u8 = 9;
 const MAX_ERROR_LEN: usize = 512;
-/// Body bytes of a PROBE_REPLY besides its padding (request, size, max chunk).
-const PROBE_REPLY_FIXED: usize = 4 + 2 + 2;
-
-/// Size of a DATA packet for `chunk` bytes of data.
-pub const fn data_packet_len(chunk: usize) -> usize {
-    chunk + DATA_OVERHEAD
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -111,14 +76,13 @@ impl SegmentStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-    /// Client → server: report the XXH3-128 digest of `[offset, offset + len)`.
-    Digest { request: u32, offset: u64, len: u32 },
-    /// Server → client: digest of a range (zero unless `status` is Ok).
-    DigestInfo { request: u32, offset: u64, len: u32, status: SegmentStatus, xxh3: u128 },
-    /// Client → server: send `[offset, offset + len)` as DATA packets of
-    /// `chunk` bytes each (the last one may be shorter).
-    Read { request: u32, offset: u64, len: u32, chunk: u16 },
-    /// Server → client: up to `MAX_CHUNK` bytes of file data.
+    /// Client → server: hash `[offset, offset + len)` and report its digest.
+    OpenSegment { request: u32, offset: u64, len: u32 },
+    /// Server → client: digest of a segment (all zero unless `status` is Ok).
+    SegmentInfo { request: u32, offset: u64, len: u32, status: SegmentStatus, sha256: [u8; 32] },
+    /// Client → server: send `[offset, offset + len)` as DATA packets.
+    Read { request: u32, offset: u64, len: u32 },
+    /// Server → client: up to `CHUNK_SIZE` bytes of file data.
     Data { offset: u64, data: Vec<u8> },
     /// Client → server: the transfer is finished; forget it.
     Close,
@@ -126,49 +90,35 @@ pub enum Message {
     Closed,
     /// Server → client: a request failed.
     Error { message: String },
-    /// Client → server: answer with a PROBE_REPLY packet of exactly `size` bytes.
-    Probe { request: u32, size: u16 },
-    /// Server → client: answer to `Probe`, padded to the requested size.
-    /// `max_chunk` is the largest chunk the server accepts in a READ; 0 means
-    /// a server that predates the field (see [`LEGACY_MAX_CHUNK`]).
-    ProbeReply { request: u32, size: u16, max_chunk: u16, padding: usize },
 }
 
 impl Message {
     fn kind(&self) -> u8 {
         match self {
-            Message::Digest { .. } => KIND_DIGEST,
-            Message::DigestInfo { .. } => KIND_DIGEST_INFO,
+            Message::OpenSegment { .. } => KIND_OPEN_SEGMENT,
+            Message::SegmentInfo { .. } => KIND_SEGMENT_INFO,
             Message::Read { .. } => KIND_READ,
             Message::Data { .. } => KIND_DATA,
             Message::Close => KIND_CLOSE,
             Message::Closed => KIND_CLOSED,
             Message::Error { .. } => KIND_ERROR,
-            Message::Probe { .. } => KIND_PROBE,
-            Message::ProbeReply { .. } => KIND_PROBE_REPLY,
         }
     }
 
     fn encode_body(&self) -> Vec<u8> {
         let mut body = Vec::new();
         match self {
-            Message::Digest { request, offset, len } => {
+            Message::OpenSegment { request, offset, len } | Message::Read { request, offset, len } => {
                 body.extend_from_slice(&request.to_be_bytes());
                 body.extend_from_slice(&offset.to_be_bytes());
                 body.extend_from_slice(&len.to_be_bytes());
             }
-            Message::Read { request, offset, len, chunk } => {
-                body.extend_from_slice(&request.to_be_bytes());
-                body.extend_from_slice(&offset.to_be_bytes());
-                body.extend_from_slice(&len.to_be_bytes());
-                body.extend_from_slice(&chunk.to_be_bytes());
-            }
-            Message::DigestInfo { request, offset, len, status, xxh3 } => {
+            Message::SegmentInfo { request, offset, len, status, sha256 } => {
                 body.extend_from_slice(&request.to_be_bytes());
                 body.extend_from_slice(&offset.to_be_bytes());
                 body.extend_from_slice(&len.to_be_bytes());
                 body.push(*status as u8);
-                body.extend_from_slice(&xxh3.to_be_bytes());
+                body.extend_from_slice(sha256);
             }
             Message::Data { offset, data } => {
                 body.reserve(8 + data.len());
@@ -183,16 +133,6 @@ impl Message {
                 }
                 body.extend_from_slice(&message.as_bytes()[..end]);
             }
-            Message::Probe { request, size } => {
-                body.extend_from_slice(&request.to_be_bytes());
-                body.extend_from_slice(&size.to_be_bytes());
-            }
-            Message::ProbeReply { request, size, max_chunk, padding } => {
-                body.extend_from_slice(&request.to_be_bytes());
-                body.extend_from_slice(&size.to_be_bytes());
-                body.extend_from_slice(&max_chunk.to_be_bytes());
-                body.resize(body.len() + padding, 0);
-            }
         }
         body
     }
@@ -200,32 +140,29 @@ impl Message {
     fn decode_body(kind: u8, body: &[u8]) -> Result<Self, WireError> {
         let mut reader = Reader { buf: body, pos: 0 };
         let message = match kind {
-            KIND_DIGEST => {
+            KIND_OPEN_SEGMENT | KIND_READ => {
                 let request = reader.u32()?;
                 let offset = reader.u64()?;
                 let len = reader.u32()?;
-                Message::Digest { request, offset, len }
+                if kind == KIND_READ {
+                    Message::Read { request, offset, len }
+                } else {
+                    Message::OpenSegment { request, offset, len }
+                }
             }
-            KIND_READ => {
-                let request = reader.u32()?;
-                let offset = reader.u64()?;
-                let len = reader.u32()?;
-                let chunk = reader.u16()?;
-                Message::Read { request, offset, len, chunk }
-            }
-            KIND_DIGEST_INFO => {
+            KIND_SEGMENT_INFO => {
                 let request = reader.u32()?;
                 let offset = reader.u64()?;
                 let len = reader.u32()?;
                 let status = SegmentStatus::from_u8(reader.u8()?).ok_or(WireError::Malformed("segment status"))?;
-                let mut xxh3 = [0_u8; 16];
-                xxh3.copy_from_slice(reader.bytes(16)?);
-                Message::DigestInfo { request, offset, len, status, xxh3: u128::from_be_bytes(xxh3) }
+                let mut sha256 = [0_u8; 32];
+                sha256.copy_from_slice(reader.bytes(32)?);
+                Message::SegmentInfo { request, offset, len, status, sha256 }
             }
             KIND_DATA => {
                 let offset = reader.u64()?;
                 let data = reader.rest().to_vec();
-                if data.len() > MAX_CHUNK {
+                if data.len() > CHUNK_SIZE {
                     return Err(WireError::Malformed("data chunk too long"));
                 }
                 Message::Data { offset, data }
@@ -233,34 +170,12 @@ impl Message {
             KIND_CLOSE => Message::Close,
             KIND_CLOSED => Message::Closed,
             KIND_ERROR => Message::Error { message: String::from_utf8_lossy(reader.rest()).into_owned() },
-            KIND_PROBE => {
-                let request = reader.u32()?;
-                let size = reader.u16()?;
-                Message::Probe { request, size }
-            }
-            KIND_PROBE_REPLY => {
-                let request = reader.u32()?;
-                let size = reader.u16()?;
-                // Older servers send only zero padding here (or nothing).
-                let max_chunk = reader.u16().unwrap_or(0);
-                let padding = reader.rest().len();
-                Message::ProbeReply { request, size, max_chunk, padding }
-            }
             other => return Err(WireError::UnknownKind(other)),
         };
-        let open_ended = matches!(message, Message::Data { .. } | Message::Error { .. } | Message::ProbeReply { .. });
-        if !open_ended && reader.pos != body.len() {
+        if !matches!(message, Message::Data { .. } | Message::Error { .. }) && reader.pos != body.len() {
             return Err(WireError::Malformed("trailing bytes"));
         }
         Ok(message)
-    }
-
-    /// A PROBE_REPLY whose sealed packet is exactly `size` bytes (or as close
-    /// as possible if `size` is too small), advertising [`MAX_CHUNK`].
-    pub fn probe_reply(request: u32, size: u16) -> Message {
-        let fixed = HEADER_LEN + PROBE_REPLY_FIXED + TAG_LEN;
-        let padding = usize::from(size).min(MAX_PROBE_LEN).saturating_sub(fixed);
-        Message::ProbeReply { request, size, max_chunk: MAX_CHUNK as u16, padding }
     }
 }
 
@@ -279,12 +194,6 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, WireError> {
         Ok(self.bytes(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, WireError> {
-        let mut out = [0_u8; 2];
-        out.copy_from_slice(self.bytes(2)?);
-        Ok(u16::from_be_bytes(out))
     }
 
     fn u32(&mut self) -> Result<u32, WireError> {
@@ -320,7 +229,7 @@ impl fmt::Display for WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WireError::Truncated => f.write_str("truncated packet"),
-            WireError::BadMagic => f.write_str("not an rsftp-turbo packet (or a different protocol version)"),
+            WireError::BadMagic => f.write_str("not an rsftp-turbo packet"),
             WireError::UnknownKind(kind) => write!(f, "unknown packet kind {kind}"),
             WireError::Authentication => f.write_str("packet failed authentication"),
             WireError::Malformed(what) => write!(f, "malformed packet: {what}"),
@@ -365,7 +274,7 @@ impl PacketCipher {
 
     /// Builds a packet. `counter` must never repeat for one key and direction.
     pub fn seal(&self, direction: Direction, transfer: u64, counter: u64, message: &Message) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(HEADER_LEN + TAG_LEN + MAX_CHUNK + 8);
+        let mut packet = Vec::with_capacity(HEADER_LEN + TAG_LEN + CHUNK_SIZE + 8);
         packet.extend_from_slice(&MAGIC);
         packet.push(message.kind());
         packet.extend_from_slice(&transfer.to_be_bytes());
@@ -391,7 +300,7 @@ impl PacketCipher {
         data: &[u8],
         out: &mut Vec<u8>,
     ) {
-        debug_assert!(data.len() <= MAX_CHUNK);
+        debug_assert!(data.len() <= CHUNK_SIZE);
         let start = out.len();
         out.extend_from_slice(&MAGIC);
         out.push(KIND_DATA);
@@ -424,11 +333,6 @@ fn nonce(direction: Direction, counter: u64) -> Nonce<Aes256Gcm> {
     bytes[0] = direction as u8;
     bytes[4..].copy_from_slice(&counter.to_be_bytes());
     Nonce::<Aes256Gcm>::from(bytes)
-}
-
-/// XXH3-128 of `data`, as used for segment verification.
-pub fn digest(data: &[u8]) -> u128 {
-    xxhash_rust::xxh3::xxh3_128(data)
 }
 
 /// Sliding-window replay filter for packet counters (last 128 counters).
@@ -485,21 +389,17 @@ mod tests {
     #[test]
     fn every_message_round_trips() {
         let messages = [
-            Message::Digest { request: 1, offset: 2, len: 3 },
-            Message::DigestInfo { request: 4, offset: 5, len: 6, status: SegmentStatus::FileChanged, xxh3: u128::MAX - 7 },
-            Message::Read { request: 7, offset: 8, len: 9, chunk: 1380 },
-            Message::Data { offset: 1_000_000, data: vec![42; LARGE_CHUNK] },
+            Message::OpenSegment { request: 1, offset: 2, len: 3 },
+            Message::SegmentInfo { request: 4, offset: 5, len: 6, status: SegmentStatus::FileChanged, sha256: [9; 32] },
+            Message::Read { request: 7, offset: 8, len: 9 },
+            Message::Data { offset: 1_000_000, data: vec![42; CHUNK_SIZE] },
             Message::Close,
             Message::Closed,
             Message::Error { message: "nope".into() },
-            Message::Data { offset: 7, data: vec![1; MAX_CHUNK] },
-            Message::Probe { request: 3, size: 1425 },
-            Message::probe_reply(3, 1425),
-            Message::probe_reply(4, 1500),
         ];
         for (counter, message) in messages.iter().enumerate() {
             let packet = cipher().seal(Direction::ToClient, 99, counter as u64, message);
-            assert!(packet.len() <= MAX_PROBE_LEN, "{} bytes", packet.len());
+            assert!(packet.len() <= 1280, "{} bytes", packet.len());
             let (header, decoded) = cipher().open(Direction::ToClient, &packet).unwrap();
             assert_eq!(header.transfer, 99);
             assert_eq!(header.counter, counter as u64);
@@ -508,54 +408,23 @@ mod tests {
     }
 
     #[test]
-    fn probe_replies_have_the_requested_size() {
-        for size in [1245_u16, 1425, 1500] {
-            let packet = cipher().seal(Direction::ToClient, 1, 1, &Message::probe_reply(1, size));
-            assert_eq!(packet.len(), usize::from(size));
-        }
-        assert_eq!(data_packet_len(LARGE_CHUNK), 1425);
-        assert_eq!(DATA_PACKET_LEN, 1245);
-        // Full-MTU chunks: exactly a 1500-byte IP packet.
-        assert_eq!(IPV4_FULL_CHUNK, 1427);
-        assert_eq!(data_packet_len(IPV4_FULL_CHUNK) + 20 + 8, 1500);
-        assert_eq!(data_packet_len(IPV6_FULL_CHUNK) + 40 + 8, 1500);
-    }
-
-    #[test]
-    fn probe_replies_from_older_servers_read_as_legacy() {
-        // Pre-`max_chunk` servers wrote request, size, then zero padding.
-        let mut body = Vec::new();
-        body.extend_from_slice(&9_u32.to_be_bytes());
-        body.extend_from_slice(&1425_u16.to_be_bytes());
-        body.resize(body.len() + 100, 0);
-        match Message::decode_body(KIND_PROBE_REPLY, &body).unwrap() {
-            Message::ProbeReply { request, max_chunk, .. } => assert_eq!((request, max_chunk), (9, 0)),
-            other => panic!("{other:?}"),
-        }
-        // A reply with no padding at all still decodes.
-        let short = [0, 0, 0, 1, 0, 30];
-        assert!(matches!(
-            Message::decode_body(KIND_PROBE_REPLY, &short).unwrap(),
-            Message::ProbeReply { max_chunk: 0, padding: 0, .. }
-        ));
-    }
-
-    #[test]
     fn in_place_data_sealing_matches_seal() {
-        for chunk in [CHUNK_SIZE, LARGE_CHUNK, MAX_CHUNK, 10] {
-            let data = vec![5_u8; chunk];
-            let expected = cipher().seal(Direction::ToClient, 3, 77, &Message::Data { offset: 4096, data: data.clone() });
-            let mut out = vec![1, 2, 3];
-            cipher().seal_data_into(Direction::ToClient, 3, 77, 4096, &data, &mut out);
-            assert_eq!(&out[..3], &[1, 2, 3]);
-            assert_eq!(&out[3..], &expected[..]);
-            assert_eq!(expected.len(), data_packet_len(chunk));
-        }
+        let data = vec![5_u8; CHUNK_SIZE];
+        let expected = cipher().seal(Direction::ToClient, 3, 77, &Message::Data { offset: 4096, data: data.clone() });
+        let mut out = vec![1, 2, 3];
+        cipher().seal_data_into(Direction::ToClient, 3, 77, 4096, &data, &mut out);
+        assert_eq!(&out[..3], &[1, 2, 3]);
+        assert_eq!(&out[3..], &expected[..]);
+        assert_eq!(expected.len(), DATA_PACKET_LEN);
+        let short = cipher().seal(Direction::ToClient, 3, 78, &Message::Data { offset: 0, data: vec![9; 10] });
+        let mut out = Vec::new();
+        cipher().seal_data_into(Direction::ToClient, 3, 78, 0, &[9; 10], &mut out);
+        assert_eq!(out, short);
     }
 
     #[test]
     fn tampering_wrong_key_and_wrong_direction_are_rejected() {
-        let packet = cipher().seal(Direction::ToServer, 1, 0, &Message::Read { request: 1, offset: 0, len: 10, chunk: 1200 });
+        let packet = cipher().seal(Direction::ToServer, 1, 0, &Message::Read { request: 1, offset: 0, len: 10 });
         let mut tampered = packet.clone();
         *tampered.last_mut().unwrap() ^= 1;
         assert_eq!(cipher().open(Direction::ToServer, &tampered).unwrap_err(), WireError::Authentication);
@@ -566,15 +435,6 @@ mod tests {
         let other = PacketCipher::new(&[8_u8; KEY_LEN]);
         assert_eq!(other.open(Direction::ToServer, &packet).unwrap_err(), WireError::Authentication);
         assert_eq!(parse_header(&packet[..10]).unwrap_err(), WireError::Truncated);
-        let mut old_version = packet.clone();
-        old_version[3] = b'1';
-        assert_eq!(parse_header(&old_version).unwrap_err(), WireError::BadMagic);
-    }
-
-    #[test]
-    fn digest_is_xxh3_128() {
-        assert_eq!(digest(b""), xxhash_rust::xxh3::xxh3_128(b""));
-        assert_ne!(digest(b"a"), digest(b"b"));
     }
 
     #[test]
@@ -585,7 +445,7 @@ mod tests {
         assert!(window.accept(3));
         assert!(!window.accept(3));
         assert!(window.accept(200));
-        assert!(!window.accept(5));
+        assert!(!window.accept(5)); // older than the window
         assert!(window.accept(199));
         assert!(!window.accept(199));
     }

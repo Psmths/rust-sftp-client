@@ -43,7 +43,7 @@ back to SFTP automatically when the server has no helper or UDP is blocked.
   and open UDP port 6767. See [crates/turbo-server/dist/README.md](crates/turbo-server/dist/README.md).
 * Each download is authorised over the SSH session (`rsftp-turbo ticket` runs as the logged-in user,
   so only files that user can read are offered), every UDP packet is encrypted and authenticated with
-  AES-256-GCM, lost packets are re-requested, and every segment is verified against an XXH3-128 digest
+  AES-256-GCM, lost packets are re-requested, and every segment is verified against a SHA-256 digest
   computed on the server and downloaded again if it does not match.
 * Downloads keep their progress in a hidden `.<name>.rsftp-part` file: if turbo fails part-way, SFTP
   finishes only the missing pieces, and an interrupted download resumes where it stopped (when the

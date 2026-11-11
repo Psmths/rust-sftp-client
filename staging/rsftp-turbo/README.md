@@ -28,12 +28,11 @@ linked and runs on any x86_64 Linux distribution.
    encrypted and authenticated with AES-256-GCM under that key; the daemon
    drops anything it cannot authenticate, answers only the IP address of the
    SSH session and rejects replayed requests.
-4. Data flows immediately; the client re-requests lost packets and checks every
-   segment against an XXH3-128 digest the server computes (asked for together
-   with the segment's last data), fetching the segment again on mismatch. If the
-   file changes on the server during the download, the download fails instead of
-   producing a mixed file. A short probe at the start picks the largest packet
-   size the path carries without fragmentation.
+4. For each segment the server first reports a SHA-256 digest; the client then
+   requests the data in 1,200-byte chunks, re-requests lost ones and checks the
+   segment against the digest, fetching it again on mismatch. If the file
+   changes on the server during the download, the download fails instead of
+   producing a mixed file.
 5. Progress is kept in a hidden `.<name>.rsftp-part` file next to the
    destination: if turbo fails part-way, SFTP finishes only the missing pieces,
    and an interrupted download resumes where it stopped.

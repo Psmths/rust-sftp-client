@@ -23,9 +23,10 @@ use rsftp_turbo_proto::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_STREAM_COM
 /// How long to wait for `rsftp-turbo ticket` on the server.
 const TICKET_TIMEOUT: Duration = Duration::from_secs(15);
 /// Small, world-readable regular files used to check rsftp-turbo right after
-/// connecting (the helper only issues tickets for regular files). Only the
-/// UDP handshake runs; no file data is sent.
+/// connecting (the helper only issues tickets for regular files). The check
+/// fetches and verifies at most [`TURBO_PROBE_BYTES`] of one over UDP.
 const TURBO_PROBE_FILES: [&str; 3] = ["/etc/hostname", "/etc/os-release", "/etc/passwd"];
+const TURBO_PROBE_BYTES: u64 = 4096;
 
 /// Whether the server offers rsftp-turbo, learned on first use.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -701,6 +702,8 @@ impl SftpConnection {
         let mut ticket = None;
         for path in TURBO_PROBE_FILES {
             match self.request_turbo_ticket(path).await {
+                // An empty file has nothing to fetch; try the next one.
+                Ok(issued) if issued.size == 0 => {}
                 Ok(issued) => {
                     ticket = Some(issued);
                     break;
@@ -718,7 +721,11 @@ impl SftpConnection {
             Ok(connection) => connection,
             Err(error) => return TurboState::Unavailable(error.to_string()),
         };
-        let result = connection.negotiate(&|| false).await;
+        let len = ticket.size.min(TURBO_PROBE_BYTES) as u32;
+        let result = match rsftp_turbo_proto::client::SegmentFetcher::new(std::sync::Arc::clone(&connection)).await {
+            Ok(mut fetcher) => fetcher.fetch(0, len, &mut |_: u64| {}, &|| false).await.map(|_| ()),
+            Err(error) => Err(error),
+        };
         connection.close().await;
         match result {
             Ok(_) => TurboState::Ready,

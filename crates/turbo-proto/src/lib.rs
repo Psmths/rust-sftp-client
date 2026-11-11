@@ -13,13 +13,11 @@
 //!   anything it cannot authenticate (no amplification for spoofed requests);
 //! * the daemon only answers the IP address the SSH session came from and
 //!   rejects replayed requests;
-//! * files are fetched in segments; data flows immediately, lost chunks are
-//!   re-requested, and each segment is checked against an XXH3-128 digest the
-//!   server computes (requested alongside the last data, so it costs no extra
-//!   round trip); a segment that does not match is fetched again;
-//! * one congestion controller per download paces requests from all its
-//!   workers, tolerates a little random loss and backs off gently beyond it;
-//! * a probe picks the largest packet size the path carries unfragmented.
+//! * files are fetched in segments; for each segment the server reports a
+//!   SHA-256 digest, the client re-requests lost chunks until the segment is
+//!   complete, verifies the digest and retries the segment on mismatch;
+//! * the client paces requests with a congestion window (slow start, then
+//!   additive increase, multiplicative decrease on loss).
 
 pub mod client;
 pub mod ticket;
@@ -27,7 +25,6 @@ pub mod wire;
 
 pub use ticket::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_COMMAND, TICKET_STREAM_COMMAND};
 pub use wire::{
-    data_packet_len, digest, Direction, Message, PacketCipher, ReplayWindow, SegmentStatus, WireError, CHUNK_SIZE,
-    DEFAULT_PORT, IPV4_FULL_CHUNK, IPV6_FULL_CHUNK, LARGE_CHUNK, LEGACY_MAX_CHUNK, MAX_CHUNK, MAX_READ_LEN,
-    MAX_SEGMENT_LEN, MIN_CHUNK,
+    Direction, Message, PacketCipher, ReplayWindow, SegmentStatus, WireError, CHUNK_SIZE, DEFAULT_PORT,
+    MAX_READ_LEN, MAX_SEGMENT_LEN,
 };

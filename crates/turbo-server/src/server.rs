@@ -15,20 +15,19 @@ use std::{
 };
 
 use rsftp_turbo_proto::{
-    data_packet_len, digest,
-    wire::{parse_header, KEY_LEN, MAX_PACKET, MAX_PROBE_LEN},
-    Direction, Message, PacketCipher, ReplayWindow, SegmentStatus, MAX_CHUNK, MAX_READ_LEN, MAX_SEGMENT_LEN, MIN_CHUNK,
+    wire::{parse_header, DATA_PACKET_LEN, KEY_LEN, MAX_PACKET},
+    Direction, Message, PacketCipher, ReplayWindow, SegmentStatus, CHUNK_SIZE, MAX_READ_LEN, MAX_SEGMENT_LEN,
 };
+use sha2::{Digest, Sha256};
 
 /// A transfer nobody has used for this long is forgotten (and its file closed).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upper bound on registered transfers, so local users cannot exhaust descriptors.
 pub const MAX_TRANSFERS: usize = 1024;
 const SEND_BUFFER: usize = 8 * 1024 * 1024;
-/// Bytes per batched send: UDP GSO allows at most 64 segments and a 64 KiB
-/// datagram, so batches stay a little below that.
+/// DATA packets per batched send (UDP GSO allows at most 64 and 64 KiB).
 #[cfg(target_os = "linux")]
-const GSO_BYTES: usize = 60_000;
+const GSO_BATCH: usize = 48;
 const RECEIVE_BUFFER: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -72,18 +71,20 @@ impl Transfer {
         Ok(data)
     }
 
-    /// XXH3-128 of a range, after checking the file did not change. The
-    /// data was just served, so this normally reads from the page cache.
-    fn digest(&self, offset: u64, len: u32) -> (SegmentStatus, u128) {
+    fn digest(&self, offset: u64, len: u32) -> (SegmentStatus, [u8; 32]) {
         if !self.in_range(offset, len, MAX_SEGMENT_LEN) {
-            return (SegmentStatus::OutOfRange, 0);
+            return (SegmentStatus::OutOfRange, [0; 32]);
         }
         if !self.unchanged() {
-            return (SegmentStatus::FileChanged, 0);
+            return (SegmentStatus::FileChanged, [0; 32]);
         }
         match self.read(offset, len) {
-            Ok(data) => (SegmentStatus::Ok, digest(&data)),
-            Err(_) => (SegmentStatus::IoError, 0),
+            Ok(data) => {
+                let mut sha256 = [0_u8; 32];
+                sha256.copy_from_slice(&Sha256::digest(&data));
+                (SegmentStatus::Ok, sha256)
+            }
+            Err(_) => (SegmentStatus::IoError, [0; 32]),
         }
     }
 }
@@ -283,21 +284,13 @@ impl Server {
         let id = header.transfer;
         self.counters.requests.fetch_add(1, Ordering::Relaxed);
         match message {
-            Message::Digest { request, offset, len } => {
-                let (status, xxh3) = transfer.digest(offset, len);
-                let reply = Message::DigestInfo { request, offset, len, status, xxh3 };
+            Message::OpenSegment { request, offset, len } => {
+                let (status, sha256) = transfer.digest(offset, len);
+                let reply = Message::SegmentInfo { request, offset, len, status, sha256 };
                 let _ = socket.send_to(&transfer.seal(id, &reply), from);
             }
-            Message::Probe { request, size } => {
-                // Padded to the size asked for, so the client learns whether
-                // packets that large reach it unfragmented.
-                if usize::from(size) <= MAX_PROBE_LEN {
-                    let _ = socket.send_to(&transfer.seal(id, &Message::probe_reply(request, size)), from);
-                }
-            }
-            Message::Read { offset, len, chunk, .. } => {
-                let chunk = usize::from(chunk);
-                if !(MIN_CHUNK..=MAX_CHUNK).contains(&chunk) || !transfer.in_range(offset, len, MAX_READ_LEN) {
+            Message::Read { offset, len, .. } => {
+                if !transfer.in_range(offset, len, MAX_READ_LEN) {
                     let reply = Message::Error { message: "read outside the file".into() };
                     let _ = socket.send_to(&transfer.seal(id, &reply), from);
                     return;
@@ -310,7 +303,7 @@ impl Server {
                         return;
                     }
                 };
-                self.send_data(socket, &transfer, id, from, offset, &data, chunk);
+                self.send_data(socket, &transfer, id, from, offset, &data);
             }
             Message::Close => {
                 if let Ok(mut transfers) = self.transfers.write() {
@@ -319,61 +312,53 @@ impl Server {
                 let _ = socket.send_to(&transfer.seal(id, &Message::Closed), from);
             }
             // Server-to-client messages are never valid requests.
-            Message::DigestInfo { .. }
-            | Message::Data { .. }
-            | Message::Closed
-            | Message::Error { .. }
-            | Message::ProbeReply { .. } => {}
+            Message::SegmentInfo { .. } | Message::Data { .. } | Message::Closed | Message::Error { .. } => {}
         }
     }
 
     /// Sends `data` (starting at file `offset`) as DATA packets. Send errors
     /// are ignored: a full queue means the burst was too large, and the
     /// client re-requests whatever is missing.
-    #[allow(clippy::too_many_arguments)]
-    fn send_data(&self, socket: &UdpSocket, transfer: &Transfer, id: u64, to: SocketAddr, offset: u64, data: &[u8], chunk_size: usize) {
+    fn send_data(&self, socket: &UdpSocket, transfer: &Transfer, id: u64, to: SocketAddr, offset: u64, data: &[u8]) {
         #[cfg(target_os = "linux")]
         if self.options.drop_data_every == 0 && !self.gso_disabled.load(Ordering::Relaxed) {
-            self.send_data_batched(socket, transfer, id, to, offset, data, chunk_size);
+            self.send_data_batched(socket, transfer, id, to, offset, data);
             return;
         }
-        let mut packet = Vec::with_capacity(data_packet_len(chunk_size));
-        for (index, chunk) in data.chunks(chunk_size).enumerate() {
+        let mut packet = Vec::with_capacity(DATA_PACKET_LEN);
+        for (index, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
             if self.should_drop() {
                 continue;
             }
             packet.clear();
             let counter = transfer.counter.fetch_add(1, Ordering::Relaxed);
-            let chunk_offset = offset + (index * chunk_size) as u64;
+            let chunk_offset = offset + (index * CHUNK_SIZE) as u64;
             transfer.cipher.seal_data_into(Direction::ToClient, id, counter, chunk_offset, chunk, &mut packet);
             let sent = socket.send_to(&packet, to);
             self.count_send(&sent, 1, chunk.len());
         }
     }
 
-    /// Linux: many packets per system call using UDP segmentation offload.
-    /// Falls back to single sends if unsupported.
+    /// Linux: up to [`GSO_BATCH`] packets per system call using UDP
+    /// segmentation offload. Falls back to single sends if unsupported.
     #[cfg(target_os = "linux")]
-    #[allow(clippy::too_many_arguments)]
-    fn send_data_batched(&self, socket: &UdpSocket, transfer: &Transfer, id: u64, to: SocketAddr, offset: u64, data: &[u8], chunk_size: usize) {
-        let packet_len = data_packet_len(chunk_size);
-        let per_call = (GSO_BYTES / packet_len).clamp(1, 64);
-        let mut batch = Vec::with_capacity(per_call * packet_len);
-        for (group_index, group) in data.chunks(chunk_size * per_call).enumerate() {
+    fn send_data_batched(&self, socket: &UdpSocket, transfer: &Transfer, id: u64, to: SocketAddr, offset: u64, data: &[u8]) {
+        let mut batch = Vec::with_capacity(GSO_BATCH * DATA_PACKET_LEN);
+        for (group_index, group) in data.chunks(CHUNK_SIZE * GSO_BATCH).enumerate() {
             batch.clear();
-            let group_offset = offset + (group_index * chunk_size * per_call) as u64;
-            for (index, chunk) in group.chunks(chunk_size).enumerate() {
+            let group_offset = offset + (group_index * CHUNK_SIZE * GSO_BATCH) as u64;
+            for (index, chunk) in group.chunks(CHUNK_SIZE).enumerate() {
                 let counter = transfer.counter.fetch_add(1, Ordering::Relaxed);
-                let chunk_offset = group_offset + (index * chunk_size) as u64;
+                let chunk_offset = group_offset + (index * CHUNK_SIZE) as u64;
                 transfer.cipher.seal_data_into(Direction::ToClient, id, counter, chunk_offset, chunk, &mut batch);
             }
-            let packets = group.len().div_ceil(chunk_size) as u64;
-            if group.len() <= chunk_size {
+            let packets = group.len().div_ceil(CHUNK_SIZE) as u64;
+            if group.len() <= CHUNK_SIZE {
                 let sent = socket.send_to(&batch, to);
                 self.count_send(&sent, packets, group.len());
                 continue;
             }
-            match send_gso(socket, &batch, to, packet_len as u16) {
+            match send_gso(socket, &batch, to) {
                 Ok(sent) => self.count_send(&Ok(sent), packets, group.len()),
                 Err(error) => {
                     use nix::errno::Errno;
@@ -382,7 +367,7 @@ impl Server {
                         if !self.gso_disabled.swap(true, Ordering::Relaxed) {
                             eprintln!("rsftp-turbo: batched UDP sends (GSO) not supported here ({error}); sending packets one by one");
                         }
-                        for (packet, chunk) in batch.chunks(packet_len).zip(group.chunks(chunk_size)) {
+                        for (packet, chunk) in batch.chunks(DATA_PACKET_LEN).zip(group.chunks(CHUNK_SIZE)) {
                             let sent = socket.send_to(packet, to);
                             self.count_send(&sent, 1, chunk.len());
                         }
@@ -403,11 +388,12 @@ impl Server {
 /// One `sendmsg` carrying several equally sized datagrams (the last may be
 /// shorter); the kernel or NIC splits them (UDP_SEGMENT, Linux 4.18+).
 #[cfg(target_os = "linux")]
-fn send_gso(socket: &UdpSocket, batch: &[u8], to: SocketAddr, segment: u16) -> nix::Result<usize> {
+fn send_gso(socket: &UdpSocket, batch: &[u8], to: SocketAddr) -> nix::Result<usize> {
     use std::{io::IoSlice, os::fd::AsRawFd};
 
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
 
+    let segment = DATA_PACKET_LEN as u16;
     let address = SockaddrStorage::from(to);
     sendmsg(
         socket.as_raw_fd(),
@@ -431,40 +417,6 @@ fn open_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
     // for many clients are queued instead of dropped by this host.
     let _ = socket.set_send_buffer_size(SEND_BUFFER);
     let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
-    #[cfg(target_os = "linux")]
-    never_fragment(&socket, addr.is_ipv6());
     socket.bind(&addr.into())?;
     Ok(UdpSocket::from(socket))
-}
-
-/// Sends every packet with "don't fragment" set, ignoring any cached path
-/// MTU (`PMTUDISC_PROBE`). Without this, Linux fragments datagrams larger
-/// than the interface MTU, so an oversized probe reply would still arrive
-/// (reassembled) and the client would pick a chunk size that is then
-/// fragmented for the whole transfer. With it, a packet that does not fit is
-/// dropped, the probe for that size gets no answer, and the client picks a
-/// smaller one. Best effort: on failure the old behaviour remains.
-#[cfg(target_os = "linux")]
-fn never_fragment(socket: &socket2::Socket, ipv6: bool) {
-    use std::os::fd::AsRawFd;
-
-    use nix::libc;
-
-    let set = |level: libc::c_int, name: libc::c_int, value: libc::c_int| {
-        // SAFETY: `value` is a valid c_int that outlives the call, and its size is passed.
-        unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                level,
-                name,
-                std::ptr::from_ref(&value).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        }
-    };
-    // IPv4 traffic, including IPv4-mapped clients of a dual-stack `[::]` socket.
-    set(libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_PROBE);
-    if ipv6 {
-        set(libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_PROBE);
-    }
 }
