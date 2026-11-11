@@ -11,7 +11,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 install -m 0755 "$here/rsftp-turbo" /usr/local/bin/rsftp-turbo
 install -m 0644 "$here/rsftp-turbo.service" /etc/systemd/system/rsftp-turbo.service
 systemctl daemon-reload
-systemctl enable --now rsftp-turbo.service
+systemctl enable rsftp-turbo.service
+# restart (not just start) so an update replaces a running old version
+systemctl restart rsftp-turbo.service
 
 echo
 echo "rsftp-turbo is installed and running:"
