@@ -1768,7 +1768,7 @@ impl eframe::App for SftpApp {
                 let speed = |state: &str| -> f64 { self.sessions.iter().map(|session| session.speed(state)).sum() };
                 let speeds = format!("↓ {}   ↑ {}", speed_text(speed("Downloading")), speed_text(speed("Uploading")));
                 let (turbo_text, turbo_details) = turbo_status_text(self.session());
-                let fixed = 200.0 + 220.0 + 180.0 + 130.0 + 4.0 * ui.spacing().item_spacing.x;
+                let fixed = 200.0 + 220.0 + 180.0 + 130.0 + VERSION_PANE_WIDTH + 5.0 * ui.spacing().item_spacing.x;
                 let message_width = (ui.available_width() - fixed).max(120.0);
                 win32::status_pane(ui, message_width, self.session().status.as_str());
                 win32::status_pane(ui, 200.0, connection);
@@ -1776,6 +1776,8 @@ impl eframe::App for SftpApp {
                 win32::status_pane(ui, 180.0, speeds);
                 win32::status_pane(ui, 130.0, format!("{active} active transfer{}", if active == 1 { "" } else { "s" }))
                     .on_hover_text("Across all sessions");
+                win32::status_pane(ui, VERSION_PANE_WIDTH, version_text())
+                    .on_hover_text(format!("Rust SFTP Client {}", version_text()));
             });
         });
         egui::TopBottomPanel::bottom("queue")
@@ -2014,6 +2016,18 @@ fn delete_message(target: &FileTarget) -> String {
         [(name, true)] => format!("Are you sure you want to permanently delete the folder \"{name}\" and all of its contents{location}?"),
         [(name, false)] => format!("Are you sure you want to permanently delete \"{name}\"{location}?"),
         _ => format!("Are you sure you want to permanently delete these {} items{location}?", items.len()),
+    }
+}
+
+const VERSION_PANE_WIDTH: f32 = 110.0;
+
+/// "v0.2.0", plus the CI build number when built by the release workflow
+/// (matching release tags such as v0.2.0-build.42).
+fn version_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match option_env!("RSFTP_BUILD_NUMBER").filter(|build| !build.is_empty()) {
+        Some(build) => format!("v{version} (build {build})"),
+        None => format!("v{version}"),
     }
 }
 

@@ -16,6 +16,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Shown next to the version in the client's status bar.
+  RSFTP_BUILD_NUMBER: ${{ github.run_number }}
 
 jobs:
   build:
