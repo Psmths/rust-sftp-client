@@ -7,8 +7,11 @@
 //! random loss and backs off gently when loss exceeds that.
 //!
 //! A fetcher asks for a segment's data right away and for its XXH3-128 digest
-//! as soon as every chunk has been requested once, so verification usually
-//! costs no extra round trip. Lost chunks are re-requested after a timeout.
+//! as soon as every chunk has been requested once. A fetch returns as soon as
+//! all of the segment's data has arrived; if the digest is not there yet, the
+//! segment is verified later, while the fetcher works on its next segment
+//! (see [`SegmentFetcher::take_verifications`]). Lost chunks are re-requested
+//! after a timeout of 1.5–2× the RTT this client measures.
 
 use std::{
     collections::VecDeque,
@@ -26,8 +29,8 @@ use tokio::{net::UdpSocket, time::timeout};
 use crate::{
     ticket::Ticket,
     wire::{
-        data_packet_len, digest, Direction, Message, PacketCipher, SegmentStatus, CHUNK_SIZE, LARGE_CHUNK,
-        MAX_PACKET, MAX_READ_LEN,
+        data_packet_len, digest, Direction, Message, PacketCipher, SegmentStatus, CHUNK_SIZE, IPV4_FULL_CHUNK,
+        IPV6_FULL_CHUNK, LARGE_CHUNK, LEGACY_MAX_CHUNK, MAX_PACKET, MAX_READ_LEN,
     },
 };
 
@@ -48,15 +51,23 @@ const DECREASE: f64 = 0.7;
 const PACING_GAIN: f64 = 1.25;
 /// Requests may run this far ahead of the pacing schedule (small bursts).
 const PACING_SLACK: Duration = Duration::from_millis(2);
+/// Timeout before the first RTT sample (the probe normally provides one).
 const INITIAL_RTO: Duration = Duration::from_millis(500);
-/// Floor for request timeouts: data queued behind earlier bursts arrives
-/// late, and re-requesting it too early only adds duplicate traffic.
-const MIN_RTO: Duration = Duration::from_millis(200);
+/// Request timeouts are this range of multiples of the smoothed RTT: the low
+/// end when the RTT is steady, the high end when it varies.
+const RTO_MIN_FACTOR: f64 = 1.5;
+const RTO_MAX_FACTOR: f64 = 2.0;
+/// Absolute floor, only relevant on sub-5 ms paths (timer granularity).
+const MIN_RTO: Duration = Duration::from_millis(10);
 const MAX_RTO: Duration = Duration::from_secs(3);
+/// After the first probe reply, how long to wait for larger ones (× RTT).
+const PROBE_GRACE_FACTOR: u32 = 1;
 /// How often waiting loops re-check for cancellation.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROBE_ATTEMPTS: u32 = 4;
-const DIGEST_ATTEMPTS: u32 = 6;
+/// A digest request is repeated with exponential backoff from the RTO; the
+/// segment fails verification (and is fetched again) after this long.
+const DIGEST_GIVE_UP: Duration = Duration::from_secs(10);
 /// A segment attempt fails after this long without receiving any data.
 const STALL_LIMIT: Duration = Duration::from_secs(10);
 /// Requested UDP receive buffer, so bursts are not dropped by the client's
@@ -117,7 +128,8 @@ pub struct FetchStats {
     /// Request timeouts after which nothing at all had arrived for a while.
     pub stalls: u64,
     pub peak_window: usize,
-    /// Time spent waiting for digests after a segment's data had all arrived.
+    /// Time a fetcher sat idle waiting for digests (only at the end of its
+    /// work: digests of earlier segments are checked while later ones download).
     pub digest_wait: Duration,
     pub smoothed_rtt: Option<Duration>,
     /// Chunk size used for this download.
@@ -245,9 +257,7 @@ impl Congestion {
             }
         }
         let srtt = state.srtt.unwrap_or(sample);
-        // At least twice the smoothed RTT: the variance estimate alone reacts
-        // too slowly to queueing delay that builds up during a burst.
-        state.rto = (srtt + state.rttvar * 4).max(srtt * 2).clamp(MIN_RTO, MAX_RTO);
+        state.rto = rto_for(srtt, state.rttvar);
     }
 
     /// Pacing at `PACING_GAIN` × window / RTT. Books a slot and returns
@@ -313,6 +323,20 @@ impl Congestion {
     }
 }
 
+/// Request timeout for a smoothed RTT and its mean deviation: the classic
+/// `srtt + 4 × rttvar`, kept within 1.5–2× the smoothed RTT so it tracks the
+/// RTT this client actually measures.
+fn rto_for(srtt: Duration, rttvar: Duration) -> Duration {
+    let low = srtt.mul_f64(RTO_MIN_FACTOR);
+    let high = srtt.mul_f64(RTO_MAX_FACTOR);
+    (srtt + rttvar * 4).clamp(low, high).clamp(MIN_RTO, MAX_RTO)
+}
+
+/// Exponential backoff for repeated digest requests.
+fn backoff(rto: Duration, attempts: u32) -> Duration {
+    rto.saturating_mul(1 << attempts.min(8)).min(MAX_RTO)
+}
+
 /// State shared by all fetchers of one download.
 pub struct Connection {
     pub server: SocketAddr,
@@ -351,27 +375,41 @@ impl Connection {
         self.chunk.load(Ordering::Relaxed)
     }
 
-    /// Checks that the server answers over UDP and picks the chunk size:
-    /// [`LARGE_CHUNK`] if a full-size probe reply gets through, otherwise
-    /// [`CHUNK_SIZE`]. Fails with `Unreachable` if nothing answers.
+    /// Checks that the server answers over UDP and picks the chunk size: the
+    /// largest candidate whose full-size probe reply arrives intact (the
+    /// server sends with "don't fragment", so too-large replies are lost),
+    /// capped by the largest chunk the server accepts. Candidates: a full
+    /// 1500-byte-MTU packet, then [`LARGE_CHUNK`] (PPPoE-safe), then
+    /// [`CHUNK_SIZE`]. Also takes the first RTT samples. Fails with
+    /// `Unreachable` if nothing answers.
     pub async fn negotiate(&self, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<usize, FetchError> {
         let socket = bind_for(self.server).await.map_err(FetchError::Io)?;
         let mut buffer = vec![0_u8; MAX_PACKET];
-        let large = data_packet_len(LARGE_CHUNK);
-        let small = data_packet_len(CHUNK_SIZE);
-        let mut small_works = false;
+        let full = if self.server.ip().to_canonical().is_ipv4() { IPV4_FULL_CHUNK } else { IPV6_FULL_CHUNK };
+        let candidates = [full, LARGE_CHUNK, CHUNK_SIZE];
+        // Largest chunk whose probe arrived intact, and the server's limit.
+        let mut best: Option<usize> = None;
+        let mut server_max: Option<usize> = None;
         for attempt in 1..=PROBE_ATTEMPTS {
-            let (large_id, small_id) = (self.request_id(), self.request_id());
+            let ids: Vec<(u32, usize)> = candidates.iter().map(|&chunk| (self.request_id(), chunk)).collect();
             let sent_at = Instant::now();
-            for (request, size) in [(large_id, large), (small_id, small)] {
-                if let Err(error) = socket.send(&self.seal(&Message::Probe { request, size: size as u16 })).await {
+            for &(request, chunk) in &ids {
+                let size = data_packet_len(chunk) as u16;
+                if let Err(error) = socket.send(&self.seal(&Message::Probe { request, size })).await {
                     return Err(if is_unreachable(&error) { FetchError::Unreachable } else { FetchError::Io(error) });
                 }
             }
-            let deadline = sent_at + Duration::from_millis(400) * attempt;
+            let mut deadline = sent_at + Duration::from_millis(400) * attempt;
+            let mut grace_set = false;
             loop {
                 if cancelled() {
                     return Err(FetchError::Cancelled);
+                }
+                // Done once the largest candidate the server accepts has arrived.
+                let limit = server_max.unwrap_or(usize::MAX);
+                let wanted = candidates.iter().copied().find(|&chunk| chunk <= limit);
+                if best.is_some() && best == wanted {
+                    break;
                 }
                 let now = Instant::now();
                 if now >= deadline {
@@ -382,14 +420,19 @@ impl Connection {
                     Ok(Err(error)) if is_unreachable(&error) => return Err(FetchError::Unreachable),
                     Ok(Err(error)) => return Err(FetchError::Io(error)),
                     Ok(Ok(len)) => match self.cipher.open(Direction::ToClient, &buffer[..len]) {
-                        Ok((header, Message::ProbeReply { request, .. })) if header.transfer == self.transfer => {
+                        Ok((header, Message::ProbeReply { request, max_chunk, .. })) if header.transfer == self.transfer => {
+                            let Some(&(_, chunk)) = ids.iter().find(|(id, _)| *id == request) else { continue };
                             self.congestion.sample_rtt(sent_at.elapsed());
-                            if request == large_id && len == large {
-                                self.chunk.store(LARGE_CHUNK, Ordering::Relaxed);
-                                return Ok(LARGE_CHUNK);
+                            server_max = Some(if max_chunk == 0 { LEGACY_MAX_CHUNK } else { usize::from(max_chunk) });
+                            if len == data_packet_len(chunk) && best.is_none_or(|known| chunk > known) {
+                                best = Some(chunk);
                             }
-                            if request == small_id {
-                                small_works = true;
+                            // The replies were sent together: give the larger
+                            // ones about one RTT more, not the whole deadline.
+                            if !grace_set {
+                                grace_set = true;
+                                let rtt = self.congestion.srtt().unwrap_or(INITIAL_RTO);
+                                deadline = deadline.min(Instant::now() + (rtt * PROBE_GRACE_FACTOR).max(MIN_RTO));
                             }
                         }
                         Ok((header, Message::Error { message })) if header.transfer == self.transfer => {
@@ -399,9 +442,12 @@ impl Connection {
                     },
                 }
             }
-            if small_works {
-                self.chunk.store(CHUNK_SIZE, Ordering::Relaxed);
-                return Ok(CHUNK_SIZE);
+            let limit = server_max.unwrap_or(usize::MAX);
+            // A legacy server may reject the full-size chunk even though its
+            // probe got through: use the largest candidate it accepts.
+            if let Some(chunk) = best.and_then(|best| candidates.iter().copied().find(|&c| c <= best && c <= limit)) {
+                self.chunk.store(chunk, Ordering::Relaxed);
+                return Ok(chunk);
             }
         }
         Err(FetchError::Unreachable)
@@ -453,6 +499,49 @@ struct Batch {
     retransmission: bool,
 }
 
+/// Result of checking one fetched segment against the server's digest.
+#[derive(Debug)]
+pub struct Verification {
+    pub offset: u64,
+    pub len: u32,
+    /// `HashMismatch` and `Timeout` are retryable: fetch the segment again.
+    pub result: Result<(), FetchError>,
+}
+
+/// An outstanding DIGEST request (possibly asked several times).
+struct DigestAsk {
+    offset: u64,
+    len: u32,
+    /// Every request id used for it, so a late reply to an earlier ask counts.
+    requests: Vec<u32>,
+    first_asked: Instant,
+    deadline: Instant,
+    attempts: u32,
+}
+
+impl DigestAsk {
+    fn answers(&self, request: u32) -> bool {
+        self.requests.contains(&request)
+    }
+}
+
+/// A segment whose data has all arrived but whose digest has not.
+struct PendingVerification {
+    ask: DigestAsk,
+    /// XXH3-128 of the data as received.
+    local: u128,
+}
+
+fn verdict(status: SegmentStatus, xxh3: u128, local: u128) -> Result<(), FetchError> {
+    match status {
+        SegmentStatus::Ok if xxh3 == local => Ok(()),
+        SegmentStatus::Ok => Err(FetchError::HashMismatch),
+        SegmentStatus::FileChanged => Err(FetchError::FileChanged),
+        SegmentStatus::OutOfRange => Err(FetchError::Server("segment outside the file".into())),
+        SegmentStatus::IoError => Err(FetchError::Server("read error on the server".into())),
+    }
+}
+
 pub struct SegmentFetcher {
     conn: Arc<Connection>,
     socket: UdpSocket,
@@ -462,6 +551,10 @@ pub struct SegmentFetcher {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     gro: bool,
     stats: FetchStats,
+    /// Segments returned by `fetch` that still await their digest.
+    pending: Vec<PendingVerification>,
+    /// Finished verifications not yet collected by the caller.
+    verified: Vec<Verification>,
 }
 
 impl SegmentFetcher {
@@ -478,6 +571,8 @@ impl SegmentFetcher {
             inbox: Vec::with_capacity(1024),
             gro,
             stats: FetchStats::default(),
+            pending: Vec::new(),
+            verified: Vec::new(),
         })
     }
 
@@ -491,6 +586,107 @@ impl SegmentFetcher {
             chunk_size: self.conn.chunk_size(),
             ..self.stats
         }
+    }
+
+    /// Verifications completed since the last call. Every segment `fetch`
+    /// returned produces exactly one, now or later; a segment must not be
+    /// treated as done before its verification succeeds.
+    pub fn take_verifications(&mut self) -> Vec<Verification> {
+        std::mem::take(&mut self.verified)
+    }
+
+    /// Segments returned by `fetch` whose digest has not arrived yet.
+    pub fn pending_verifications(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Waits until every pending segment is verified (results via
+    /// [`take_verifications`](Self::take_verifications)). Only needed once a
+    /// fetcher has nothing left to fetch; until then `fetch` handles digests.
+    pub async fn finish_verifications(&mut self, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), FetchError> {
+        let started = Instant::now();
+        let result = async {
+            while !self.pending.is_empty() {
+                if cancelled() {
+                    return Err(FetchError::Cancelled);
+                }
+                let now = Instant::now();
+                let deadline = self.pending.iter().map(|pending| pending.ask.deadline).min().unwrap_or(now);
+                self.receive_batch(deadline.saturating_duration_since(now).min(POLL_INTERVAL)).await?;
+                let mut inbox = std::mem::take(&mut self.inbox);
+                for message in inbox.drain(..) {
+                    match message {
+                        Message::DigestInfo { request, status, xxh3, .. } => self.resolve_pending(request, status, xxh3),
+                        Message::Error { message } => return Err(FetchError::Server(message)),
+                        _ => {}
+                    }
+                }
+                self.inbox = inbox;
+                self.renew_pending().await?;
+            }
+            Ok(())
+        }
+        .await;
+        self.stats.digest_wait += started.elapsed();
+        result
+    }
+
+    /// Settles the pending segment that `request` was asked for, if any.
+    fn resolve_pending(&mut self, request: u32, status: SegmentStatus, xxh3: u128) {
+        if let Some(index) = self.pending.iter().position(|pending| pending.ask.answers(request)) {
+            let pending = self.pending.swap_remove(index);
+            self.verified.push(Verification {
+                offset: pending.ask.offset,
+                len: pending.ask.len,
+                result: verdict(status, xxh3, pending.local),
+            });
+        }
+    }
+
+    /// Re-asks digests whose deadline passed; gives up on those asked for too long.
+    async fn renew_pending(&mut self) -> Result<(), FetchError> {
+        let mut index = 0;
+        while index < self.pending.len() {
+            let now = Instant::now();
+            let ask = &self.pending[index].ask;
+            if now < ask.deadline {
+                index += 1;
+                continue;
+            }
+            if now.saturating_duration_since(ask.first_asked) >= DIGEST_GIVE_UP {
+                let pending = self.pending.swap_remove(index);
+                self.verified.push(Verification {
+                    offset: pending.ask.offset,
+                    len: pending.ask.len,
+                    result: Err(FetchError::Timeout),
+                });
+                continue;
+            }
+            let (offset, len) = (ask.offset, ask.len);
+            let request = self.conn.request_id();
+            self.send(&Message::Digest { request, offset, len }).await?;
+            let rto = self.conn.congestion.rto();
+            let ask = &mut self.pending[index].ask;
+            ask.requests.push(request);
+            ask.attempts += 1;
+            ask.deadline = Instant::now() + backoff(rto, ask.attempts);
+            index += 1;
+        }
+        Ok(())
+    }
+
+    async fn ask_digest(&self, offset: u64, len: u32) -> Result<DigestAsk, FetchError> {
+        let request = self.conn.request_id();
+        self.send(&Message::Digest { request, offset, len }).await?;
+        let now = Instant::now();
+        Ok(DigestAsk {
+            offset,
+            len,
+            requests: vec![request],
+            first_asked: now,
+            deadline: now + backoff(self.conn.congestion.rto(), 0),
+            attempts: 0,
+        })
     }
 
     async fn send(&self, message: &Message) -> Result<(), FetchError> {
@@ -547,7 +743,15 @@ impl SegmentFetcher {
         Ok((len, 0))
     }
 
-    /// Downloads and verifies `[offset, offset + len)`.
+    /// Downloads `[offset, offset + len)` and returns its data as soon as all
+    /// of it has arrived.
+    ///
+    /// If the server's digest has already arrived it is checked here (a
+    /// mismatch fails with `HashMismatch`); otherwise the check completes
+    /// later, during following fetches or
+    /// [`finish_verifications`](Self::finish_verifications). Either way a
+    /// [`Verification`] for the segment appears in
+    /// [`take_verifications`](Self::take_verifications).
     ///
     /// `progress` is called with the number of segment bytes received so far.
     pub async fn fetch(
@@ -585,11 +789,10 @@ impl SegmentFetcher {
         let mut cursor = 0_usize;
         let mut batches: VecDeque<Batch> = VecDeque::new();
         let mut last_progress = Instant::now();
-        let mut expected: Option<u128> = None;
-        // (request id, deadline) of the outstanding DIGEST request.
-        let mut digest_request: Option<(u32, Instant)> = None;
-        let mut digest_attempts = 0_u32;
-        let mut waiting_since: Option<Instant> = None;
+        // The server's verdict on this segment, once its digest has arrived.
+        let mut answer: Option<(SegmentStatus, u128)> = None;
+        // This segment's outstanding DIGEST request.
+        let mut digest_ask: Option<DigestAsk> = None;
         // When pacing holds back the next request.
         let mut paced_until: Option<Instant> = None;
 
@@ -598,16 +801,23 @@ impl SegmentFetcher {
                 return Err(FetchError::Cancelled);
             }
             if received_chunks == chunk_count {
-                if let Some(expected) = expected {
-                    if let Some(since) = waiting_since {
-                        self.stats.digest_wait += since.elapsed();
+                let local = digest(&data);
+                match answer {
+                    Some((status, xxh3)) => {
+                        // Errors other than a mismatch are reported right away.
+                        verdict(status, xxh3, local)?;
+                        self.verified.push(Verification { offset, len, result: Ok(()) });
                     }
-                    if digest(&data) != expected {
-                        return Err(FetchError::HashMismatch);
+                    None => {
+                        // Don't wait: verify while the next segment downloads.
+                        let ask = match digest_ask.take() {
+                            Some(ask) => ask,
+                            None => self.ask_digest(offset, len).await?,
+                        };
+                        self.pending.push(PendingVerification { ask, local });
                     }
-                    return Ok(data);
                 }
-                waiting_since.get_or_insert_with(Instant::now);
+                return Ok(data);
             }
 
             // Ask for missing chunks while the shared window and pacing allow.
@@ -663,11 +873,8 @@ impl SegmentFetcher {
             // Once everything has been requested, ask for the digest; it
             // arrives together with the last data.
             let all_requested = received_chunks + *reserved == chunk_count;
-            if expected.is_none() && digest_request.is_none() && all_requested {
-                let request = conn.request_id();
-                self.send(&Message::Digest { request, offset, len }).await?;
-                let deadline = Instant::now() + conn.congestion.rto().max(INITIAL_RTO);
-                digest_request = Some((request, deadline));
+            if answer.is_none() && digest_ask.is_none() && all_requested {
+                digest_ask = Some(self.ask_digest(offset, len).await?);
             }
 
             // Wait for packets until the earliest deadline.
@@ -675,7 +882,8 @@ impl SegmentFetcher {
             let deadline = batches
                 .iter()
                 .map(|batch| batch.deadline)
-                .chain(digest_request.map(|(_, deadline)| deadline))
+                .chain(digest_ask.as_ref().map(|ask| ask.deadline))
+                .chain(self.pending.iter().map(|pending| pending.ask.deadline))
                 .chain(paced_until)
                 .min()
                 .unwrap_or(now + POLL_INTERVAL);
@@ -705,13 +913,15 @@ impl SegmentFetcher {
                         last_progress = Instant::now();
                     }
                     Message::DigestInfo { request, status, xxh3, .. } => {
-                        if digest_request.is_some_and(|(asked, _)| asked == request) {
+                        if digest_ask.as_ref().is_some_and(|ask| ask.answers(request)) {
                             match status {
-                                SegmentStatus::Ok => expected = Some(xxh3),
-                                SegmentStatus::FileChanged => return Err(FetchError::FileChanged),
-                                SegmentStatus::OutOfRange => return Err(FetchError::Server("segment outside the file".into())),
-                                SegmentStatus::IoError => return Err(FetchError::Server("read error on the server".into())),
+                                SegmentStatus::Ok => answer = Some((status, xxh3)),
+                                // No point downloading the rest of a changed file.
+                                other => return Err(verdict(other, xxh3, 0).unwrap_err()),
                             }
+                        } else {
+                            // The digest of a segment returned earlier.
+                            self.resolve_pending(request, status, xxh3);
                         }
                     }
                     Message::Error { message } => return Err(FetchError::Server(message)),
@@ -755,15 +965,23 @@ impl SegmentFetcher {
             }
             conn.congestion.report(delivered, lost);
 
-            if let Some((_, deadline)) = digest_request {
-                if expected.is_none() && now >= deadline {
-                    digest_request = None; // asked again on the next pass
-                    digest_attempts += 1;
-                    if digest_attempts >= DIGEST_ATTEMPTS {
-                        return Err(FetchError::Timeout);
+            // Re-ask this segment's digest with backoff if it is overdue.
+            if answer.is_none() {
+                if let Some(ask) = digest_ask.as_mut() {
+                    if now >= ask.deadline {
+                        if now.saturating_duration_since(ask.first_asked) >= DIGEST_GIVE_UP {
+                            return Err(FetchError::Timeout);
+                        }
+                        let request = conn.request_id();
+                        self.send(&Message::Digest { request, offset, len }).await?;
+                        ask.requests.push(request);
+                        ask.attempts += 1;
+                        ask.deadline = Instant::now() + backoff(conn.congestion.rto(), ask.attempts);
                     }
                 }
             }
+            self.renew_pending().await?;
+
             if lost > 0 && now.saturating_duration_since(last_progress) >= conn.congestion.rto() {
                 self.stats.stalls += 1;
             }
@@ -822,6 +1040,39 @@ mod tests {
         assert_eq!(chunk_index(1000, len, 1001, chunk, chunk), None);
         assert_eq!(chunk_index(1000, len, 1000 + len as u64, 1, chunk), None);
         assert_eq!(chunk_index(0, 5000, LARGE_CHUNK as u64, LARGE_CHUNK, LARGE_CHUNK), Some(1));
+    }
+
+    #[test]
+    fn rto_is_one_and_a_half_to_twice_the_measured_rtt() {
+        let ms = Duration::from_millis;
+        // Steady RTT (no deviation): 1.5 × RTT.
+        assert_eq!(rto_for(ms(52), ms(0)), ms(78));
+        // Some jitter: srtt + 4 × rttvar, within the band.
+        assert_eq!(rto_for(ms(52), ms(5)), ms(78)); // 52 + 20 is below 1.5 × RTT
+        assert_eq!(rto_for(ms(52), ms(10)), ms(92));
+        // Lots of jitter: capped at 2 × RTT.
+        assert_eq!(rto_for(ms(52), ms(40)), ms(104));
+        // Floors and ceilings still apply at the extremes.
+        assert_eq!(rto_for(ms(1), ms(0)), MIN_RTO);
+        assert_eq!(rto_for(Duration::from_secs(5), ms(0)), MAX_RTO);
+
+        // The controller uses it as soon as it has samples.
+        let congestion = Congestion::default();
+        assert_eq!(congestion.rto(), INITIAL_RTO);
+        for _ in 0..50 {
+            congestion.sample_rtt(ms(52));
+        }
+        let rto = congestion.rto();
+        assert!(rto >= ms(78) && rto <= ms(104), "{rto:?}");
+    }
+
+    #[test]
+    fn digest_backoff_doubles_up_to_the_ceiling() {
+        let rto = Duration::from_millis(80);
+        assert_eq!(backoff(rto, 0), rto);
+        assert_eq!(backoff(rto, 1), rto * 2);
+        assert_eq!(backoff(rto, 3), rto * 8);
+        assert_eq!(backoff(rto, 30), MAX_RTO);
     }
 
     #[test]

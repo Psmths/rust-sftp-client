@@ -431,6 +431,40 @@ fn open_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
     // for many clients are queued instead of dropped by this host.
     let _ = socket.set_send_buffer_size(SEND_BUFFER);
     let _ = socket.set_recv_buffer_size(RECEIVE_BUFFER);
+    #[cfg(target_os = "linux")]
+    never_fragment(&socket, addr.is_ipv6());
     socket.bind(&addr.into())?;
     Ok(UdpSocket::from(socket))
+}
+
+/// Sends every packet with "don't fragment" set, ignoring any cached path
+/// MTU (`PMTUDISC_PROBE`). Without this, Linux fragments datagrams larger
+/// than the interface MTU, so an oversized probe reply would still arrive
+/// (reassembled) and the client would pick a chunk size that is then
+/// fragmented for the whole transfer. With it, a packet that does not fit is
+/// dropped, the probe for that size gets no answer, and the client picks a
+/// smaller one. Best effort: on failure the old behaviour remains.
+#[cfg(target_os = "linux")]
+fn never_fragment(socket: &socket2::Socket, ipv6: bool) {
+    use std::os::fd::AsRawFd;
+
+    use nix::libc;
+
+    let set = |level: libc::c_int, name: libc::c_int, value: libc::c_int| {
+        // SAFETY: `value` is a valid c_int that outlives the call, and its size is passed.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        }
+    };
+    // IPv4 traffic, including IPv4-mapped clients of a dual-stack `[::]` socket.
+    set(libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_PROBE);
+    if ipv6 {
+        set(libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_PROBE);
+    }
 }

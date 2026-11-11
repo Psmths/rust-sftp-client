@@ -28,5 +28,6 @@ pub mod wire;
 pub use ticket::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_COMMAND, TICKET_STREAM_COMMAND};
 pub use wire::{
     data_packet_len, digest, Direction, Message, PacketCipher, ReplayWindow, SegmentStatus, WireError, CHUNK_SIZE,
-    DEFAULT_PORT, LARGE_CHUNK, MAX_CHUNK, MAX_READ_LEN, MAX_SEGMENT_LEN, MIN_CHUNK,
+    DEFAULT_PORT, IPV4_FULL_CHUNK, IPV6_FULL_CHUNK, LARGE_CHUNK, LEGACY_MAX_CHUNK, MAX_CHUNK, MAX_READ_LEN,
+    MAX_SEGMENT_LEN, MIN_CHUNK,
 };

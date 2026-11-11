@@ -4,12 +4,14 @@
 //! that the service answers and picks the packet size, then a bounded number
 //! of workers fetch fixed-size pieces, each verified against the server's
 //! XXH3-128 digest, write them with positional writes and record them in the
-//! partial file. Failed or corrupted pieces are fetched again up to
-//! [`RETRIES`] times. Whatever is left when turbo gives up is finished by the
+//! partial file once verified. A piece is written as soon as its data has
+//! arrived; its digest is checked while the worker fetches the next piece, and
+//! only then is it recorded as done. Failed or corrupted pieces are fetched
+//! again up to [`RETRIES`] times. Whatever is left when turbo gives up is finished by the
 //! SFTP engine.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -19,7 +21,7 @@ use std::{
 };
 
 use rsftp_turbo_proto::{
-    client::{Connection, FetchError, FetchStats, SegmentFetcher},
+    client::{Connection, FetchError, FetchStats, SegmentFetcher, Verification},
     Ticket, MAX_SEGMENT_LEN,
 };
 use tokio::{sync::mpsc, task::JoinSet};
@@ -30,7 +32,7 @@ use super::{
     CancelToken, DownloadError, DownloadProgress, DownloadResult, SegmentProgress, SegmentRange, TransferSettings,
 };
 
-/// Largest piece: each one is held in memory until its digest is verified.
+/// Largest piece: each one is held in memory until all its data has arrived.
 const MAX_TURBO_SEGMENT: u64 = 8 * 1024 * 1024;
 const MIN_TURBO_SEGMENT: u64 = 256 * 1024;
 const RETRIES: usize = 3;
@@ -135,7 +137,8 @@ pub async fn download(
     for range in &pieces {
         shared.report(*range, 0, false, false);
     }
-    let queue = Arc::new(Mutex::new(pieces.into_iter().collect::<VecDeque<_>>()));
+    // Each piece with the number of attempts already spent on it.
+    let queue: Arc<Queue> = Arc::new(Mutex::new(pieces.into_iter().map(|range| (range, 0)).collect()));
     // Stops the remaining workers when one fails for good.
     let abort = CancelToken::new();
     let mut tasks = JoinSet::new();
@@ -184,9 +187,12 @@ pub async fn download(
     })
 }
 
+/// Pieces still to fetch, with the attempts already used on each.
+type Queue = Mutex<VecDeque<(SegmentRange, usize)>>;
+
 async fn worker(
     connection: Arc<Connection>,
-    queue: Arc<Mutex<VecDeque<SegmentRange>>>,
+    queue: Arc<Queue>,
     shared: Arc<Shared>,
     partial: Arc<Partial>,
     cancel: &CancelToken,
@@ -202,18 +208,31 @@ async fn worker(
 
 async fn fetch_pieces(
     fetcher: &mut SegmentFetcher,
-    queue: &Mutex<VecDeque<SegmentRange>>,
+    queue: &Queue,
     shared: &Shared,
     partial: &Arc<Partial>,
     cancel: &CancelToken,
     abort: &CancelToken,
 ) -> Result<(), TurboError> {
     let stopped = || cancel.is_cancelled() || abort.is_cancelled();
+    // Pieces written to disk whose digest is still being checked: start → (range, attempts).
+    let mut unverified: HashMap<u64, (SegmentRange, usize)> = HashMap::new();
     loop {
         let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-        let Some(range) = next else { return Ok(()) };
+        let Some((range, used)) = next else {
+            if unverified.is_empty() {
+                return Ok(());
+            }
+            // Nothing left to fetch: wait for the last digests. A failed one
+            // goes back into the queue and is picked up by this loop.
+            if let Err(error) = fetcher.finish_verifications(&stopped).await {
+                return Err(stop_error(error, &stopped));
+            }
+            settle(fetcher.take_verifications(), &mut unverified, queue, shared, partial)?;
+            continue;
+        };
         let len = range.len() as u32;
-        let mut attempt = 0;
+        let mut attempt = used;
         loop {
             attempt += 1;
             let mut counted = 0_u64;
@@ -235,14 +254,13 @@ async fn fetch_pieces(
                 .await;
             match result {
                 Ok(data) => {
+                    // Written now, but recorded as done only once verified.
                     let file = partial.file();
                     let offset = range.start;
                     tokio::task::spawn_blocking(move || write_all_at(&file, &data, offset))
                         .await
                         .map_err(|error| DownloadError::Worker(error.to_string()))??;
-                    partial.mark_done(range.start, range.end_exclusive);
-                    shared.completed.fetch_add(1, Ordering::Relaxed);
-                    shared.report(range, range.len(), true, false);
+                    unverified.insert(range.start, (range, attempt));
                     break;
                 }
                 Err(error) => {
@@ -258,13 +276,62 @@ async fn fetch_pieces(
                         continue;
                     }
                     shared.report(range, 0, false, true);
-                    return Err(TurboError::Failed(DownloadError::Turbo(format!(
-                        "piece at byte {} failed after {attempt} attempt(s): {error}",
-                        range.start
-                    ))));
+                    return Err(failed(range, attempt, &error));
                 }
             }
         }
+        settle(fetcher.take_verifications(), &mut unverified, queue, shared, partial)?;
+    }
+}
+
+/// Records verified pieces as done and sends failed ones back to the queue
+/// (or fails the download once a piece has used up its attempts).
+fn settle(
+    verifications: Vec<Verification>,
+    unverified: &mut HashMap<u64, (SegmentRange, usize)>,
+    queue: &Queue,
+    shared: &Shared,
+    partial: &Arc<Partial>,
+) -> Result<(), TurboError> {
+    for verification in verifications {
+        let Some((range, attempts)) = unverified.remove(&verification.offset) else { continue };
+        match verification.result {
+            Ok(()) => {
+                partial.mark_done(range.start, range.end_exclusive);
+                shared.completed.fetch_add(1, Ordering::Relaxed);
+                shared.report(range, range.len(), true, false);
+            }
+            Err(error) => {
+                // Its bytes were counted when they arrived; they don't count now.
+                shared.transferred.fetch_sub(range.len(), Ordering::Relaxed);
+                if error.is_retryable() && attempts < RETRIES {
+                    shared.retried_segments.fetch_add(1, Ordering::Relaxed);
+                    shared.report(range, 0, false, false);
+                    if let Ok(mut queue) = queue.lock() {
+                        queue.push_front((range, attempts));
+                    }
+                } else {
+                    shared.report(range, 0, false, true);
+                    return Err(failed(range, attempts, &error));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn failed(range: SegmentRange, attempts: usize, error: &FetchError) -> TurboError {
+    TurboError::Failed(DownloadError::Turbo(format!(
+        "piece at byte {} failed after {attempts} attempt(s): {error}",
+        range.start
+    )))
+}
+
+fn stop_error(error: FetchError, stopped: &dyn Fn() -> bool) -> TurboError {
+    if matches!(error, FetchError::Cancelled) || stopped() {
+        TurboError::Failed(DownloadError::Cancelled)
+    } else {
+        TurboError::Failed(DownloadError::Turbo(format!("verifying pieces failed: {error}")))
     }
 }
 

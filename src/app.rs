@@ -1089,8 +1089,8 @@ impl SftpApp {
         }
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
         win32::list_view(ui, list_height, |ui| {
-            let name_width = list_header(ui);
-            egui::ScrollArea::vertical().id_salt(("local_list", self.sessions[a].id)).auto_shrink([false, false]).show(ui, |ui| {
+            let (name_width, header) = reserve_list_header(ui);
+            let scrolled = file_list_scroll(("local_list", self.sessions[a].id)).show(ui, |ui| {
                 for entry in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1124,6 +1124,7 @@ impl SftpApp {
                     });
                 }
             });
+            paint_list_header(ui, header, name_width, scrolled.state.offset.x);
         });
         let visible = self.sessions[a].local_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
         ui.label(format!("{visible} object(s)"));
@@ -1187,7 +1188,7 @@ impl SftpApp {
         let mut open_profiles = false;
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
         win32::list_view(ui, list_height, |ui| {
-            let name_width = list_header(ui);
+            let (name_width, header) = reserve_list_header(ui);
             if !connected {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
@@ -1196,9 +1197,10 @@ impl SftpApp {
                     ui.add_space(8.0);
                     if win32::button_sized(ui, true, "Connect…", 75.0).clicked() { open_profiles = true; }
                 });
+                paint_list_header(ui, header, name_width, 0.0);
                 return;
             }
-            egui::ScrollArea::vertical().id_salt(("remote_list", self.sessions[a].id)).auto_shrink([false, false]).show(ui, |ui| {
+            let scrolled = file_list_scroll(("remote_list", self.sessions[a].id)).show(ui, |ui| {
                 for entry in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1253,6 +1255,7 @@ impl SftpApp {
                     });
                 }
             });
+            paint_list_header(ui, header, name_width, scrolled.state.offset.x);
         });
         if open_profiles { self.dialog = Some(Dialog::Profiles); }
         let visible = self.sessions[a].remote_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
@@ -2070,18 +2073,40 @@ const MODIFIED_WIDTH: f32 = 150.0;
 const TYPE_WIDTH: f32 = 80.0;
 
 /// Draws the file list column headers and returns the width of the Name column.
-fn list_header(ui: &mut egui::Ui) -> f32 {
+const HEADER_HEIGHT: f32 = 19.0;
+
+/// Scroll area of a file list: scroll bars on both axes, always shown, so
+/// columns cut off in a narrow pane can be scrolled into view.
+fn file_list_scroll(id: impl std::hash::Hash) -> egui::ScrollArea {
+    egui::ScrollArea::both()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+}
+
+/// Reserves the column header row of a file list and returns the Name column
+/// width with it. The header is painted afterwards by [`paint_list_header`],
+/// once the list's horizontal scroll offset is known, so it moves with the rows.
+fn reserve_list_header(ui: &mut egui::Ui) -> (f32, egui::Rect) {
     let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - ui.spacing().scroll.bar_width).max(100.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        win32::header_cell(ui, name_width, 19.0, "Name");
-        win32::header_cell(ui, SIZE_WIDTH, 19.0, "Size");
-        win32::header_cell(ui, MODIFIED_WIDTH, 19.0, "Modified (UTC)");
-        win32::header_cell(ui, TYPE_WIDTH, 19.0, "Type");
-        let rest = ui.available_width();
-        if rest > 0.0 { win32::header_cell(ui, rest, 19.0, ""); }
-    });
-    name_width
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), HEADER_HEIGHT), egui::Sense::hover());
+    (name_width, rect)
+}
+
+/// Paints the column headers into `rect`, shifted left by the rows' horizontal scroll.
+fn paint_list_header(ui: &mut egui::Ui, rect: egui::Rect, name_width: f32, scroll_x: f32) {
+    let columns = name_width + SIZE_WIDTH + MODIFIED_WIDTH + TYPE_WIDTH;
+    let width = columns.max(rect.width() + scroll_x);
+    let shifted = egui::Rect::from_min_size(rect.min - egui::vec2(scroll_x, 0.0), egui::vec2(width, HEADER_HEIGHT));
+    let mut header = ui.new_child(egui::UiBuilder::new().max_rect(shifted).layout(egui::Layout::left_to_right(egui::Align::Min)));
+    header.set_clip_rect(rect.intersect(ui.clip_rect()));
+    header.spacing_mut().item_spacing.x = 0.0;
+    win32::header_cell(&mut header, name_width, HEADER_HEIGHT, "Name");
+    win32::header_cell(&mut header, SIZE_WIDTH, HEADER_HEIGHT, "Size");
+    win32::header_cell(&mut header, MODIFIED_WIDTH, HEADER_HEIGHT, "Modified (UTC)");
+    win32::header_cell(&mut header, TYPE_WIDTH, HEADER_HEIGHT, "Type");
+    let rest = header.available_width();
+    if rest > 0.0 { win32::header_cell(&mut header, rest, HEADER_HEIGHT, ""); }
 }
 
 fn file_row_details(ui: &mut egui::Ui, dir: bool, size: u64, modified: &str) {

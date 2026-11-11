@@ -14,7 +14,11 @@
 //! Data flows as soon as the client asks for it (`Read`); the client asks for
 //! a segment's XXH3-128 digest (`Digest`) once it has requested all of the
 //! segment, so verification costs no extra round trip. The chunk size is
-//! chosen per transfer with `Probe` (largest that gets through unfragmented).
+//! chosen per transfer with `Probe` (largest that gets through unfragmented;
+//! the server sends with "don't fragment" set, so an oversized probe reply is
+//! dropped instead of silently fragmented). A PROBE_REPLY also carries the
+//! server's largest supported chunk; servers from before that field pad with
+//! zeros, which reads as [`LEGACY_MAX_CHUNK`].
 
 use std::fmt;
 
@@ -36,8 +40,16 @@ pub const CHUNK_SIZE: usize = 1200;
 /// Larger chunk used when a probe shows the path carries it: 1425-byte
 /// packets fit a 1500-byte MTU and PPPoE (1492) over IPv4 and IPv6.
 pub const LARGE_CHUNK: usize = 1380;
+/// Largest chunk whose packet fits a 1500-byte MTU over IPv4
+/// (1500 − 20 IP − 8 UDP − 45 = 1427).
+pub const IPV4_FULL_CHUNK: usize = 1500 - 20 - 8 - DATA_OVERHEAD;
+/// Same over IPv6 (40-byte IP header): 1407.
+pub const IPV6_FULL_CHUNK: usize = 1500 - 40 - 8 - DATA_OVERHEAD;
 pub const MIN_CHUNK: usize = 512;
-pub const MAX_CHUNK: usize = 1400;
+/// Largest chunk this version sends or accepts.
+pub const MAX_CHUNK: usize = IPV4_FULL_CHUNK;
+/// Largest chunk a server from before the PROBE_REPLY `max_chunk` field accepts.
+pub const LEGACY_MAX_CHUNK: usize = 1400;
 /// Size of a DATA packet carrying a full default chunk.
 pub const DATA_PACKET_LEN: usize = CHUNK_SIZE + DATA_OVERHEAD;
 /// Largest byte range a single READ may ask for.
@@ -59,8 +71,8 @@ const KIND_ERROR: u8 = 7;
 const KIND_PROBE: u8 = 8;
 const KIND_PROBE_REPLY: u8 = 9;
 const MAX_ERROR_LEN: usize = 512;
-/// Body bytes of a PROBE_REPLY besides its padding.
-const PROBE_REPLY_FIXED: usize = 4 + 2;
+/// Body bytes of a PROBE_REPLY besides its padding (request, size, max chunk).
+const PROBE_REPLY_FIXED: usize = 4 + 2 + 2;
 
 /// Size of a DATA packet for `chunk` bytes of data.
 pub const fn data_packet_len(chunk: usize) -> usize {
@@ -117,7 +129,9 @@ pub enum Message {
     /// Client → server: answer with a PROBE_REPLY packet of exactly `size` bytes.
     Probe { request: u32, size: u16 },
     /// Server → client: answer to `Probe`, padded to the requested size.
-    ProbeReply { request: u32, size: u16, padding: usize },
+    /// `max_chunk` is the largest chunk the server accepts in a READ; 0 means
+    /// a server that predates the field (see [`LEGACY_MAX_CHUNK`]).
+    ProbeReply { request: u32, size: u16, max_chunk: u16, padding: usize },
 }
 
 impl Message {
@@ -173,9 +187,10 @@ impl Message {
                 body.extend_from_slice(&request.to_be_bytes());
                 body.extend_from_slice(&size.to_be_bytes());
             }
-            Message::ProbeReply { request, size, padding } => {
+            Message::ProbeReply { request, size, max_chunk, padding } => {
                 body.extend_from_slice(&request.to_be_bytes());
                 body.extend_from_slice(&size.to_be_bytes());
+                body.extend_from_slice(&max_chunk.to_be_bytes());
                 body.resize(body.len() + padding, 0);
             }
         }
@@ -226,8 +241,10 @@ impl Message {
             KIND_PROBE_REPLY => {
                 let request = reader.u32()?;
                 let size = reader.u16()?;
+                // Older servers send only zero padding here (or nothing).
+                let max_chunk = reader.u16().unwrap_or(0);
                 let padding = reader.rest().len();
-                Message::ProbeReply { request, size, padding }
+                Message::ProbeReply { request, size, max_chunk, padding }
             }
             other => return Err(WireError::UnknownKind(other)),
         };
@@ -239,11 +256,11 @@ impl Message {
     }
 
     /// A PROBE_REPLY whose sealed packet is exactly `size` bytes (or as close
-    /// as possible if `size` is too small).
+    /// as possible if `size` is too small), advertising [`MAX_CHUNK`].
     pub fn probe_reply(request: u32, size: u16) -> Message {
         let fixed = HEADER_LEN + PROBE_REPLY_FIXED + TAG_LEN;
         let padding = usize::from(size).min(MAX_PROBE_LEN).saturating_sub(fixed);
-        Message::ProbeReply { request, size, padding }
+        Message::ProbeReply { request, size, max_chunk: MAX_CHUNK as u16, padding }
     }
 }
 
@@ -475,8 +492,10 @@ mod tests {
             Message::Close,
             Message::Closed,
             Message::Error { message: "nope".into() },
+            Message::Data { offset: 7, data: vec![1; MAX_CHUNK] },
             Message::Probe { request: 3, size: 1425 },
             Message::probe_reply(3, 1425),
+            Message::probe_reply(4, 1500),
         ];
         for (counter, message) in messages.iter().enumerate() {
             let packet = cipher().seal(Direction::ToClient, 99, counter as u64, message);
@@ -496,11 +515,34 @@ mod tests {
         }
         assert_eq!(data_packet_len(LARGE_CHUNK), 1425);
         assert_eq!(DATA_PACKET_LEN, 1245);
+        // Full-MTU chunks: exactly a 1500-byte IP packet.
+        assert_eq!(IPV4_FULL_CHUNK, 1427);
+        assert_eq!(data_packet_len(IPV4_FULL_CHUNK) + 20 + 8, 1500);
+        assert_eq!(data_packet_len(IPV6_FULL_CHUNK) + 40 + 8, 1500);
+    }
+
+    #[test]
+    fn probe_replies_from_older_servers_read_as_legacy() {
+        // Pre-`max_chunk` servers wrote request, size, then zero padding.
+        let mut body = Vec::new();
+        body.extend_from_slice(&9_u32.to_be_bytes());
+        body.extend_from_slice(&1425_u16.to_be_bytes());
+        body.resize(body.len() + 100, 0);
+        match Message::decode_body(KIND_PROBE_REPLY, &body).unwrap() {
+            Message::ProbeReply { request, max_chunk, .. } => assert_eq!((request, max_chunk), (9, 0)),
+            other => panic!("{other:?}"),
+        }
+        // A reply with no padding at all still decodes.
+        let short = [0, 0, 0, 1, 0, 30];
+        assert!(matches!(
+            Message::decode_body(KIND_PROBE_REPLY, &short).unwrap(),
+            Message::ProbeReply { max_chunk: 0, padding: 0, .. }
+        ));
     }
 
     #[test]
     fn in_place_data_sealing_matches_seal() {
-        for chunk in [CHUNK_SIZE, LARGE_CHUNK, 10] {
+        for chunk in [CHUNK_SIZE, LARGE_CHUNK, MAX_CHUNK, 10] {
             let data = vec![5_u8; chunk];
             let expected = cipher().seal(Direction::ToClient, 3, 77, &Message::Data { offset: 4096, data: data.clone() });
             let mut out = vec![1, 2, 3];
