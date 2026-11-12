@@ -2517,7 +2517,7 @@ fn paint_speed_graph(
         (egui::Color32::from_rgb(220, 0, 0), egui::Color32::from_rgb(200, 0, 200))
     };
     let mut label_slots: Vec<f32> = Vec::new();
-    for (average, color, label) in [(average_down, average_down_color, "avg ↓"), (average_up, average_up_color, "avg ↑")] {
+    for (average, color, label) in [(average_down, average_down_color, "avg download"), (average_up, average_up_color, "avg upload")] {
         let Some(average) = average else { continue };
         let y = y_of(average).round() + 0.5;
         painter.extend(egui::Shape::dotted_line(&[egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], color, 4.0, 0.9));

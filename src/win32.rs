@@ -257,10 +257,29 @@ fn install_font(ctx: &egui::Context) {
         "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|path| std::fs::read(path).ok()) else { return; };
+    /// Fuller fonts for characters the UI font lacks (Wine's Tahoma has no
+    /// arrows, for example); egui's own fonts do not cover them either.
+    const FALLBACKS: &[&str] = &[
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation-fonts/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    let Some((primary, bytes)) = CANDIDATES.iter().find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes))) else { return; };
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("win32-ui".into(), Arc::new(FontData::from_owned(bytes)));
-    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "win32-ui".into());
+    let family = fonts.families.entry(FontFamily::Proportional).or_default();
+    family.insert(0, "win32-ui".into());
+    let fallback = FALLBACKS.iter().filter(|path| **path != primary).find_map(|path| std::fs::read(path).ok());
+    if let Some(bytes) = fallback {
+        fonts.font_data.insert("win32-ui-fallback".into(), Arc::new(FontData::from_owned(bytes)));
+        fonts.families.entry(FontFamily::Proportional).or_default().insert(1, "win32-ui-fallback".into());
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -775,7 +794,10 @@ pub fn icon_toggle(ui: &mut Ui, on: bool, icon: Icon, tooltip: &str) -> Response
                 painter.rect_filled(rect, 0.0, scroll_track());
             }
             thin_sunken(painter, rect);
-            icon_rect = icon_rect.translate(egui::vec2(1.0, 1.0));
+            // Only a button being pressed nudges its icon; a checked one stays centred.
+            if pressed {
+                icon_rect = icon_rect.translate(egui::vec2(1.0, 1.0));
+            }
         } else if response.hovered() {
             edge(painter, painter.round_rect_to_pixels(rect), highlight(), shadow());
         }
