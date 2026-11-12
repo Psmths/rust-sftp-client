@@ -1193,7 +1193,7 @@ impl SftpApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let selected = self.sessions[a].local_selected.contains(&entry.path);
-                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.label(), entry.dir, selected);
+                        let response = file_row(ui, name_width, &entry.label(), entry.dir, entry.size, &entry.modified, selected);
                         // Dragging a selected item drags the whole selection; dragging
                         // any other item selects just it first, as Explorer does.
                         if response.dragged() && entry.name != ".." {
@@ -1259,7 +1259,6 @@ impl SftpApp {
                             None => {}
                         }
                         if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
-                        file_row_details(ui, entry.dir, entry.size, &entry.modified);
                     });
                 }
                 let session = &mut self.sessions[a];
@@ -1366,7 +1365,7 @@ impl SftpApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let selected = self.sessions[a].remote_selected.contains(&entry.path);
-                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.label(), entry.dir, selected);
+                        let response = file_row(ui, name_width, &entry.label(), entry.dir, entry.size, &entry.modified, selected);
                         if response.dragged() && entry.name != ".." {
                             let session = &mut self.sessions[a];
                             if response.drag_started() && !selected {
@@ -1425,7 +1424,6 @@ impl SftpApp {
                             Some(RowAction::Hash(_)) | None => {}
                         }
                         if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
-                        file_row_details(ui, entry.dir, entry.size, &entry.modified);
                     });
                 }
                 let session = &mut self.sessions[a];
@@ -2707,38 +2705,44 @@ fn short_duration(duration: Duration) -> String {
     if seconds % 60 == 0 { format!("{} min", seconds / 60) } else { format!("{seconds} s") }
 }
 
-fn file_row_details(ui: &mut egui::Ui, dir: bool, size: u64, modified: &str) {
-    file_text_cell(ui, SIZE_WIDTH, ROW_HEIGHT, &if dir { String::new() } else { size_text(size) }, true);
-    file_text_cell(ui, MODIFIED_WIDTH, ROW_HEIGHT, &modified.replace('T', " ").trim_end_matches('Z').to_owned(), false);
-    file_text_cell(ui, TYPE_WIDTH, ROW_HEIGHT, if dir { "File folder" } else { "File" }, false);
-}
+/// One file-list row: icon and name, size, modification time and type.
+/// The whole row is the click and drag target, and a selected row is
+/// highlighted across every column, as in Explorer's details view.
+fn file_row(ui: &mut egui::Ui, name_width: f32, name: &str, dir: bool, size: u64, modified: &str, selected: bool) -> egui::Response {
+    let width = name_width + SIZE_WIDTH + MODIFIED_WIDTH + TYPE_WIDTH;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click_and_drag());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    if selected {
+        painter.rect_filled(rect, 0.0, win32::selection());
+    }
+    let color = if selected { win32::selection_text() } else { win32::text_color() };
+    let font = egui::TextStyle::Body.resolve(ui.style());
 
-fn file_name_cell(
-    ui: &mut egui::Ui,
-    width: f32,
-    height: f32,
-    text: &str,
-    dir: bool,
-    selected: bool,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, height),
-        egui::Sense::click_and_drag(),
-    );
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-        let icon = egui::Rect::from_min_size(rect.left_center() + egui::vec2(4.0, -6.0), egui::vec2(14.0, 12.0));
-        paint_file_icon(&painter, icon, dir);
-        let color = if selected { win32::selection_text() } else { win32::text_color() };
-        let galley = painter.layout_no_wrap(text.to_owned(), egui::TextStyle::Body.resolve(ui.style()), color);
-        let text_rect = egui::Rect::from_min_size(
-            egui::pos2(icon.right() + 4.0, rect.center().y - galley.size().y / 2.0),
-            galley.size(),
-        ).expand2(egui::vec2(2.0, 1.0));
-        if selected {
-            painter.rect_filled(text_rect, 0.0, win32::selection());
+    let icon = egui::Rect::from_min_size(rect.left_center() + egui::vec2(4.0, -6.0), egui::vec2(14.0, 12.0));
+    paint_file_icon(&painter, icon, dir);
+    let name_rect = egui::Rect::from_min_max(egui::pos2(icon.right() + 6.0, rect.top()), egui::pos2(rect.left() + name_width - 4.0, rect.bottom()));
+    painter.with_clip_rect(name_rect.intersect(painter.clip_rect()))
+        .text(name_rect.left_center(), egui::Align2::LEFT_CENTER, name, font.clone(), color);
+
+    let mut left = rect.left() + name_width;
+    let modified = modified.replace('T', " ").trim_end_matches('Z').to_owned();
+    let size = if dir { String::new() } else { size_text(size) };
+    for (text, width, right_align) in [
+        (size.as_str(), SIZE_WIDTH, true),
+        (modified.as_str(), MODIFIED_WIDTH, false),
+        (if dir { "File folder" } else { "File" }, TYPE_WIDTH, false),
+    ] {
+        let cell = egui::Rect::from_min_size(egui::pos2(left, rect.top()), egui::vec2(width, ROW_HEIGHT));
+        let clipped = painter.with_clip_rect(cell.shrink2(egui::vec2(4.0, 0.0)).intersect(painter.clip_rect()));
+        if right_align {
+            clipped.text(cell.right_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, text, font.clone(), color);
+        } else {
+            clipped.text(cell.left_center() + egui::vec2(5.0, 0.0), egui::Align2::LEFT_CENTER, text, font.clone(), color);
         }
-        painter.galley(text_rect.min + egui::vec2(2.0, 1.0), galley, color);
+        left += width;
     }
     response
 }
