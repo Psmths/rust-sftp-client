@@ -23,7 +23,9 @@ pub mod client;
 pub mod ticket;
 pub mod wire;
 
-pub use ticket::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_COMMAND, TICKET_STREAM_COMMAND};
+pub use ticket::{
+    ListEntry, Listing, StreamReply, StreamRequest, Ticket, PROTOCOL_VERSION, TICKET_COMMAND, TICKET_STREAM_COMMAND,
+};
 pub use wire::{
     Direction, Message, PacketCipher, ReplayWindow, SegmentStatus, WireError, CHUNK_SIZE, DEFAULT_PORT,
     MAX_READ_LEN, MAX_SEGMENT_LEN,

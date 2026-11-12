@@ -39,6 +39,11 @@ linked and runs on any x86_64 Linux distribution.
 
 Transfers are forgotten (and their files closed) after 2 minutes without use.
 
+The same SSH helper also lists directories for the client's file browser: a
+line `{"list":"/some/dir"}` on its stdin is answered with the whole listing in
+one JSON reply, read with the logged-in user's permissions. This needs neither
+the daemon nor UDP.
+
 ## Running manually
 
 ```sh

@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex},
+    sync::{atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering}, Arc, Mutex},
     time::Duration,
 };
 use russh::{client, keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate}, ChannelMsg};
@@ -18,10 +18,28 @@ use crate::{
         CancelToken, DownloadError, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings,
     },
 };
-use rsftp_turbo_proto::{StreamReply, Ticket, PROTOCOL_VERSION, TICKET_STREAM_COMMAND};
+use rsftp_turbo_proto::{StreamReply, StreamRequest, Ticket, PROTOCOL_VERSION, TICKET_STREAM_COMMAND};
 
 /// How long to wait for `rsftp-turbo ticket` on the server.
 const TICKET_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for a directory listing from the helper (large folders
+/// on slow links take a while to arrive).
+const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Whether the rsftp-turbo helper lists directories on this connection.
+const HELPER_LISTING_UNKNOWN: u8 = 0;
+const HELPER_LISTING_YES: u8 = 1;
+const HELPER_LISTING_NO: u8 = 2;
+
+/// One remote directory entry (symbolic links are described themselves).
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+    /// Modification time, Unix seconds.
+    pub mtime: Option<u64>,
+}
 /// Small, world-readable regular files used to check rsftp-turbo right after
 /// connecting (the helper only issues tickets for regular files). The check
 /// fetches and verifies at most [`TURBO_PROBE_BYTES`] of one over UDP.
@@ -142,6 +160,8 @@ pub struct SftpConnection {
     turbo: Mutex<TurboInfo>,
     /// The ticket helper; `None` once it has exited or failed.
     tickets: tokio::sync::Mutex<Option<TicketStream>>,
+    /// `HELPER_LISTING_*`: learned from the first listing.
+    helper_listing: AtomicU8,
     pub host: String,
     pub port: u16,
     pub fingerprint: String,
@@ -237,6 +257,7 @@ impl SftpConnection {
             network,
             turbo: Mutex::new(TurboInfo { state: turbo_state, last_fallback: None }),
             tickets: tokio::sync::Mutex::new(tickets),
+            helper_listing: AtomicU8::new(HELPER_LISTING_UNKNOWN),
             host: profile.host.clone(),
             port: profile.port,
             fingerprint: trusted_fingerprint.unwrap_or_default().to_owned(),
@@ -262,6 +283,82 @@ impl SftpConnection {
 
     pub async fn canonicalize(&self, path: &str) -> Result<String, ConnectError> {
         self.sftp.canonicalize(path.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
+    }
+
+    /// Lists `path` (absolute, or relative to the home folder) and returns
+    /// its absolute path and entries (without `.` and `..`, unsorted).
+    ///
+    /// Uses the rsftp-turbo helper when it can list: one round trip over the
+    /// SSH channel it already holds, instead of SFTP's realpath, opendir,
+    /// several readdirs and close. Falls back to SFTP when the helper is not
+    /// running or too old.
+    pub async fn list_directory(&self, path: &str) -> Result<(String, Vec<DirEntry>), String> {
+        if self.helper_listing.load(Ordering::Relaxed) != HELPER_LISTING_NO {
+            match self.helper_list(path).await {
+                Some(result) => {
+                    self.helper_listing.store(HELPER_LISTING_YES, Ordering::Relaxed);
+                    return result;
+                }
+                None => self.helper_listing.store(HELPER_LISTING_NO, Ordering::Relaxed),
+            }
+        }
+        self.sftp_list(path).await
+    }
+
+    /// `Some(true)` once a listing came from the rsftp-turbo helper,
+    /// `Some(false)` once listings fell back to SFTP, `None` before the first.
+    pub fn listing_via_helper(&self) -> Option<bool> {
+        match self.helper_listing.load(Ordering::Relaxed) {
+            HELPER_LISTING_YES => Some(true),
+            HELPER_LISTING_NO => Some(false),
+            _ => None,
+        }
+    }
+
+    /// `None` if the helper cannot list (use SFTP); otherwise its answer,
+    /// which may be an error such as "permission denied".
+    async fn helper_list(&self, path: &str) -> Option<Result<(String, Vec<DirEntry>), String>> {
+        let request = StreamRequest { list: Some(path.to_owned()) };
+        let line = serde_json::to_string(&request).ok()?;
+        let reply = self.helper_exchange(line, LIST_TIMEOUT).await.ok()?;
+        // A helper too old to list answered as if the request were a file name.
+        if !reply.list_reply {
+            return None;
+        }
+        Some(match (reply.listing, reply.error) {
+            (Some(listing), _) => Ok((
+                listing.path,
+                listing
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.name != "." && entry.name != "..")
+                    .map(|entry| DirEntry { name: entry.name, dir: entry.dir, size: entry.size, mtime: entry.mtime })
+                    .collect(),
+            )),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err("empty listing reply from rsftp-turbo".into()),
+        })
+    }
+
+    async fn sftp_list(&self, path: &str) -> Result<(String, Vec<DirEntry>), String> {
+        let requested = if path.is_empty() { "." } else { path };
+        let path = if crate::session::needs_canonical_path(requested) {
+            self.canonicalize(requested).await.map_err(|e| e.to_string())?
+        } else {
+            requested.to_owned()
+        };
+        let read_dir = self.list_dir(&path).await.map_err(|e| e.to_string())?;
+        let entries = read_dir
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                if name == "." || name == ".." {
+                    return None;
+                }
+                let attrs = entry.metadata();
+                Some(DirEntry { dir: attrs.is_dir(), size: attrs.size.unwrap_or(0), mtime: attrs.mtime.map(u64::from), name })
+            })
+            .collect();
+        Ok((path, entries))
     }
 
 
@@ -824,24 +921,40 @@ impl SftpConnection {
         Some(SocketAddr::new(ip, ticket.port))
     }
 
-    /// Asks the ticket helper for a ticket: writes the path as one line and
-    /// reads one JSON reply line. Requests are serialised on the one channel.
+    /// Asks the ticket helper for a ticket for `remote_path`.
     async fn request_turbo_ticket(&self, remote_path: &str) -> Result<Ticket, TicketError> {
         if remote_path.contains('\n') {
             return Err(TicketError::Refused("file names containing a newline are not supported".into()));
+        }
+        // Lines starting with `{` are JSON requests; real paths are absolute.
+        if !remote_path.starts_with('/') {
+            return Err(TicketError::Refused("only absolute paths can be fetched over rsftp-turbo".into()));
+        }
+        ticket_from_reply(self.helper_exchange(format!("{remote_path}\n"), TICKET_TIMEOUT).await?)
+    }
+
+    /// Writes one request line to the helper and reads its JSON reply line.
+    /// Requests are serialised on the one channel. A helper that fails,
+    /// answers garbage or times out is dropped (its stream would be out of
+    /// step), which turns turbo off for this connection.
+    async fn helper_exchange(&self, mut line: String, limit: Duration) -> Result<StreamReply, TicketError> {
+        if !line.ends_with('\n') {
+            line.push('\n');
         }
         let mut guard = self.tickets.lock().await;
         let Some(stream) = guard.as_mut() else {
             return Err(TicketError::Unavailable("the rsftp-turbo helper is not running".into()));
         };
         let exchange = async {
-            stream.channel.data(format!("{remote_path}\n").as_bytes()).await
+            stream.channel.data(line.as_bytes()).await
                 .map_err(|error| TicketError::Unavailable(format!("rsftp-turbo channel failed: {error}")))?;
             let mut exit_status = None;
             loop {
                 if let Some(end) = stream.stdout.iter().position(|&byte| byte == b'\n') {
                     let line: Vec<u8> = stream.stdout.drain(..=end).collect();
-                    return parse_reply(&line);
+                    return serde_json::from_slice::<StreamReply>(&line).map_err(|error| {
+                        TicketError::Unavailable(format!("unexpected reply from rsftp-turbo: {error}"))
+                    });
                 }
                 match stream.channel.wait().await {
                     Some(ChannelMsg::Data { data }) => stream.stdout.extend_from_slice(&data),
@@ -856,7 +969,7 @@ impl SftpConnection {
                 }
             }
         };
-        let result = match tokio::time::timeout(TICKET_TIMEOUT, exchange).await {
+        let result = match tokio::time::timeout(limit, exchange).await {
             Ok(result) => result,
             Err(_) => Err(TicketError::Unavailable(
                 "timed out waiting for the rsftp-turbo helper (is rsftp-turbo on the server up to date?)".into(),
@@ -870,10 +983,8 @@ impl SftpConnection {
     }
 }
 
-/// Interprets one reply line of `rsftp-turbo ticket --stream`.
-fn parse_reply(line: &[u8]) -> Result<Ticket, TicketError> {
-    let reply: StreamReply = serde_json::from_slice(line)
-        .map_err(|error| TicketError::Unavailable(format!("unexpected reply from rsftp-turbo: {error}")))?;
+/// Interprets the helper's answer to a ticket request.
+fn ticket_from_reply(reply: StreamReply) -> Result<Ticket, TicketError> {
     match (reply.ticket, reply.error) {
         (Some(ticket), _) if ticket.version == PROTOCOL_VERSION => Ok(ticket),
         (Some(ticket), _) => Err(TicketError::Unavailable(format!(

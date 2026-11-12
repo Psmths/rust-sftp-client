@@ -4,17 +4,22 @@
 //! daemon and prints JSON tickets. Two modes:
 //!
 //! * `ticket`: one path on stdin, one [`Ticket`] on stdout;
-//! * `ticket --stream`: one path per stdin line, one [`StreamReply`] line per
-//!   path, until stdin closes. The client keeps this running for the whole SSH
-//!   connection so it needs only one SSH channel.
+//! * `ticket --stream`: one request per stdin line, one [`StreamReply`] line
+//!   per request, until stdin closes. The client keeps this running for the
+//!   whole SSH connection so it needs only one SSH channel. A request is a
+//!   file path (a ticket) or a JSON [`StreamRequest`] (a directory listing,
+//!   which needs no daemon: it is read here, as the logged-in user).
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, Read, Write},
     path::Path,
+    time::UNIX_EPOCH,
 };
 
-use rsftp_turbo_proto::{ticket::to_hex, StreamReply, Ticket, PROTOCOL_VERSION};
+use rsftp_turbo_proto::{
+    ticket::to_hex, ListEntry, Listing, StreamReply, StreamRequest, Ticket, PROTOCOL_VERSION,
+};
 
 use crate::registration::{register, RegisterRequest};
 
@@ -54,18 +59,60 @@ pub fn run_stream(socket: &Path) -> io::Result<()> {
         if stdin.lock().take(MAX_PATH).read_line(&mut line)? == 0 {
             return Ok(());
         }
-        let reply = match issue(trim_line(&line), socket) {
-            Ok(ticket) => StreamReply { ticket: Some(ticket), error: None, service_unavailable: false },
-            Err(failure) => StreamReply {
-                ticket: None,
-                error: Some(failure.message),
-                service_unavailable: failure.service_unavailable,
-            },
+        let request = trim_line(&line);
+        let reply = if request.starts_with('{') {
+            answer_request(request)
+        } else {
+            match issue(request, socket) {
+                Ok(ticket) => StreamReply { ticket: Some(ticket), ..StreamReply::default() },
+                Err(failure) => StreamReply {
+                    error: Some(failure.message),
+                    service_unavailable: failure.service_unavailable,
+                    ..StreamReply::default()
+                },
+            }
         };
         serde_json::to_writer(&mut stdout, &reply)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
     }
+}
+
+/// Answers a JSON request line.
+fn answer_request(request: &str) -> StreamReply {
+    match serde_json::from_str::<StreamRequest>(request) {
+        Ok(StreamRequest { list: Some(path) }) => match list_directory(&path) {
+            Ok(listing) => StreamReply { listing: Some(listing), list_reply: true, ..StreamReply::default() },
+            Err(message) => StreamReply { error: Some(message), list_reply: true, ..StreamReply::default() },
+        },
+        Ok(_) => StreamReply { error: Some("unknown request".into()), ..StreamReply::default() },
+        Err(error) => StreamReply { error: Some(format!("invalid request: {error}")), ..StreamReply::default() },
+    }
+}
+
+/// Lists `path` (relative paths start at the working directory, which over
+/// SSH is the login's home folder) with the current user's permissions.
+pub fn list_directory(path: &str) -> Result<Listing, String> {
+    let requested = if path.is_empty() { "." } else { path };
+    let resolved = fs::canonicalize(requested).map_err(|error| format!("cannot open {requested}: {error}"))?;
+    let reader = fs::read_dir(&resolved).map_err(|error| format!("cannot list {}: {error}", resolved.display()))?;
+    let mut entries = Vec::new();
+    for entry in reader {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // DirEntry::metadata does not follow symbolic links, like SFTP READDIR.
+        let entry = match entry.metadata() {
+            Ok(meta) => ListEntry {
+                name,
+                dir: meta.is_dir(),
+                size: meta.len(),
+                mtime: meta.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|age| age.as_secs()),
+            },
+            Err(_) => ListEntry { name, dir: false, size: 0, mtime: None },
+        };
+        entries.push(entry);
+    }
+    Ok(Listing { path: resolved.to_string_lossy().into_owned(), entries })
 }
 
 fn trim_line(line: &str) -> &str {
@@ -104,4 +151,41 @@ pub fn issue(path: &str, socket: &Path) -> Result<Ticket, TicketFailure> {
         address: server_ip,
         size: meta.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_a_directory_without_following_links() {
+        let root = std::env::temp_dir().join(format!("rsftp-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("file.bin"), b"12345").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("sub"), root.join("link")).unwrap();
+
+        let listing = list_directory(&format!("{}/sub/..", root.display())).unwrap();
+        assert_eq!(Path::new(&listing.path), fs::canonicalize(&root).unwrap());
+        let find = |name: &str| listing.entries.iter().find(|entry| entry.name == name).cloned();
+        assert!(find("sub").unwrap().dir);
+        let file = find("file.bin").unwrap();
+        assert_eq!((file.dir, file.size), (false, 5));
+        assert!(file.mtime.is_some());
+        #[cfg(unix)]
+        assert!(!find("link").unwrap().dir);
+        assert!(find(".").is_none() && find("..").is_none());
+
+        assert!(list_directory(&format!("{}/missing", root.display())).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn json_lines_are_requests_and_errors_are_marked_as_list_replies() {
+        let failed = answer_request(r#"{"list":"/nonexistent-rsftp-dir"}"#);
+        assert!(failed.list_reply && failed.listing.is_none() && failed.error.is_some());
+        let unknown = answer_request(r#"{"other":1}"#);
+        assert!(!unknown.list_reply && unknown.error.is_some());
+    }
 }

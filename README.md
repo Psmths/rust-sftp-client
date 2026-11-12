@@ -48,7 +48,8 @@ back to SFTP automatically when the server has no helper or UDP is blocked.
 * Downloads keep their progress in a hidden `.<name>.rsftp-part` file: if turbo fails part-way, SFTP
   finishes only the missing pieces, and an interrupted download resumes where it stopped (when the
   remote file is unchanged). Stopping a transfer deletes its partial file.
-* Toggle it under *Settings → Network Settings → UDP downloads*. The log records which protocol was used. Right after connecting, the client checks that the service answers over UDP (a handshake only, no file data), so the status bar shows *Turbo: ready* or the reason it is unavailable before the first download.
+* Toggle it under *Settings → Network Settings → UDP downloads*. The log records which protocol was used. Right after connecting, the client checks that the service answers over UDP (by fetching the first few KiB of a small system file such as `/etc/hostname`), so the status bar shows *Turbo: ready* or the reason it is unavailable before the first download.
+* Remote directory listings also go through the helper when the server's `rsftp-turbo` supports it: one round trip over the existing SSH connection instead of several SFTP requests, which helps with large folders and distant servers. It needs no UDP. Older helpers and servers without one are listed over SFTP. The turbo status tooltip shows which method is in use. Logging in and permissions stay with SSH: the helper runs as the logged-in user.
 
 ## Troubleshooting startup
 

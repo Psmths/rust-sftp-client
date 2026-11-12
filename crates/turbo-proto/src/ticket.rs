@@ -9,13 +9,24 @@ use crate::wire::KEY_LEN;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Command the client runs over SSH; the file path is written to its stdin.
 pub const TICKET_COMMAND: &str = "rsftp-turbo ticket";
-/// Long-lived variant: one path per line on stdin, one [`StreamReply`] JSON
-/// line per path on stdout. The client keeps it running for the whole SSH
-/// connection, so it needs only one SSH channel however many files it fetches.
+/// Long-lived variant: one request per line on stdin, one [`StreamReply`]
+/// JSON line per request on stdout. The client keeps it running for the whole
+/// SSH connection, so it needs only one SSH channel however many files it
+/// fetches. A request is either a file path (ticket request) or, if the line
+/// starts with `{`, a JSON [`StreamRequest`]. Ticket requests are always
+/// absolute paths, so the two never collide.
 pub const TICKET_STREAM_COMMAND: &str = "rsftp-turbo ticket --stream";
 
+/// A JSON request line of `rsftp-turbo ticket --stream`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamRequest {
+    /// Directory to list: absolute, or relative to the login's home folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<String>,
+}
+
 /// One line of `rsftp-turbo ticket --stream` output.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamReply {
     #[serde(default)]
     pub ticket: Option<Ticket>,
@@ -24,6 +35,40 @@ pub struct StreamReply {
     /// The error means the service itself is unusable (not just this file).
     #[serde(default)]
     pub service_unavailable: bool,
+    /// Answer to a list request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing: Option<Listing>,
+    /// Set on every answer to a list request, failed ones included. A helper
+    /// too old to list reads the request as a file name and answers without it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub list_reply: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A directory as the logged-in user sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listing {
+    /// Absolute path with symbolic links resolved (like SFTP `realpath`).
+    pub path: String,
+    /// Every entry except `.` and `..`, unsorted.
+    pub entries: Vec<ListEntry>,
+}
+
+/// One directory entry. Like an SFTP listing, symbolic links are described
+/// themselves, not their targets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListEntry {
+    pub name: String,
+    #[serde(default)]
+    pub dir: bool,
+    #[serde(default)]
+    pub size: u64,
+    /// Modification time, Unix seconds.
+    #[serde(default)]
+    pub mtime: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,5 +145,30 @@ mod tests {
         assert_eq!(ticket.key_bytes(), Some([3_u8; KEY_LEN]));
         let short = Ticket { key: "00".into(), ..ticket };
         assert_eq!(short.key_bytes(), None);
+    }
+
+    #[test]
+    fn list_replies_round_trip_and_old_replies_still_parse() {
+        let reply = StreamReply {
+            listing: Some(Listing {
+                path: "/home/u".into(),
+                entries: vec![ListEntry { name: "a".into(), dir: true, size: 0, mtime: Some(5) }],
+            }),
+            list_reply: true,
+            ..StreamReply::default()
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<StreamReply>(&json).unwrap(), reply);
+
+        // A pre-listing helper's answer to a list request: a plain file error.
+        let old: StreamReply = serde_json::from_str(r#"{"ticket":null,"error":"cannot open","service_unavailable":false}"#).unwrap();
+        assert!(!old.list_reply && old.listing.is_none());
+
+        // Ticket replies do not grow new fields.
+        let plain = serde_json::to_string(&StreamReply { error: Some("x".into()), ..StreamReply::default() }).unwrap();
+        assert!(!plain.contains("list"));
+
+        let request = serde_json::to_string(&StreamRequest { list: Some("/tmp".into()) }).unwrap();
+        assert!(request.starts_with('{'));
     }
 }

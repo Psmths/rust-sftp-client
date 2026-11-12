@@ -2069,6 +2069,13 @@ fn turbo_status_text(session: &Session) -> (String, String) {
     if let Some(fallback) = &info.last_fallback {
         details.push_str(&format!("\n\nLast file that fell back to SFTP: {fallback}"));
     }
+    match connection.listing_via_helper() {
+        Some(true) => details.push_str("\n\nDirectory listings: rsftp-turbo helper over SSH (one round trip each)."),
+        Some(false) => details.push_str(
+            "\n\nDirectory listings: SFTP (the server's rsftp-turbo helper is not running or too old to list directories).",
+        ),
+        None => {}
+    }
     (short, details)
 }
 

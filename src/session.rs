@@ -391,26 +391,18 @@ impl Session {
         self.status = format!("Reading remote directory {requested} …");
         self.runtime.spawn(async move {
             let result = async {
-                let path = if needs_canonical_path(&requested) {
-                    connection.canonicalize(&requested).await.map_err(|e| e.to_string())?
-                } else {
-                    requested
-                };
-                let read_dir = connection.list_dir(&path).await.map_err(|e| e.to_string())?;
-                let mut entries = Vec::new();
-                for entry in read_dir {
-                    let name = entry.file_name();
-                    if name == "." || name == ".." { continue; }
-                    let attrs = entry.metadata();
-                    let full_path = crate::app::join_remote(&path, &name);
-                    entries.push(RemoteEntry {
-                        name,
-                        path: full_path,
-                        dir: attrs.is_dir(),
-                        size: attrs.size.unwrap_or(0),
-                        modified: attrs.mtime.map(|t| crate::app::format_unix_utc(t as i64)).unwrap_or_else(|| "—".into()),
-                    });
-                }
+                // Through the rsftp-turbo helper when it can list, else SFTP.
+                let (path, listed) = connection.list_directory(&requested).await?;
+                let mut entries: Vec<RemoteEntry> = listed
+                    .into_iter()
+                    .map(|entry| RemoteEntry {
+                        path: crate::app::join_remote(&path, &entry.name),
+                        name: entry.name,
+                        dir: entry.dir,
+                        size: entry.size,
+                        modified: entry.mtime.map(|t| crate::app::format_unix_utc(t as i64)).unwrap_or_else(|| "—".into()),
+                    })
+                    .collect();
                 entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
                 Ok((path, entries))
             }.await;
@@ -812,7 +804,7 @@ impl Session {
 
 
 /// True unless `path` is already absolute and free of `.`/`..` segments.
-fn needs_canonical_path(path: &str) -> bool {
+pub(crate) fn needs_canonical_path(path: &str) -> bool {
     !path.starts_with('/') || path.split('/').any(|part| part == "." || part == "..")
 }
 
