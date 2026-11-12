@@ -310,8 +310,9 @@ enum Dialog {
 
 #[derive(Clone, Debug)]
 enum DragPayload {
-    Local(PathBuf),
-    Remote(String),
+    /// Every item being dragged: the whole selection if the dragged item is in it.
+    Local(Vec<PathBuf>),
+    Remote(Vec<String>),
 }
 
 pub struct SftpApp {
@@ -1038,8 +1039,10 @@ impl SftpApp {
             self.local_pane_contents(ui);
         });
         if let Some(payload) = dropped {
-            if let DragPayload::Remote(path) = payload.as_ref() {
-                self.sessions[a].queue_download(path.clone(), self.settings.transfer);
+            if let DragPayload::Remote(paths) = payload.as_ref() {
+                for path in paths {
+                    self.sessions[a].queue_download(path.clone(), self.settings.transfer);
+                }
             }
         }
     }
@@ -1104,7 +1107,21 @@ impl SftpApp {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let selected = self.sessions[a].local_selected.contains(&entry.path);
                         let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.name, entry.dir, selected);
-                        if response.dragged() { response.dnd_set_drag_payload(DragPayload::Local(entry.path.clone())); }
+                        // Dragging a selected item drags the whole selection; dragging
+                        // any other item selects just it first, as Explorer does.
+                        if response.dragged() && entry.name != ".." {
+                            let session = &mut self.sessions[a];
+                            if response.drag_started() && !selected {
+                                session.local_selected = vec![entry.path.clone()];
+                                session.local_anchor = Some(entry.path.clone());
+                            }
+                            let paths = if session.local_selected.contains(&entry.path) {
+                                order.iter().filter(|path| session.local_selected.contains(path)).cloned().collect()
+                            } else {
+                                vec![entry.path.clone()]
+                            };
+                            response.dnd_set_drag_payload(DragPayload::Local(paths));
+                        }
                         if response.clicked() {
                             let (ctrl, shift) = click_modifiers(&response);
                             let session = &mut self.sessions[a];
@@ -1171,8 +1188,10 @@ impl SftpApp {
             self.remote_pane_contents(ui);
         });
         if let Some(payload) = dropped {
-            if let DragPayload::Local(path) = payload.as_ref() {
-                self.sessions[a].queue_upload(path.clone());
+            if let DragPayload::Local(paths) = payload.as_ref() {
+                for path in paths {
+                    self.sessions[a].queue_upload(path.clone());
+                }
             }
         }
     }
@@ -1234,7 +1253,19 @@ impl SftpApp {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let selected = self.sessions[a].remote_selected.contains(&entry.path);
                         let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.name, entry.dir, selected);
-                        if response.dragged() { response.dnd_set_drag_payload(DragPayload::Remote(entry.path.clone())); }
+                        if response.dragged() && entry.name != ".." {
+                            let session = &mut self.sessions[a];
+                            if response.drag_started() && !selected {
+                                session.remote_selected = vec![entry.path.clone()];
+                                session.remote_anchor = Some(entry.path.clone());
+                            }
+                            let paths = if session.remote_selected.contains(&entry.path) {
+                                order.iter().filter(|path| session.remote_selected.contains(path)).cloned().collect()
+                            } else {
+                                vec![entry.path.clone()]
+                            };
+                            response.dnd_set_drag_payload(DragPayload::Remote(paths));
+                        }
                         if response.clicked() {
                             let (ctrl, shift) = click_modifiers(&response);
                             let session = &mut self.sessions[a];
@@ -1510,8 +1541,11 @@ impl SftpApp {
             .filter(|sample| now.saturating_duration_since(sample.at) <= span)
             .collect();
         let peak = |pick: fn(&SpeedSample) -> f64| window.iter().map(pick).fold(0.0_f64, f64::max);
-        let average = |pick: fn(&SpeedSample) -> f64| {
-            if window.is_empty() { 0.0 } else { window.iter().map(pick).sum::<f64>() / window.len() as f64 }
+        // Averages cover only the seconds in which that direction was transferring,
+        // so idle time does not pull them towards zero.
+        let average = |pick: fn(&SpeedSample) -> Option<f64>| {
+            let active: Vec<f64> = window.iter().filter_map(pick).collect();
+            if active.is_empty() { 0.0 } else { active.iter().sum::<f64>() / active.len() as f64 }
         };
         let (bytes_down, bytes_up) = session.bytes_transferred();
         let count = |tab: QueueTab| session.transfers.iter().filter(|item| item.tab() == tab).count();
@@ -1521,8 +1555,8 @@ impl SftpApp {
             ("Uploading now:", speed_text(session.speed("Uploading"))),
             ("Peak download:", speed_text(peak(|sample| sample.down))),
             ("Peak upload:", speed_text(peak(|sample| sample.up))),
-            ("Average download:", speed_text(average(|sample| sample.down))),
-            ("Average upload:", speed_text(average(|sample| sample.up))),
+            ("Average download:", speed_text(average(|sample| sample.downloading.then_some(sample.down)))),
+            ("Average upload:", speed_text(average(|sample| sample.uploading.then_some(sample.up)))),
             ("Downloaded:", size_text(bytes_down)),
             ("Uploaded:", size_text(bytes_up)),
             ("Transfers:", format!("{} active, {} complete, {} failed", count(QueueTab::Pending), count(QueueTab::Complete), count(QueueTab::Failed))),

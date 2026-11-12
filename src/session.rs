@@ -231,6 +231,9 @@ pub struct SpeedSample {
     pub at: Instant,
     pub down: f64,
     pub up: f64,
+    /// A download / upload was running when the sample was taken.
+    pub downloading: bool,
+    pub uploading: bool,
 }
 
 /// How far back the statistics graph can look.
@@ -401,7 +404,15 @@ impl Session {
         if self.speed_history.back().is_some_and(|last| now.saturating_duration_since(last.at) < SPEED_SAMPLE_INTERVAL) {
             return;
         }
-        self.speed_history.push_back(SpeedSample { at: now, down: self.speed("Downloading"), up: self.speed("Uploading") });
+        let running = |state: &str| self.transfers.iter().any(|item| item.state == state);
+        let sample = SpeedSample {
+            at: now,
+            down: self.speed("Downloading"),
+            up: self.speed("Uploading"),
+            downloading: running("Downloading"),
+            uploading: running("Uploading"),
+        };
+        self.speed_history.push_back(sample);
         while self.speed_history.front().is_some_and(|first| now.saturating_duration_since(first.at) > SPEED_HISTORY) {
             self.speed_history.pop_front();
         }
