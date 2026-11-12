@@ -790,6 +790,31 @@ pub fn icon_button(ui: &mut Ui, enabled: bool, icon: Icon, tooltip: &str) -> Res
     response.on_hover_text(tooltip)
 }
 
+/// Narrow drop-down arrow attached to the right of a toolbar button
+/// (Explorer's split buttons). Stays pressed in while its menu is open.
+pub fn dropdown_arrow(ui: &mut Ui, enabled: bool, open: bool, tooltip: &str) -> Response {
+    let size = egui::vec2(13.0, 23.0);
+    let (rect, response) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let pressed = enabled && (open || (response.is_pointer_button_down_on() && response.contains_pointer()));
+        let mut center = rect.center();
+        if pressed {
+            thin_sunken(painter, rect);
+            center += egui::vec2(1.0, 1.0);
+        } else if enabled && response.hovered() {
+            edge(painter, painter.round_rect_to_pixels(rect), highlight(), shadow());
+        }
+        let color = if enabled { text_color() } else { gray_text() };
+        painter.add(egui::Shape::convex_polygon(
+            vec![center + egui::vec2(-3.5, -1.5), center + egui::vec2(3.5, -1.5), center + egui::vec2(0.0, 2.5)],
+            color,
+            Stroke::NONE,
+        ));
+    }
+    response.on_hover_text(tooltip)
+}
+
 /// Toolbar button that stays pressed in while `on`, like a checked Win32
 /// toolbar button.
 pub fn icon_toggle(ui: &mut Ui, on: bool, icon: Icon, tooltip: &str) -> Response {

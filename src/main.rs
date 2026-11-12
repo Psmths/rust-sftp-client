@@ -6,6 +6,7 @@ mod connection;
 mod credentials;
 mod logging;
 mod transfer;
+mod units;
 mod places;
 mod search;
 mod session;

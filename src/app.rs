@@ -182,6 +182,7 @@ struct SettingsDraft {
     log_directory: String,
     split_sessions: bool,
     theme: win32::Theme,
+    units: crate::units::SizeUnits,
 }
 
 impl SettingsDraft {
@@ -210,6 +211,7 @@ impl SettingsDraft {
             log_directory: logging.directory.display().to_string(),
             split_sessions: logging.split_sessions,
             theme: settings.theme,
+            units: settings.units,
         }
     }
 
@@ -244,7 +246,7 @@ impl SettingsDraft {
             split_sessions: self.split_sessions,
         };
         // Settings not edited in this window are carried over when applying.
-        Ok(AppSettings { transfer, network, logging, theme: self.theme, hide_hidden_items: false, last_local_dir: None })
+        Ok(AppSettings { transfer, network, logging, theme: self.theme, units: self.units, hide_hidden_items: false, last_local_dir: None })
     }
 }
 
@@ -385,6 +387,7 @@ impl SftpApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = crate::settings::load();
         win32::apply(&cc.egui_ctx, settings.theme);
+        crate::units::set(settings.units);
         // Open where the user left off; the home folder the first time (or if it is gone).
         let path = settings
             .last_local_dir
@@ -787,6 +790,7 @@ impl SftpApp {
                 return false;
             }
             if let Err(error) = fs::create_dir(&path) {
+                session.log_file_operation("MKDIR", &Err(format!("Could not create folder {}: {error}", path.display())));
                 self.rename_error = format!("Could not create the folder: {error}");
                 return false;
             }
@@ -814,6 +818,11 @@ impl SftpApp {
         let Some(index) = self.session_index(self.file_target_session) else { return; };
         let session_id = self.file_target_session;
         let tx = self.op_tx.clone();
+        let names: Vec<String> = match &target {
+            FileTarget::Local(entries) => entries.iter().map(|entry| entry.path.display().to_string()).collect(),
+            FileTarget::Remote(entries) => entries.iter().map(|entry| format!("remote {}", entry.path)).collect(),
+        };
+        self.sessions[index].log_file_operation("DELETE", &Ok(format!("Deleting {}", names.join(", "))));
         match target {
             FileTarget::Local(entries) => {
                 self.sessions[index].local_selected.clear();
@@ -869,6 +878,9 @@ impl SftpApp {
                     return false;
                 }
                 if let Err(error) = fs::rename(&entry.path, &destination) {
+                    self.sessions[index].log_file_operation("RENAME", &Err(format!(
+                        "Could not rename {} to {}: {error}", entry.path.display(), destination.display()
+                    )));
                     self.rename_error = format!("Could not rename: {error}");
                     return false;
                 }
@@ -1030,6 +1042,38 @@ impl SftpApp {
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.settings_error.clear();
         self.settings_open = true;
+    }
+
+    /// Connects with the profile in the editor fields, asking for (or looking
+    /// up) the password as needed. Used by the Connect button and the quick
+    /// connect menu.
+    fn connect_with_form(&mut self) {
+        match self.profile_value() {
+            Ok(profile) => {
+                if profile.auth_method == AuthMethod::Password {
+                    if !self.password.is_empty() {
+                        // Typed in the profile editor: use it (and save it once it works).
+                        self.dialog = None;
+                        self.begin_connect(Some(self.password.clone()));
+                    } else if profile.save_password {
+                        self.dialog = None;
+                        self.start_password_lookup(&profile);
+                    } else {
+                        self.dialog = Some(Dialog::Password);
+                    }
+                } else {
+                    self.dialog = None;
+                    self.begin_connect(None);
+                }
+            }
+            Err(error) => self.show_error(error),
+        }
+    }
+
+    /// Connects to a saved profile straight away (the toolbar's quick connect menu).
+    fn quick_connect(&mut self, index: usize) {
+        self.apply_profile(index);
+        self.connect_with_form();
     }
 
     fn apply_profile(&mut self, index: usize) {
@@ -1464,7 +1508,7 @@ impl SftpApp {
                 win32::header_cell(ui, protocol_width, header_height, "Protocol");
                 win32::header_cell(ui, progress_width, header_height, "Progress");
                 win32::header_cell(ui, percent_width, header_height, "Complete");
-                win32::header_cell(ui, speed_width, header_height, "Speed (MiB/s)");
+                win32::header_cell(ui, speed_width, header_height, "Speed");
                 win32::header_cell(ui, elapsed_width, header_height, "Elapsed");
                 win32::header_cell(ui, remaining_width, header_height, "Remaining");
                 let rest = ui.available_width();
@@ -1577,7 +1621,7 @@ impl SftpApp {
                             if item.state == "Complete" { 100.0 } else { 0.0 }
                         } else { item.transferred as f64 * 100.0 / item.total as f64 };
                         file_text_cell(ui, percent_width, row_height, &format!("{percent:.1}%"), false);
-                        let speed = if item.state == "Queued" { "—".into() } else { format!("{:.2}", item.speed_mib_s) };
+                        let speed = if item.state == "Queued" { "—".into() } else { speed_text(item.speed_mib_s) };
                         file_text_cell(ui, speed_width, row_height, &speed, false);
                         let elapsed = item.started_at.map(|start| {
                             item.finished_at.unwrap_or_else(Instant::now).saturating_duration_since(start)
@@ -1670,8 +1714,6 @@ impl SftpApp {
                         ui.selectable_value(&mut self.stats_span_minutes, minutes, format!("{minutes} min"));
                     }
                 });
-            ui.add_space(12.0);
-            ui.weak("Download and upload speed of this session; one sample per second.");
         });
         ui.add_space(2.0);
         let session = &self.sessions[a];
@@ -1987,26 +2029,7 @@ impl SftpApp {
         }
         if save { self.save_profile(); }
         if connect {
-            match self.profile_value() {
-                Ok(profile) => {
-                    if profile.auth_method == AuthMethod::Password {
-                        if !self.password.is_empty() {
-                            // Typed in the profile editor: use it (and save it once it works).
-                            self.dialog = None;
-                            self.begin_connect(Some(self.password.clone()));
-                        } else if profile.save_password {
-                            self.dialog = None;
-                            self.start_password_lookup(&profile);
-                        } else {
-                            self.dialog = Some(Dialog::Password);
-                        }
-                    } else {
-                        self.dialog = None;
-                        self.begin_connect(None);
-                    }
-                }
-                Err(error) => self.show_error(error),
-            }
+            self.connect_with_form();
         }
         if let Some(password) = password_value {
             self.password = password.clone();
@@ -2137,8 +2160,20 @@ impl SftpApp {
                                             }
                                         });
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.label("Units:");
+                                    egui::ComboBox::from_id_salt("units")
+                                        .width(260.0)
+                                        .selected_text(draft.units.label())
+                                        .show_ui(ui, |ui| {
+                                            for units in crate::units::SizeUnits::ALL {
+                                                ui.selectable_value(&mut draft.units, units, units.label());
+                                            }
+                                        });
+                                });
                                 ui.add_space(6.0);
-                                ui.weak("Applies to every window as soon as you click OK or Apply.");
+                                ui.weak("Units apply to file sizes, transfer speeds, the transfer queue and the statistics.");
+                                ui.weak("Both apply to every window as soon as you click OK or Apply.");
                             }
                             SettingsPage::Logging => {
                                 ui.checkbox(&mut draft.logging_enabled, "Enable logging");
@@ -2196,6 +2231,7 @@ impl SftpApp {
                     if settings.theme != self.settings.theme {
                         win32::apply(ctx, settings.theme);
                     }
+                    crate::units::set(settings.units);
                     if settings.transfer.max_concurrent_transfers != self.settings.transfer.max_concurrent_transfers {
                         for session in &mut self.sessions {
                             session.set_concurrency(settings.transfer.max_concurrent_transfers);
@@ -2244,7 +2280,35 @@ impl eframe::App for SftpApp {
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
-                if win32::icon_button(ui, true, win32::Icon::Connect, "Connect… (opens a new session tab)").clicked() { self.dialog = Some(Dialog::Profiles); }
+                // Connect button with an attached menu of saved profiles.
+                let mut quick = None;
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if win32::icon_button(ui, true, win32::Icon::Connect, "Connect… (opens a new session tab)").clicked() {
+                        self.dialog = Some(Dialog::Profiles);
+                    }
+                    let menu_id = ui.id().with("quick_connect");
+                    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
+                    let arrow = win32::dropdown_arrow(ui, true, open, "Connect to a saved profile");
+                    egui::Popup::menu(&arrow).id(menu_id).show(|ui| {
+                        win32::menu_item_style(ui.style_mut());
+                        ui.set_min_width(180.0);
+                        if self.saved_profiles.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No saved profiles"));
+                        }
+                        for (index, profile) in self.saved_profiles.iter().enumerate() {
+                            let label = format!("{}  ({}@{})", profile.name, profile.username, profile.host);
+                            if ui.button(label).clicked() {
+                                quick = Some(index);
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Manage profiles…").clicked() {
+                            self.dialog = Some(Dialog::Profiles);
+                        }
+                    });
+                });
+                if let Some(index) = quick { self.quick_connect(index); }
                 if win32::icon_button(ui, can_close, win32::Icon::Disconnect, "Disconnect and close this session").clicked() { self.disconnect_active(); }
                 win32::toolbar_separator(ui);
                 if win32::icon_button(ui, can_upload, win32::Icon::Upload, "Upload selected local items").clicked() { self.upload_selected(); }
@@ -2344,8 +2408,8 @@ impl eframe::App for SftpApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if self.session().queue_tab == QueueTab::Statistics {
-            // Keep the graph moving and sampling while it is visible.
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            // Keep the graph scrolling smoothly (about 30 frames per second) while it is visible.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
 }
@@ -2486,12 +2550,9 @@ fn turbo_status_text(session: &Session) -> (String, String) {
     (short, details)
 }
 
+/// A speed in MiB/s, written in the chosen units.
 fn speed_text(mib_per_second: f64) -> String {
-    if mib_per_second >= 1.0 {
-        format!("{mib_per_second:.1} MiB/s")
-    } else {
-        format!("{:.0} KiB/s", mib_per_second * 1024.0)
-    }
+    crate::units::speed_mib(mib_per_second)
 }
 
 const ROW_HEIGHT: f32 = 18.0;
@@ -2592,7 +2653,8 @@ fn paint_speed_graph(
         return;
     }
     let peak = samples.iter().map(|sample| sample.down.max(sample.up)).fold(0.0_f64, f64::max);
-    let y_max = nice_ceiling(peak.max(0.5));
+    // The axis ends on a round number in the units shown.
+    let y_max = crate::units::nice_speed_ceiling_mib(peak.max(0.5));
     let x_of = |at: Instant| plot.right() - now.saturating_duration_since(at).as_secs_f32() / span.as_secs_f32() * plot.width();
     let y_of = |value: f64| plot.bottom() - (value / y_max).clamp(0.0, 1.0) as f32 * plot.height();
 
@@ -2616,7 +2678,10 @@ fn paint_speed_graph(
     let series = |pick: fn(&SpeedSample) -> f64| -> Vec<egui::Pos2> {
         let mut points = Vec::with_capacity(samples.len() + 4);
         let mut previous: Option<&SpeedSample> = None;
-        for sample in samples {
+        for (index, sample) in samples.iter().enumerate() {
+            // Moving average over about one second, so the 250 ms samples do not jitter.
+            let neighbours = &samples[index.saturating_sub(2)..(index + 3).min(samples.len())];
+            let smoothed = neighbours.iter().map(pick).sum::<f64>() / neighbours.len() as f64;
             if let Some(last) = previous {
                 if sample.at.saturating_duration_since(last.at) > Duration::from_millis(2500) {
                     points.push(egui::pos2(x_of(last.at + Duration::from_secs(1)), y_of(0.0)));
@@ -2624,7 +2689,7 @@ fn paint_speed_graph(
                     points.push(egui::pos2(x_of(before), y_of(0.0)));
                 }
             }
-            points.push(egui::pos2(x_of(sample.at), y_of(pick(sample))));
+            points.push(egui::pos2(x_of(sample.at), y_of(smoothed)));
             previous = Some(sample);
         }
         if let Some(last) = previous {
@@ -2689,15 +2754,6 @@ fn paint_speed_graph(
     }
 }
 
-/// Smallest 1, 2 or 5 × 10ⁿ that is at least `value`.
-fn nice_ceiling(value: f64) -> f64 {
-    let magnitude = 10_f64.powf(value.log10().floor());
-    [1.0, 2.0, 5.0, 10.0]
-        .iter()
-        .map(|factor| factor * magnitude)
-        .find(|candidate| *candidate >= value)
-        .unwrap_or(10.0 * magnitude)
-}
 
 /// "45 s" or "5 min".
 fn short_duration(duration: Duration) -> String {
@@ -2913,12 +2969,9 @@ fn duration_text(duration: Duration) -> String {
     }
 }
 
+/// A size, written in the chosen units.
 fn size_text(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut index = 0;
-    while value >= 1024.0 && index < UNITS.len() - 1 { value /= 1024.0; index += 1; }
-    if index == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[index]) }
+    crate::units::size(bytes)
 }
 
 #[cfg(test)]

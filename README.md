@@ -1,121 +1,49 @@
 # Rust SFTP Client
 
-A native Rust desktop SFTP client with an information-dense, analyst-workstation interface inspired by the Tiramisu-TL WebUI. The application is rendered directly with eframe/egui; it does not embed a web frontend.
+A native desktop SFTP client for Windows and Linux, written in Rust with egui, with a dual-pane
+Windows Classic–style interface (light or dark).
 
-> **Status:** The native dual-pane UI, local and remote filesystem browsing, password and private-key SSH authentication, explicit SSH host-key pinning, segmented downloads, and recursive drag-and-drop transfers are integrated. SSH-agent authentication is not implemented yet. Build and runtime verification are still required on the target system.
+## Features
 
-## Technology
-
-- **eframe + egui** for the native desktop interface.
-- **Tokio** for asynchronous networking and transfer orchestration.
-- **russh 0.63.x** for SSH transport and authentication.
-- **russh-sftp 3.0.1** for SFTP v3.
-- **serde** for profile and transfer-state serialization.
-
-There is no Tauri, React, TypeScript, Vite, Node.js, or NPM build step.
-
-## Build
-
-```bash
-cargo test
-cargo build --release
-```
-
-The executable is written to `target/release/rust-sftp-client`.
-
-Every push to `main` is built and tested on Linux and Windows by GitHub Actions
-([.github/workflows/build.yml](.github/workflows/build.yml)). The binaries are attached to each
-run as artifacts (`rust-sftp-client-<version>-linux-x86_64.tar.gz` and `rust-sftp-client-<version>-windows-x86_64.exe`)
-and kept for 30 days. A build can also be started by hand from the Actions tab.
-
-When both builds succeed on a push to `main`, a GitHub Release is published automatically,
-tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.4.3-build.42`), with both binaries,
-a `SHA256SUMS.txt` file and notes listing the changes since the previous release. Manual runs
-only build.
+- **Connections:** saved profiles, password or (unencrypted) private-key login, passwords optionally kept
+  in the system credential store, SSH host keys pinned by SHA-256 fingerprint, one tab per connection,
+  and a quick-connect menu next to the Connect button.
+- **Browsing:** local and remote panes with sorting, Ctrl/Shift multi-select, filtering, recursive
+  search, show/hide hidden items, new folder, rename and delete. The local pane reopens where you left off.
+- **Transfers:** drag and drop or right-click to upload and download files and folders; large downloads
+  are split into parallel segments and resume after interruptions. Failed transfers can be retried.
+- **Queue panel:** Pending, Complete and Failed transfers, the session's log, and a statistics tab with a
+  live speed graph.
+- **Settings:** transfer and network tuning, logging to files, theme, and size units (binary, decimal,
+  or speeds in bits).
 
 ## Faster downloads with rsftp-turbo (optional)
 
-`rsftp-turbo` is a small server-side helper that downloads files over UDP instead of SFTP, avoiding
-SFTP's per-request round trips. Browsing, uploads and logins still use SSH/SFTP, and downloads fall
-back to SFTP automatically when the server has no helper or UDP is blocked.
+`rsftp-turbo` is a small server helper that downloads files over UDP instead of SFTP and lists folders in
+one round trip. Logins and permissions stay with SSH: the helper runs as the logged-in user, every UDP
+packet is encrypted and authenticated (AES-256-GCM), and every segment is checked against a SHA-256
+digest. Downloads fall back to SFTP automatically when the helper is missing or UDP is blocked.
 
-* Install on the server from the `rsftp-turbo-<version>-linux-x86_64.tar.gz` release asset (`sudo ./install.sh`; the bare `rsftp-turbo-<version>-linux-x86_64` binary is attached too, for updating an existing install)
-  and open UDP port 6767. See [crates/turbo-server/dist/README.md](crates/turbo-server/dist/README.md).
-* Each download is authorised over the SSH session (`rsftp-turbo ticket` runs as the logged-in user,
-  so only files that user can read are offered), every UDP packet is encrypted and authenticated with
-  AES-256-GCM, lost packets are re-requested, and every segment is verified against a SHA-256 digest
-  computed on the server and downloaded again if it does not match.
-* Each worker asks for its next segment's SHA-256 while the current segment's last data arrives, so the
-  server's read-and-hash time is mostly hidden. All downloads of a connection share at most 16 segments in
-  flight (more if *Workers per file* is higher), which keeps many simultaneous files from overrunning the
-  link. A segment that still fails after 5 attempts is left to SFTP while turbo carries on with the rest;
-  turbo gives up on a file only after 3 segments in a row fail.
-* Downloads keep their progress in a hidden `.<name>.rsftp-part` file: if turbo fails part-way, SFTP
-  finishes only the missing pieces, and an interrupted download resumes where it stopped (when the
-  remote file is unchanged). Stopping a transfer deletes its partial file.
-* Toggle it under *Settings → Network Settings → UDP downloads*. The log records which protocol was used. Right after connecting, the client checks that the service answers over UDP (by fetching the first few KiB of a small system file such as `/etc/hostname`), so the status bar shows *Turbo: ready* or the reason it is unavailable before the first download.
-* Remote directory listings also go through the helper when the server's `rsftp-turbo` supports it: one round trip over the existing SSH connection instead of several SFTP requests, which helps with large folders and distant servers. It needs no UDP. Older helpers and servers without one are listed over SFTP. The turbo status tooltip shows which method is in use. Logging in and permissions stay with SSH: the helper runs as the logged-in user.
+Install it on the server from the `rsftp-turbo-<version>-linux-x86_64.tar.gz` release asset with
+`sudo ./install.sh`, then open UDP port 6767. Details:
+[crates/turbo-server/dist/README.md](crates/turbo-server/dist/README.md).
 
-## Troubleshooting startup
+## Building
 
-The Windows build draws with Direct3D 12 (via wgpu), which also works in virtual machines without GPU
-drivers; Linux uses OpenGL. If the preferred renderer fails, the app restarts itself once with the other
-one. If both fail, an error dialog explains why and the details are appended to
-`startup-error.log` in the config folder (`~/.config/rust-sftp-client/` or
-`%USERPROFILE%\.config\rust-sftp-client\`). A renderer can be forced with the
-`RUST_SFTP_CLIENT_RENDERER` environment variable (`wgpu` or `glow`).
+```bash
+cargo test --workspace
+cargo build --release          # target/release/rust-sftp-client
+```
 
-## Implemented workflows
+Every push to `main` is built and tested on Linux and Windows by GitHub Actions, and a release
+`v<version>-build.<run>` (e.g. `v0.4.3-build.42`) is published with both clients, the rsftp-turbo
+package and `SHA256SUMS.txt`.
 
-- Save and load non-secret connection profiles, optionally with a remote folder to open after connecting (the home folder otherwise).
-- Authenticate with SSH passwords or an unencrypted private-key file.
-- Verify server keys using SHA-256 fingerprints. Unknown keys are rejected until explicitly trusted; a changed pinned key is rejected and cannot be silently replaced.
-- Optionally save passwords per login (user, host and port) in the system credential store: Windows Credential Manager, or a Secret Service keyring such as GNOME Keyring or KWallet on Linux. Passwords are never written to the profiles file; a password is saved only after it has logged in successfully or when a profile is saved with one entered.
-- Store trusted fingerprints in `~/.config/rust-sftp-client/known_hosts.json`.
-- Browse remote directories, navigate into directories and to the parent, and filter remote entries.
-- Select several items in either pane with Ctrl/Command-click (toggle) and Shift-click (range), then upload or download them together; sort either pane by clicking the Name, Size, Modified or Type column header (folders stay first).
-- The local pane opens in the folder browsed last time the app ran.
-- Create folders in either pane with the *New folder* button next to Refresh, or by right-clicking an item or the empty space below the list.
-- The eye button on the toolbar shows or hides hidden items in both panes (dot files, and on Windows files marked hidden); hidden items are shown by default and the choice is remembered.
-- Tick *Recursive* next to a pane's filter box to search every folder below the current one for names containing the filter text. Results show their relative folder and can be transferred, dragged, renamed and deleted like any item; double-clicking a found folder opens it. Remote searches list folders through the rsftp-turbo helper when available, else SFTP. Symbolic links are not followed and at most 5000 results are listed.
-- Drag local files or folders onto the remote pane to upload them recursively; each discovered file appears as its own transfer row.
-- Drag remote files or folders onto the local pane to download them recursively; each discovered file appears as its own transfer row and large files retain segmented downloads.
-- Stop a single transfer (or a whole folder transfer) or all transfers from the transfer queue's right-click menu. Stopped transfers clean up after themselves: partial downloads' temporary files and partially uploaded remote files are removed.
-- Show per-file queued, active, completed, and failed transfers with independent byte progress, elapsed time, and ETA, on Pending, Complete and Failed tabs of the queue panel.
-- A Log tab shows the selected session's events (kept in memory, whether or not file logging is on), and a Statistics tab graphs the session's download and upload speed over the last 1–30 minutes with peak, average and total figures.
-- The Statistics graph draws dotted lines at the average download (red) and upload (magenta) speed; averages count only the seconds in which that direction was transferring.
-- *Settings → Appearance* switches between the light Windows Classic theme and a dark theme.
-- Download large files through the existing bounded, retrying segmented range-download engine.
-- Open connection, password, host-key trust, error, and transfer-settings prompts in separate native windows.
+## Troubleshooting
 
-## Segmented downloads
-
-1. Read remote metadata and obtain the file size.
-2. Split large files into contiguous, non-overlapping byte ranges.
-3. Open an independent SFTP file handle for each range and seek to its starting offset.
-4. Create one pre-sized temporary output file.
-5. Stream each range directly to its assigned byte offsets using positional writes (Unix `write_at`, Windows `seek_write`) and a bounded memory buffer.
-6. Retry failed ranges up to three times; retries overwrite only that segment's byte range.
-7. Wait for all workers to stop, flush the output, validate its size, and rename it into place.
-8. Emit byte and segment progress to the desktop transfer queue.
-
-All segments share one authenticated SFTP session and use independent SFTP file handles. Persistent cross-process resume and parallel independent SSH sessions are not implemented.
-
-## Initial transfer defaults
-
-| Setting | Default |
-|---|---:|
-| Segmentation threshold | 64 MiB |
-| Target segment size | 8 MiB |
-| Maximum segments per file | 8 |
-| Maximum concurrent transfers | 4 |
-| Segment retry attempts | 3 |
-
-## Security notes
-
-- Passwords are not persisted in connection profiles.
-- Unknown SSH host keys require an explicit trust action.
-- Changed host keys are rejected; the existing pin is not overwritten.
-- Private-key contents and passwords are not written to profile storage.
-
-The trust-store file should be protected by the local user's filesystem permissions. Encrypted private-key passphrases, OS keychain integration, SSH-agent authentication, upload, and transfer cancellation remain future work.
+- **The app does not start:** Windows draws with Direct3D 12, Linux with OpenGL; if one renderer fails the
+  app retries with the other. Details go to `startup-error.log` in `~/.config/rust-sftp-client/`
+  (`%USERPROFILE%\.config\rust-sftp-client\` on Windows). Force a renderer with
+  `RUST_SFTP_CLIENT_RENDERER=wgpu` or `glow`.
+- **What happened?** The Log tab of the queue panel shows every connection, listing, transfer and file
+  operation of the session. Turn on *Settings → Logging* to also write them to files.

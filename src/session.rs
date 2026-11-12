@@ -298,7 +298,8 @@ pub struct SpeedSample {
 
 /// How far back the statistics graph can look.
 pub const SPEED_HISTORY: Duration = Duration::from_secs(30 * 60);
-const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Transfer speeds are measured every 250 ms; the graph samples them as often.
+const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 pub enum QueueEvent {
     Started { id: usize, state: String },
@@ -366,6 +367,8 @@ pub struct Session {
     /// The pending listing is the profile's default folder: on failure, show
     /// the home folder instead.
     home_fallback: bool,
+    /// When the pending listing was requested, and for which path.
+    list_started: Option<(Instant, String)>,
 
     pub transfers: Vec<TransferItem>,
     pub queue_tab: QueueTab,
@@ -424,6 +427,7 @@ impl Session {
             connect_rx: None,
             list_rx: None,
             home_fallback: false,
+            list_started: None,
             transfers: Vec::new(),
             queue_tab: QueueTab::Pending,
             next_transfer_id: 1,
@@ -473,6 +477,12 @@ impl Session {
 
     fn log_event(&self, category: Category, severity: Severity, msgid: &str, message: &str) {
         self.logger.log(&self.log, category, severity, msgid, message);
+    }
+
+    /// A callback that writes connection events to this session's log.
+    fn event_log(&self) -> crate::connection::EventLog {
+        let (logger, log) = (Arc::clone(&self.logger), self.log.clone());
+        Arc::new(move |severity, msgid, message| logger.log(&log, Category::Connection, severity, msgid, message))
     }
 
     /// Log lines of this session, oldest first.
@@ -596,8 +606,12 @@ impl Session {
                     });
                 }
             }
+            self.log_event(Category::Connection, Severity::Info, "LIST", &format!(
+                "Listed local {}: {} entries", self.path.display(), self.local_entries.len()
+            ));
         } else {
             self.status = format!("Cannot read {}", self.path.display());
+            self.log_event(Category::Connection, Severity::Error, "LIST", &format!("Could not list local {}", self.path.display()));
         }
         self.local_entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     }
@@ -634,8 +648,9 @@ impl Session {
         let (tx, rx) = std_mpsc::channel();
         self.connect_rx = Some(rx);
         self.status = format!("Connecting to {}:{} …", profile.host, profile.port);
+        let events = self.event_log();
         self.runtime.spawn(async move {
-            let result = SftpConnection::connect(&profile, password.as_deref(), trusted.as_deref(), network).await;
+            let result = SftpConnection::connect(&profile, password.as_deref(), trusted.as_deref(), network, events).await;
             let _ = tx.send(result);
         });
     }
@@ -743,6 +758,7 @@ impl Session {
         let requested = if path.is_empty() { ".".to_owned() } else { path.to_owned() };
         let (tx, rx) = std_mpsc::channel();
         self.list_rx = Some(rx);
+        self.list_started = Some((Instant::now(), requested.clone()));
         self.status = format!("Reading remote directory {requested} …");
         self.runtime.spawn(async move {
             let result = async {
@@ -777,6 +793,20 @@ impl Session {
         let result = self.list_rx.as_ref().and_then(|rx| rx.try_recv().ok())?;
         self.list_rx = None;
         let fall_back = std::mem::take(&mut self.home_fallback);
+        let (started, requested) = self.list_started.take().unwrap_or_else(|| (Instant::now(), String::new()));
+        let elapsed = started.elapsed().as_millis();
+        let via = match self.connection.as_ref().and_then(|connection| connection.listing_via_helper()) {
+            Some(true) => "the rsftp-turbo helper",
+            _ => "SFTP",
+        };
+        match &result {
+            Ok((path, entries)) => self.log_event(Category::Connection, Severity::Info, "LIST", &format!(
+                "Listed remote {path}: {} entries via {via} in {elapsed} ms", entries.len()
+            )),
+            Err(error) => self.log_event(Category::Connection, Severity::Error, "LIST", &format!(
+                "Could not list remote {requested}: {error}"
+            )),
+        }
         match result {
             Ok((path, entries)) => {
                 self.remote_path = path;

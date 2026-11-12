@@ -46,6 +46,9 @@ pub struct DirEntry {
 const TURBO_PROBE_FILES: [&str; 3] = ["/etc/hostname", "/etc/os-release", "/etc/passwd"];
 const TURBO_PROBE_BYTES: u64 = 4096;
 
+/// Writes one line to the session's log: (severity, message id, message).
+pub type EventLog = Arc<dyn Fn(crate::logging::Severity, &str, &str) + Send + Sync>;
+
 /// Whether the server offers rsftp-turbo, learned on first use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurboState {
@@ -160,6 +163,8 @@ pub struct SftpConnection {
     turbo: Mutex<TurboInfo>,
     /// The ticket helper; `None` once it has exited or failed.
     tickets: tokio::sync::Mutex<Option<TicketStream>>,
+    /// The session's log.
+    events: EventLog,
     /// `HELPER_LISTING_*`: learned from the first listing.
     helper_listing: AtomicU8,
     /// Turbo segments in flight across all downloads of this connection.
@@ -179,7 +184,9 @@ impl SftpConnection {
         password: Option<&str>,
         trusted_fingerprint: Option<&str>,
         network: NetworkSettings,
+        events: EventLog,
     ) -> Result<Self, ConnectError> {
+        use crate::logging::Severity;
         profile.validate().map_err(|e| ConnectError::Ssh(e.to_string()))?;
         if profile.auth_method == AuthMethod::SshAgent {
             return Err(ConnectError::Ssh("SSH-agent authentication is not implemented".into()));
@@ -206,7 +213,17 @@ impl SftpConnection {
                 return Err(ConnectError::Ssh(error.to_string()));
             }
         };
+        events(Severity::Info, "CONNECT", &format!(
+            "SSH connection established; host key verified ({})",
+            trusted_fingerprint.unwrap_or("not pinned")
+        ));
 
+        let method = match profile.auth_method {
+            AuthMethod::Password => "a password".to_owned(),
+            AuthMethod::PrivateKey => format!("the private key {}", profile.private_key_path.as_deref().unwrap_or("?")),
+            AuthMethod::SshAgent => "the SSH agent".to_owned(),
+        };
+        events(Severity::Info, "AUTH", &format!("Authenticating as {} with {method}", profile.username));
         let authenticated = match profile.auth_method {
             AuthMethod::Password => {
                 let password = password.ok_or_else(|| ConnectError::Ssh("Password is required".into()))?;
@@ -228,18 +245,27 @@ impl SftpConnection {
             AuthMethod::SshAgent => false,
         };
         if !authenticated {
+            events(Severity::Warning, "AUTH", &format!("Authentication failed: the server rejected {method} for {}", profile.username));
             return Err(ConnectError::AuthenticationFailed);
         }
+        events(Severity::Notice, "AUTH", &format!("Authentication succeeded as {}", profile.username));
 
         let sftp = Arc::new(open_sftp_channel(&ssh, &network).await?);
         // Reserve the rsftp-turbo ticket channel before the extra SFTP
         // channels take the remaining session slots (OpenSSH MaxSessions).
         let (tickets, turbo_state) = if network.turbo {
             match open_ticket_stream(&ssh).await {
-                Ok(stream) => (Some(stream), TurboState::Untested),
-                Err(reason) => (None, TurboState::Unavailable(reason)),
+                Ok(stream) => {
+                    events(Severity::Info, "TURBO", "Started the rsftp-turbo helper over SSH");
+                    (Some(stream), TurboState::Untested)
+                }
+                Err(reason) => {
+                    events(Severity::Warning, "TURBO", &format!("rsftp-turbo helper not available ({reason}); downloads use SFTP"));
+                    (None, TurboState::Unavailable(reason))
+                }
             }
         } else {
+            events(Severity::Info, "TURBO", "rsftp-turbo is turned off in the settings; downloads use SFTP");
             (None, TurboState::Disabled)
         };
         let mut channels = vec![Arc::clone(&sftp)];
@@ -251,8 +277,10 @@ impl SftpConnection {
                 Err(_) => break,
             }
         }
+        events(Severity::Info, "SFTP", &format!("Opened {} SFTP channel(s)", channels.len()));
 
         Ok(Self {
+            events,
             ssh,
             sftp,
             channels,
@@ -304,7 +332,14 @@ impl SftpConnection {
                     self.helper_listing.store(HELPER_LISTING_YES, Ordering::Relaxed);
                     return result;
                 }
-                None => self.helper_listing.store(HELPER_LISTING_NO, Ordering::Relaxed),
+                None => {
+                    self.helper_listing.store(HELPER_LISTING_NO, Ordering::Relaxed);
+                    (self.events)(
+                        crate::logging::Severity::Info,
+                        "LIST",
+                        "Directory listings use SFTP (the rsftp-turbo helper is not running or too old to list)",
+                    );
+                }
             }
         }
         self.sftp_list(path).await
@@ -795,7 +830,21 @@ impl SftpConnection {
     /// Checks right after connecting that rsftp-turbo answers, so its status
     /// is known before the first download. Call after `begin_turbo_probe`.
     pub async fn probe_turbo(&self) {
+        use crate::logging::Severity;
+        (self.events)(Severity::Info, "TURBO", "Checking the rsftp-turbo service over UDP");
         let state = self.turbo_probe_state().await;
+        match &state {
+            TurboState::Ready => (self.events)(Severity::Notice, "TURBO", "rsftp-turbo service confirmed over UDP; downloads will use it"),
+            TurboState::Unavailable(reason) => {
+                (self.events)(Severity::Warning, "TURBO", &format!("rsftp-turbo service unavailable ({reason}); downloads use SFTP"))
+            }
+            TurboState::Untested => (self.events)(
+                Severity::Info,
+                "TURBO",
+                "Could not check rsftp-turbo now (no small readable file to probe); the first download will",
+            ),
+            _ => {}
+        }
         if let Ok(mut info) = self.turbo.lock() {
             // A download may have settled the state in the meantime.
             if info.state == TurboState::Testing {
@@ -843,12 +892,21 @@ impl SftpConnection {
     }
 
     fn set_turbo_state(&self, state: TurboState) {
+        if let TurboState::Unavailable(reason) = &state {
+            let was = self.turbo_info().state;
+            if !matches!(was, TurboState::Unavailable(_)) {
+                (self.events)(crate::logging::Severity::Warning, "TURBO", &format!(
+                    "rsftp-turbo unavailable for this connection ({reason}); falling back to SFTP"
+                ));
+            }
+        }
         if let Ok(mut info) = self.turbo.lock() {
             info.state = state;
         }
     }
 
     fn note_turbo_fallback(&self, reason: String) {
+        (self.events)(crate::logging::Severity::Warning, "TURBO", &format!("Falling back to SFTP: {reason}"));
         if let Ok(mut info) = self.turbo.lock() {
             info.last_fallback = Some(reason);
         }
