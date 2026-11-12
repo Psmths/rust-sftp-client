@@ -152,6 +152,39 @@ pub fn select_click<T: Clone + PartialEq>(
     }
 }
 
+/// What a transfer row moves, so it can be retried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Job {
+    /// One remote file through the segmented download engine.
+    DownloadFile { remote: String, local: PathBuf, size: u64 },
+    /// A remote file or folder, recursively.
+    DownloadPath { remote: String, local: PathBuf, dir: bool },
+    /// A local file or folder, recursively.
+    UploadPath { local: PathBuf, remote: String, dir: bool },
+}
+
+impl Job {
+    /// The job of one file of a folder transfer, from the relative name its
+    /// progress reports (local path syntax, relative to the folder).
+    pub fn child(&self, relative: &str) -> Job {
+        let remote_relative = relative.replace('\\', "/");
+        match self {
+            Job::DownloadPath { remote, local, dir: true } => Job::DownloadPath {
+                remote: crate::app::join_remote(remote, &remote_relative),
+                local: local.join(relative),
+                dir: false,
+            },
+            Job::UploadPath { local, remote, dir: true } => Job::UploadPath {
+                local: local.join(relative),
+                remote: crate::app::join_remote(remote, &remote_relative),
+                dir: false,
+            },
+            // The transfer was a single file: its one row is that file.
+            other => other.clone(),
+        }
+    }
+}
+
 pub struct TransferItem {
     pub id: usize,
     pub operation_id: Option<usize>,
@@ -172,6 +205,8 @@ pub struct TransferItem {
     pub protocol: Option<&'static str>,
     /// Diagnostic summary of a finished turbo download.
     pub details: Option<String>,
+    /// What to run again for "Retry".
+    pub job: Option<Job>,
 }
 
 impl TransferItem {
@@ -193,6 +228,7 @@ impl TransferItem {
             download,
             protocol: None,
             details: None,
+            job: None,
         }
     }
 
@@ -304,6 +340,8 @@ pub struct Session {
     queue_rx: std_mpsc::Receiver<QueueEvent>,
     transfer_slots: Arc<Semaphore>,
     transfer_records: HashMap<usize, TransferRecord>,
+    /// Job of each running operation, for the rows of its files.
+    operation_jobs: HashMap<usize, Job>,
     /// Cancel tokens of operations that have not finished, by operation id.
     operations: HashMap<usize, CancelToken>,
     /// Operations the user stopped; their failure is shown as "Cancelled".
@@ -352,6 +390,7 @@ impl Session {
             queue_rx,
             transfer_slots: Arc::new(Semaphore::new(settings.max_concurrent_transfers.max(1) as usize)),
             transfer_records: HashMap::new(),
+            operation_jobs: HashMap::new(),
             operations: HashMap::new(),
             cancelled_operations: HashSet::new(),
             selected_transfer: None,
@@ -746,8 +785,7 @@ impl Session {
 
     /// Downloads the selected remote files (not folders) into the local folder.
     pub fn download_selected(&mut self, settings: TransferSettings) {
-        let Some(connection) = self.connection.clone() else { return; };
-        if self.remote_selected.is_empty() { return; }
+        if !self.is_connected() || self.remote_selected.is_empty() { return; }
         let files: Vec<RemoteEntry> = self.remote_entries.iter()
             .filter(|entry| self.remote_selected.contains(&entry.path) && !entry.dir)
             .cloned().collect();
@@ -757,53 +795,116 @@ impl Session {
         }
         let count = files.len();
         for entry in files {
-            let id = self.next_id();
-            let destination = self.path.join(&entry.name);
-            self.transfers.push(TransferItem::queued(id, entry.name.clone(), destination.clone(), entry.size, true));
-            self.record(id, "download", entry.path.clone(), destination.display().to_string());
-            let connection = connection.clone();
-            self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
-                connection.download(&entry.path, &destination, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
-            });
+            let local = self.path.join(&entry.name);
+            self.start_job(Job::DownloadFile { remote: entry.path, local, size: entry.size }, settings);
         }
         self.status = format!("Queued {count} download(s) to {}", self.path.display());
     }
 
-    /// Uploads a local file or folder (recursively) into the current remote folder.
-    pub fn queue_upload(&mut self, local_path: PathBuf) {
+    /// Queues `job` as a new transfer. `settings` only matter for downloads.
+    fn start_job(&mut self, job: Job, settings: TransferSettings) -> bool {
         let Some(connection) = self.connection.clone() else {
-            self.status = "Connect to a remote server before uploading".into();
+            self.status = "Connect to the server first".into();
+            return false;
+        };
+        let id = self.next_id();
+        let name_of = |path: &str| path.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or(path).to_owned();
+        match job.clone() {
+            Job::DownloadFile { remote, local, size } => {
+                self.transfers.push(TransferItem::queued(id, name_of(&remote), local.clone(), size, true));
+                self.record(id, "download", remote.clone(), local.display().to_string());
+                self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
+                    connection.download(&remote, &local, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
+                });
+            }
+            Job::DownloadPath { remote, local, .. } => {
+                self.transfers.push(TransferItem::queued(id, name_of(&remote), local.clone(), 0, true));
+                self.record(id, "download", remote.clone(), local.display().to_string());
+                self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
+                    connection.download_path(&remote, &local, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
+                });
+            }
+            Job::UploadPath { local, remote, .. } => {
+                let total = fs::metadata(&local).map(|meta| if meta.is_file() { meta.len() } else { 0 }).unwrap_or(0);
+                self.transfers.push(TransferItem::queued(id, name_of(&local.to_string_lossy()), local.clone(), total, false));
+                self.record(id, "upload", local.display().to_string(), remote.clone());
+                self.spawn_transfer(id, "Uploading", move |progress, cancel| async move {
+                    connection.upload_path(&local, &remote, Some(progress), cancel).await.map_err(|e| e.to_string())
+                });
+            }
+        }
+        if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+            item.job = Some(job.clone());
+        }
+        self.operation_jobs.insert(id, job);
+        true
+    }
+
+    /// Whether the transfer row `id` can be retried.
+    pub fn can_retry(&self, id: usize) -> bool {
+        self.is_connected() && self.transfers.iter().any(|item| item.id == id && item.is_failed() && item.job.is_some())
+    }
+
+    /// Runs a failed or stopped transfer row again as a new transfer; the
+    /// failed row is removed. A row of a folder transfer retries just its file.
+    pub fn retry(&mut self, id: usize, settings: TransferSettings) {
+        let Some((name, job)) = self.transfers.iter()
+            .find(|item| item.id == id && item.is_failed())
+            .and_then(|item| Some((item.name.clone(), item.job.clone()?)))
+        else {
             return;
         };
+        if self.start_job(job, settings) {
+            self.status = format!("Retrying {name}");
+            self.transfers.retain(|item| item.id != id);
+            if self.selected_transfer == Some(id) {
+                self.selected_transfer = None;
+            }
+        }
+    }
+
+    /// Retries every failed or stopped row; returns how many were queued.
+    pub fn retry_all_failed(&mut self, settings: TransferSettings) -> usize {
+        let ids: Vec<usize> = self.transfers.iter().filter(|item| item.is_failed() && item.job.is_some()).map(|item| item.id).collect();
+        for &id in &ids {
+            self.retry(id, settings);
+        }
+        if !ids.is_empty() {
+            self.status = format!("Retrying {} transfer(s)", ids.len());
+        }
+        ids.len()
+    }
+
+    /// Uploads a local file or folder (recursively) into the current remote folder.
+    pub fn queue_upload(&mut self, local_path: PathBuf) {
+        if !self.is_connected() {
+            self.status = "Connect to a remote server before uploading".into();
+            return;
+        }
         let Some(name) = local_path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
             self.status = "Cannot upload this filesystem path".into();
             return;
         };
         let remote_destination = crate::app::join_remote(&self.remote_path, &name);
-        let total = fs::metadata(&local_path).map(|meta| if meta.is_file() { meta.len() } else { 0 }).unwrap_or(0);
-        let id = self.next_id();
-        self.transfers.push(TransferItem::queued(id, name.clone(), local_path.clone(), total, false));
-        self.record(id, "upload", local_path.display().to_string(), remote_destination.clone());
-        let destination = remote_destination.clone();
-        self.spawn_transfer(id, "Uploading", move |progress, cancel| async move {
-            connection.upload_path(&local_path, &destination, Some(progress), cancel).await.map_err(|e| e.to_string())
-        });
-        self.status = format!("Queued recursive upload: {name} → {remote_destination}");
+        let dir = local_path.is_dir();
+        let job = Job::UploadPath { local: local_path, remote: remote_destination.clone(), dir };
+        // Upload jobs do not use transfer settings.
+        if self.start_job(job, TransferSettings::default()) {
+            self.status = format!("Queued recursive upload: {name} → {remote_destination}");
+        }
     }
 
     /// Downloads a remote file or folder (recursively) into the local folder.
     pub fn queue_download(&mut self, remote_path: String, settings: TransferSettings) {
-        let Some(connection) = self.connection.clone() else { return; };
+        if !self.is_connected() { return; }
         let name = remote_path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(&remote_path).to_owned();
         let destination = self.path.join(&name);
-        let id = self.next_id();
-        self.transfers.push(TransferItem::queued(id, name, destination.clone(), 0, true));
-        self.record(id, "download", remote_path.clone(), destination.display().to_string());
-        let (source, target) = (remote_path.clone(), destination.clone());
-        self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
-            connection.download_path(&source, &target, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
-        });
-        self.status = format!("Queued recursive download: {remote_path} → {}", destination.display());
+        // From the listing; an unknown path is treated as a folder.
+        let dir = self.remote_entries.iter().find(|entry| entry.path == remote_path).is_none_or(|entry| entry.dir);
+        let job = Job::DownloadPath { remote: remote_path.clone(), local: destination.clone(), dir };
+        if self.start_job(job, settings) {
+            self.status = format!("Queued recursive download: {remote_path} → {}", destination.display());
+        }
     }
 
     pub fn speed(&self, state: &str) -> f64 {
@@ -847,6 +948,7 @@ impl Session {
                 let now = Instant::now();
                 let mut child = TransferItem::queued(child_id, relative.clone(), PathBuf::from(relative), progress.total_bytes, download);
                 child.operation_id = Some(id);
+                child.job = self.operation_jobs.get(&id).map(|job| job.child(relative));
                 child.started_at = Some(now);
                 child.last_speed_sample_at = Some(now);
                 child.state = child_state;
@@ -918,6 +1020,7 @@ impl Session {
         self.operations.remove(&id);
         let cancelled = self.cancelled_operations.remove(&id) && result.is_err();
         let child_exists = self.transfers.iter().any(|item| item.operation_id == Some(id));
+        self.operation_jobs.remove(&id);
         if let Some(record) = self.transfer_records.remove(&id) {
             let elapsed = record.started.map(|start| now.saturating_duration_since(start)).unwrap_or_default();
             let (severity, message) = match &result {
@@ -1043,6 +1146,23 @@ mod tests {
         order.toggle(SortColumn::Modified);
         sort_rows(&mut rows, order);
         assert_eq!(names(&rows), ["zdir", "adir", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn folder_rows_retry_their_own_file() {
+        let download = Job::DownloadPath { remote: "/srv/media".into(), local: PathBuf::from("/home/u/media"), dir: true };
+        assert_eq!(
+            download.child("show/ep1.mkv"),
+            Job::DownloadPath { remote: "/srv/media/show/ep1.mkv".into(), local: PathBuf::from("/home/u/media/show/ep1.mkv"), dir: false }
+        );
+        let upload = Job::UploadPath { local: PathBuf::from("/home/u/docs"), remote: "/srv/docs".into(), dir: true };
+        assert_eq!(
+            upload.child("a/b.txt"),
+            Job::UploadPath { local: PathBuf::from("/home/u/docs/a/b.txt"), remote: "/srv/docs/a/b.txt".into(), dir: false }
+        );
+        // A single file's row is the file itself, even if a folder shares its name.
+        let file = Job::DownloadPath { remote: "/srv/a".into(), local: PathBuf::from("/home/u/a"), dir: false };
+        assert_eq!(file.child("a"), file);
     }
 
     #[test]

@@ -1363,6 +1363,9 @@ impl SftpApp {
                 let any_active = session.has_active_operations();
                 let mut select = None;
                 let mut stop = None;
+                // Some(Some(id)): retry that row; Some(None): retry every failed row.
+                let mut retry = None;
+                let failed_count = session.transfers.iter().filter(|item| item.is_failed() && item.job.is_some()).count();
                 for item in session.transfers.iter().filter(|item| item.tab() == tab) {
                     // The whole row is one click target; the cells are drawn on top of it.
                     let (row_rect, row_response) = ui.allocate_exact_size(
@@ -1378,6 +1381,18 @@ impl SftpApp {
                     let operation = item.operation_id.unwrap_or(item.id);
                     row_response.context_menu(|ui| {
                         win32::menu_item_style(ui.style_mut());
+                        if item.is_failed() {
+                            if ui.add_enabled(session.can_retry(item.id), egui::Button::new("Retry")).clicked() {
+                                retry = Some(Some(item.id));
+                                ui.close();
+                            }
+                            let label = format!("Retry all failed ({failed_count})");
+                            if ui.add_enabled(session.is_connected() && failed_count > 0, egui::Button::new(label)).clicked() {
+                                retry = Some(None);
+                                ui.close();
+                            }
+                            return;
+                        }
                         let label = if item.operation_id.is_some() { "Stop folder transfer" } else { "Stop transfer" };
                         if ui.add_enabled(session.is_operation_active(operation), egui::Button::new(label)).clicked() {
                             stop = Some(Some(operation));
@@ -1469,6 +1484,12 @@ impl SftpApp {
                 match stop {
                     Some(Some(operation)) => self.sessions[a].cancel_operation(operation),
                     Some(None) => self.sessions[a].cancel_all(),
+                    None => {}
+                }
+                let settings = self.settings.transfer;
+                match retry {
+                    Some(Some(id)) => self.sessions[a].retry(id, settings),
+                    Some(None) => { self.sessions[a].retry_all_failed(settings); }
                     None => {}
                 }
             });
