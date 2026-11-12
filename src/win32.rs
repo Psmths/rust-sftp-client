@@ -426,13 +426,6 @@ pub fn menu_item_style(style: &mut egui::Style) {
     }
 }
 
-/// Menu bar using Win32 menu colours for the bar and its drop-downs.
-pub fn menu_bar() -> egui::MenuBar {
-    egui::MenuBar::new()
-        .style(menu_item_style)
-        .config(egui::containers::menu::MenuConfig::new().style(menu_item_style))
-}
-
 /// Read-only sunken white field (e.g. an address box).
 pub fn field(ui: &mut Ui, text: &str) {
     let height = ui.spacing().interact_size.y;

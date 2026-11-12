@@ -2058,31 +2058,6 @@ impl eframe::App for SftpApp {
         let can_close = self.can_close_active();
         let can_download = connected && !self.session().remote_selected.is_empty();
         let can_upload = self.session().can_upload();
-        egui::TopBottomPanel::top("menubar")
-            .frame(win32::panel_frame(0).inner_margin(egui::Margin::symmetric(2, 1)))
-            .show(ctx, |ui| {
-            win32::menu_bar().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("New connection…").clicked() { self.dialog = Some(Dialog::Profiles); ui.close(); }
-                    if ui.add_enabled(can_close, egui::Button::new("Disconnect")).clicked() { self.disconnect_active(); ui.close(); }
-                    ui.separator();
-                    if ui.button("Exit").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
-                });
-                ui.menu_button("View", |ui| {
-                    if ui.button("Refresh local").clicked() { self.session_mut().refresh_local(); ui.close(); }
-                    if ui.add_enabled(connected, egui::Button::new("Refresh remote")).clicked() {
-                        self.session_mut().reload_remote();
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Transfer", |ui| {
-                    if ui.add_enabled(can_upload, egui::Button::new("Upload selected")).clicked() { self.upload_selected(); ui.close(); }
-                    if ui.add_enabled(can_download, egui::Button::new("Download selected")).clicked() { self.download_selected(); ui.close(); }
-                    ui.separator();
-                    if ui.button("Settings…").clicked() { self.open_settings(); ui.close(); }
-                });
-            });
-        });
         egui::TopBottomPanel::top("toolbar")
             .frame(win32::panel_frame(3))
             .show(ctx, |ui| {
@@ -2091,7 +2066,7 @@ impl eframe::App for SftpApp {
                 if win32::icon_button(ui, true, win32::Icon::Connect, "Connect… (opens a new session tab)").clicked() { self.dialog = Some(Dialog::Profiles); }
                 if win32::icon_button(ui, can_close, win32::Icon::Disconnect, "Disconnect and close this session").clicked() { self.disconnect_active(); }
                 win32::toolbar_separator(ui);
-                if win32::icon_button(ui, can_upload, win32::Icon::Upload, "Upload selected local item").clicked() { self.upload_selected(); }
+                if win32::icon_button(ui, can_upload, win32::Icon::Upload, "Upload selected local items").clicked() { self.upload_selected(); }
                 if win32::icon_button(ui, can_download, win32::Icon::Download, "Download selected remote files").clicked() { self.download_selected(); }
                 win32::toolbar_separator(ui);
                 if win32::icon_button(ui, true, win32::Icon::Settings, "Settings").clicked() { self.open_settings(); }
