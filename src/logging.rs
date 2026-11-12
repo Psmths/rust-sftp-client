@@ -11,6 +11,7 @@
 //! file: either one combined log, or one log per session when splitting is on.
 
 use std::{
+    collections::{HashMap, VecDeque},
     fs::{self, OpenOptions},
     io::Write as _,
     path::PathBuf,
@@ -26,6 +27,8 @@ const COMBINED_FILE: &str = "rust-sftp-client.log";
 const FACILITY: u8 = 1;
 /// Private enterprise number reserved for documentation (RFC 5612).
 const SD_ID: &str = "session@32473";
+/// Lines kept in memory per session for the Log tab.
+const RECENT_LINES: usize = 2000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -88,6 +91,26 @@ pub enum Severity {
     Info = 6,
 }
 
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Error => "ERROR",
+            Severity::Warning => "WARN",
+            Severity::Notice => "NOTICE",
+            Severity::Info => "INFO",
+        }
+    }
+}
+
+/// One logged event, as shown in the Log tab (kept even when file logging is off).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    pub time: SystemTime,
+    pub severity: Severity,
+    pub msgid: String,
+    pub message: String,
+}
+
 /// Identifies the session a log line belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLog {
@@ -103,6 +126,8 @@ pub struct Logger {
     hostname: String,
     pid: u32,
     last_error: Mutex<Option<String>>,
+    /// Recent lines per session id, newest last.
+    recent: Mutex<HashMap<u64, VecDeque<LogEntry>>>,
 }
 
 impl Logger {
@@ -112,6 +137,7 @@ impl Logger {
             hostname: hostname(),
             pid: std::process::id(),
             last_error: Mutex::new(None),
+            recent: Mutex::new(HashMap::new()),
         }
     }
 
@@ -122,6 +148,14 @@ impl Logger {
     }
 
     pub fn log(&self, session: &SessionLog, category: Category, severity: Severity, msgid: &str, message: &str) {
+        let now = SystemTime::now();
+        if let Ok(mut recent) = self.recent.lock() {
+            let lines = recent.entry(session.id).or_default();
+            if lines.len() >= RECENT_LINES {
+                lines.pop_front();
+            }
+            lines.push_back(LogEntry { time: now, severity, msgid: msgid.to_owned(), message: message.to_owned() });
+        }
         let Ok(settings) = self.settings.read().map(|settings| settings.clone()) else { return; };
         let wanted = match category {
             Category::Connection => settings.log_connections,
@@ -130,7 +164,7 @@ impl Logger {
         if !settings.enabled || !wanted {
             return;
         }
-        let line = format_line(SystemTime::now(), &self.hostname, self.pid, severity, msgid, session, message);
+        let line = format_line(now, &self.hostname, self.pid, severity, msgid, session, message);
         let path = log_file_path(&settings, session);
         let result = fs::create_dir_all(&settings.directory)
             .and_then(|()| OpenOptions::new().create(true).append(true).open(&path))
@@ -139,6 +173,22 @@ impl Logger {
             if let Ok(mut last) = self.last_error.lock() {
                 *last = Some(format!("Could not write log file {}: {error}", path.display()));
             }
+        }
+    }
+
+    /// Recent lines of `session`, oldest first.
+    pub fn recent(&self, session: u64) -> Vec<LogEntry> {
+        self.recent
+            .lock()
+            .ok()
+            .and_then(|recent| recent.get(&session).map(|lines| lines.iter().cloned().collect()))
+            .unwrap_or_default()
+    }
+
+    /// Drops the lines kept for a closed session.
+    pub fn forget(&self, session: u64) {
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.remove(&session);
         }
     }
 

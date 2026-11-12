@@ -15,7 +15,7 @@ use crate::connection::{
     load_trusted_fingerprint, trust_host_key, AuthMethod, CipherPreference, ConnectionProfile, NetworkSettings, TurboState,
 };
 use crate::logging::{default_log_dir, Logger};
-use crate::session::{ConnectOutcome, LocalEntry, QueueTab, RemoteEntry, Session};
+use crate::session::{select_click, sort_rows, ConnectOutcome, LocalEntry, QueueTab, RemoteEntry, Session, SortColumn, SortOrder, SpeedSample};
 use crate::settings::AppSettings;
 use crate::transfer::TransferSettings;
 use crate::places::{self, Drive};
@@ -232,7 +232,7 @@ impl SettingsDraft {
             directory: if directory.is_empty() { default_log_dir() } else { PathBuf::from(directory) },
             split_sessions: self.split_sessions,
         };
-        Ok(AppSettings { transfer, network, logging })
+        Ok(AppSettings { transfer, network, logging, last_local_dir: None })
     }
 }
 
@@ -360,13 +360,21 @@ pub struct SftpApp {
     op_tx: std_mpsc::Sender<OpResult>,
     op_rx: std_mpsc::Receiver<OpResult>,
     ops_pending: usize,
+    /// Minutes shown by the statistics graph.
+    stats_span_minutes: u32,
 }
 
 impl SftpApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         win32::apply(&cc.egui_ctx);
-        let path = crate::places::home_dir().unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }));
         let settings = crate::settings::load();
+        // Open where the user left off; the home folder the first time (or if it is gone).
+        let path = settings
+            .last_local_dir
+            .clone()
+            .filter(|path| path.is_dir())
+            .or_else(crate::places::home_dir)
+            .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }));
         let logger = Arc::new(Logger::new(settings.logging.clone()));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -414,6 +422,7 @@ impl SftpApp {
             op_tx,
             op_rx,
             ops_pending: 0,
+            stats_span_minutes: 5,
         }
     }
 
@@ -448,6 +457,7 @@ impl SftpApp {
         if index >= self.sessions.len() { return; }
         let mut session = self.sessions.remove(index);
         session.disconnect();
+        self.logger.forget(session.id);
         if self.dialog_session == Some(session.id) {
             self.dialog = None;
             self.dialog_session = None;
@@ -652,7 +662,7 @@ impl SftpApp {
     }
 
     fn upload_selected(&mut self) {
-        if let Some(path) = self.session().local_selected.clone() {
+        for path in self.session().uploadable_selection() {
             self.session_mut().queue_upload(path);
         }
     }
@@ -732,7 +742,7 @@ impl SftpApp {
         let tx = self.op_tx.clone();
         match target {
             FileTarget::Local(entries) => {
-                self.sessions[index].local_selected = None;
+                self.sessions[index].local_selected.clear();
                 std::thread::spawn(move || {
                     let result = entries.iter().try_for_each(|entry| {
                         // DirEntry metadata does not follow symlinks, so a link
@@ -797,7 +807,7 @@ impl SftpApp {
                 let message = format!("Renamed {} to {}", entry.path.display(), destination.display());
                 session.log_file_operation("RENAME", &Ok(message));
                 session.status = format!("Renamed {} to {new_name}", entry.name);
-                session.local_selected = Some(destination);
+                session.local_selected = vec![destination];
                 session.refresh_local();
             }
             FileTarget::Remote(entries) => {
@@ -1038,12 +1048,6 @@ impl SftpApp {
         let a = self.active;
         let connected = self.sessions[a].connection.is_some();
         ui.horizontal(|ui| {
-            ui.strong("Local site");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(format!("{} items", self.sessions[a].local_entries.len()));
-            });
-        });
-        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if win32::icon_button(ui, self.sessions[a].path.parent().is_some(), win32::Icon::Up, "Up one level").clicked() {
                 if let Some(parent) = self.sessions[a].path.parent().map(PathBuf::from) { self.sessions[a].open_local_dir(parent); }
@@ -1081,42 +1085,72 @@ impl SftpApp {
         let filter = self.sessions[a].local_filter.to_lowercase();
         let mut rows: Vec<LocalEntry> = self.sessions[a].local_entries.iter()
             .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        sort_rows(&mut rows, self.sessions[a].local_sort);
         if let Some(parent) = self.sessions[a].path.parent() {
             rows.insert(0, LocalEntry {
                 name: "..".into(), path: parent.to_path_buf(), dir: true,
                 size: 0, modified: "—".into(),
             });
         }
+        // Row order for Shift-click ranges (".." is never part of a range).
+        let order: Vec<PathBuf> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
+        let mut sort_click = None;
         win32::list_view(ui, list_height, |ui| {
             let (name_width, header) = reserve_list_header(ui);
-            let scrolled = win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
+            win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
                 for entry in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        let response = file_name_cell(
-                            ui,
-                            name_width,
-                            ROW_HEIGHT,
-                            &entry.name,
-                            entry.dir,
-                            self.sessions[a].local_selected.as_ref() == Some(&entry.path),
-                        );
+                        let selected = self.sessions[a].local_selected.contains(&entry.path);
+                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.name, entry.dir, selected);
                         if response.dragged() { response.dnd_set_drag_payload(DragPayload::Local(entry.path.clone())); }
-                        if response.clicked() || response.secondary_clicked() { self.sessions[a].local_selected = Some(entry.path.clone()); }
+                        if response.clicked() {
+                            let (ctrl, shift) = click_modifiers(&response);
+                            let session = &mut self.sessions[a];
+                            if entry.name == ".." {
+                                session.local_selected = vec![entry.path.clone()];
+                                session.local_anchor = None;
+                            } else {
+                                select_click(&mut session.local_selected, &mut session.local_anchor, &order, &entry.path, ctrl, shift);
+                            }
+                        }
+                        if response.secondary_clicked() && !selected {
+                            self.sessions[a].local_selected = vec![entry.path.clone()];
+                            self.sessions[a].local_anchor = Some(entry.path.clone());
+                        }
+                        let in_selection = self.sessions[a].local_selected.contains(&entry.path);
+                        let count = if in_selection { self.sessions[a].uploadable_selection().len().max(1) } else { 1 };
                         let mut action = None;
                         if entry.name != ".." {
                             response.context_menu(|ui| {
-                                let label = if connected { "Upload to remote" } else { "Upload to remote (not connected)" };
-                                action = row_context_menu(ui, entry.dir, label, connected, true, true);
+                                let label = match (connected, count > 1) {
+                                    (true, true) => format!("Upload {count} items to remote"),
+                                    (true, false) => "Upload to remote".to_owned(),
+                                    (false, _) => "Upload to remote (not connected)".to_owned(),
+                                };
+                                action = row_context_menu(ui, entry.dir, &label, connected, count == 1, count == 1);
                             });
                         }
+                        let targets = || -> Vec<LocalEntry> {
+                            if in_selection {
+                                let selected = &self.sessions[a].local_selected;
+                                self.sessions[a].local_entries.iter().filter(|e| selected.contains(&e.path)).cloned().collect()
+                            } else {
+                                vec![entry.clone()]
+                            }
+                        };
                         match action {
                             Some(RowAction::Open) => self.sessions[a].open_local_dir(entry.path.clone()),
-                            Some(RowAction::Transfer) => self.sessions[a].queue_upload(entry.path.clone()),
+                            Some(RowAction::Transfer) => {
+                                for target in targets() { self.sessions[a].queue_upload(target.path); }
+                            }
                             Some(RowAction::Hash(algorithm)) => self.start_local_hash(&entry, algorithm),
                             Some(RowAction::Rename) => self.begin_rename(FileTarget::Local(vec![entry.clone()])),
-                            Some(RowAction::Delete) => self.begin_delete(FileTarget::Local(vec![entry.clone()])),
+                            Some(RowAction::Delete) => {
+                                let targets = targets();
+                                self.begin_delete(FileTarget::Local(targets));
+                            }
                             None => {}
                         }
                         if response.double_clicked() && entry.dir { self.sessions[a].open_local_dir(entry.path.clone()); }
@@ -1124,10 +1158,11 @@ impl SftpApp {
                     });
                 }
             });
-            paint_list_header(ui, header, name_width, scrolled.state.offset.x);
+            sort_click = paint_list_header(ui, header, name_width, self.sessions[a].local_sort);
         });
+        if let Some(column) = sort_click { self.sessions[a].local_sort.toggle(column); }
         let visible = self.sessions[a].local_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
-        ui.label(format!("{visible} object(s)"));
+        ui.label(format!("{} selected, {visible} object(s)", self.sessions[a].uploadable_selection().len()));
     }
 
     fn remote_pane(&mut self, ui: &mut egui::Ui) {
@@ -1145,16 +1180,6 @@ impl SftpApp {
     fn remote_pane_contents(&mut self, ui: &mut egui::Ui) {
         let a = self.active;
         let connected = self.sessions[a].connection.is_some();
-        ui.horizontal(|ui| {
-            ui.strong("Remote site");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(connection) = &self.sessions[a].connection {
-                    ui.colored_label(win32::OK_GREEN, format!("{}:{}", connection.host, connection.port));
-                } else {
-                    ui.colored_label(win32::WARN_AMBER, "Not connected");
-                }
-            });
-        });
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if win32::icon_button(ui, connected, win32::Icon::Up, "Up one level").clicked() {
@@ -1178,6 +1203,7 @@ impl SftpApp {
         let filter = self.sessions[a].remote_filter.to_lowercase();
         let mut rows: Vec<RemoteEntry> = self.sessions[a].remote_entries.iter()
             .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        sort_rows(&mut rows, self.sessions[a].remote_sort);
         let remote_path_trimmed = self.sessions[a].remote_path.trim_end_matches('/');
         if !remote_path_trimmed.is_empty() && remote_path_trimmed != "/" {
             rows.insert(0, RemoteEntry {
@@ -1185,7 +1211,9 @@ impl SftpApp {
                 size: 0, modified: "—".into(),
             });
         }
+        let order: Vec<String> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
         let mut open_profiles = false;
+        let mut sort_click = None;
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
         win32::list_view(ui, list_height, |ui| {
             let (name_width, header) = reserve_list_header(ui);
@@ -1197,10 +1225,10 @@ impl SftpApp {
                     ui.add_space(8.0);
                     if win32::button_sized(ui, true, "Connect…", 75.0).clicked() { open_profiles = true; }
                 });
-                paint_list_header(ui, header, name_width, 0.0);
+                paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
                 return;
             }
-            let scrolled = win32::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
+            win32::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
                 for entry in rows {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1208,18 +1236,18 @@ impl SftpApp {
                         let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.name, entry.dir, selected);
                         if response.dragged() { response.dnd_set_drag_payload(DragPayload::Remote(entry.path.clone())); }
                         if response.clicked() {
-                            let multi = response.ctx.input(|input| input.modifiers.ctrl || input.modifiers.command);
-                            if multi {
-                                if selected { self.sessions[a].remote_selected.retain(|path| path != &entry.path); }
-                                else { self.sessions[a].remote_selected.push(entry.path.clone()); }
+                            let (ctrl, shift) = click_modifiers(&response);
+                            let session = &mut self.sessions[a];
+                            if entry.name == ".." {
+                                session.remote_selected = vec![entry.path.clone()];
+                                session.remote_anchor = None;
                             } else {
-                                self.sessions[a].remote_selected.clear();
-                                self.sessions[a].remote_selected.push(entry.path.clone());
+                                select_click(&mut session.remote_selected, &mut session.remote_anchor, &order, &entry.path, ctrl, shift);
                             }
                         }
                         if response.secondary_clicked() && !selected {
-                            self.sessions[a].remote_selected.clear();
-                            self.sessions[a].remote_selected.push(entry.path.clone());
+                            self.sessions[a].remote_selected = vec![entry.path.clone()];
+                            self.sessions[a].remote_anchor = Some(entry.path.clone());
                         }
                         let in_selection = self.sessions[a].remote_selected.contains(&entry.path);
                         let count = if in_selection { self.sessions[a].remote_selected.len() } else { 1 };
@@ -1255,11 +1283,269 @@ impl SftpApp {
                     });
                 }
             });
-            paint_list_header(ui, header, name_width, scrolled.state.offset.x);
+            sort_click = paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
         });
+        if let Some(column) = sort_click { self.sessions[a].remote_sort.toggle(column); }
         if open_profiles { self.dialog = Some(Dialog::Profiles); }
         let visible = self.sessions[a].remote_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
         ui.label(format!("{} selected, {visible} object(s)", self.sessions[a].remote_selected.len()));
+    }
+
+    /// Transfer rows of one queue tab (pending, complete or failed).
+    fn transfer_list_tab(&mut self, ui: &mut egui::Ui, tab: QueueTab) {
+        let a = self.active;
+        let list_height = ui.available_height().max(40.0);
+        win32::list_view(ui, list_height, |ui| {
+            let file_width = 220.0;
+            let protocol_width = 70.0;
+            let percent_width = 80.0;
+            let speed_width = 95.0;
+            let elapsed_width = 90.0;
+            let remaining_width = 105.0;
+            let header_height = 19.0;
+            let row_height = 18.0;
+            let fixed = file_width + protocol_width + percent_width + speed_width + elapsed_width + remaining_width;
+            let progress_width = (ui.available_width() - fixed - ui.spacing().scroll.bar_width).max(160.0);
+            ui.horizontal(|ui| {
+                win32::header_cell(ui, file_width, header_height, "File");
+                win32::header_cell(ui, protocol_width, header_height, "Protocol");
+                win32::header_cell(ui, progress_width, header_height, "Progress");
+                win32::header_cell(ui, percent_width, header_height, "Complete");
+                win32::header_cell(ui, speed_width, header_height, "Speed (MiB/s)");
+                win32::header_cell(ui, elapsed_width, header_height, "Elapsed");
+                win32::header_cell(ui, remaining_width, header_height, "Remaining");
+                let rest = ui.available_width();
+                if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
+            });
+            win32::scroll(ui, egui::ScrollArea::vertical().id_salt(("queue_list", self.sessions[a].id)).auto_shrink([false, false]), |ui| {
+                if !self.sessions[a].transfers.iter().any(|item| item.tab() == tab) {
+                    let empty = match tab {
+                        QueueTab::Pending => "There are no pending transfers.",
+                        QueueTab::Failed => "No transfers have failed or been stopped.",
+                        _ => "There are no completed transfers.",
+                    };
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| { ui.add_space(6.0); ui.weak(empty); });
+                    return;
+                }
+                let session = &self.sessions[a];
+                let any_active = session.has_active_operations();
+                let mut select = None;
+                let mut stop = None;
+                for item in session.transfers.iter().filter(|item| item.tab() == tab) {
+                    // The whole row is one click target; the cells are drawn on top of it.
+                    let (row_rect, row_response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_height), egui::Sense::click()
+                    );
+                    if session.selected_transfer == Some(item.id) {
+                        ui.painter().rect_filled(row_rect, 0.0, QUEUE_SELECTION);
+                    }
+                    if row_response.clicked() || row_response.secondary_clicked() {
+                        select = Some(item.id);
+                    }
+                    // Rows of a folder transfer stop the whole folder transfer.
+                    let operation = item.operation_id.unwrap_or(item.id);
+                    row_response.context_menu(|ui| {
+                        win32::menu_item_style(ui.style_mut());
+                        let label = if item.operation_id.is_some() { "Stop folder transfer" } else { "Stop transfer" };
+                        if ui.add_enabled(session.is_operation_active(operation), egui::Button::new(label)).clicked() {
+                            stop = Some(Some(operation));
+                            ui.close();
+                        }
+                        if ui.add_enabled(any_active, egui::Button::new("Stop all transfers")).clicked() {
+                            stop = Some(None);
+                            ui.close();
+                        }
+                    });
+                    let row_layout = egui::UiBuilder::new()
+                        .max_rect(row_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center));
+                    ui.scope_builder(row_layout, |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        file_text_cell(ui, file_width, row_height, &item.name, false);
+                        file_text_cell(ui, protocol_width, row_height, item.protocol.unwrap_or("—"), false);
+                        let (cell_rect, response) = ui.allocate_exact_size(
+                            egui::vec2(progress_width, row_height), egui::Sense::hover()
+                        );
+                        let bar_rect = cell_rect.shrink2(egui::vec2(4.0, 2.0));
+                        let painter = ui.painter();
+                        painter.rect_filled(bar_rect, 0.0, win32::WINDOW);
+                        win32::thin_sunken(painter, bar_rect);
+                        let bar_rect = bar_rect.shrink(1.0);
+                        let failed = item.state.starts_with("Failed");
+                        let complete = item.state == "Complete";
+                        let pieces: Vec<Piece> = if !item.segments.is_empty() && item.total > 0 {
+                            item.segments.iter().map(|segment| {
+                                let length = segment.end_exclusive.saturating_sub(segment.start);
+                                Piece {
+                                    start: segment.start,
+                                    end: segment.end_exclusive,
+                                    done: if segment.complete { length } else { segment.transferred_bytes.min(length) },
+                                    failed: segment.failed,
+                                }
+                            }).collect()
+                        } else {
+                            let total = item.total.max(1);
+                            let done = if complete { total } else { item.transferred.min(total) };
+                            vec![Piece { start: 0, end: total, done, failed }]
+                        };
+                        let total = if item.segments.is_empty() || item.total == 0 { item.total.max(1) } else { item.total };
+                        let fill = if complete {
+                            win32::OK_GREEN
+                        } else if item.state == "Cancelled" {
+                            win32::SHADOW
+                        } else {
+                            PIECE_FILL
+                        };
+                        paint_piece_bar(painter, bar_rect, total, &pieces, fill);
+                        if response.hovered() {
+                            let details = item.details.as_deref().map(|details| format!("\n\n{details}")).unwrap_or_default();
+                            response.on_hover_text(format!(
+                                "{} / {} · {} segments\n{}{details}",
+                                size_text(item.transferred), size_text(item.total), item.segments.len(), item.state
+                            ));
+                        }
+                        let percent = if item.total == 0 {
+                            if item.state == "Complete" { 100.0 } else { 0.0 }
+                        } else { item.transferred as f64 * 100.0 / item.total as f64 };
+                        file_text_cell(ui, percent_width, row_height, &format!("{percent:.1}%"), false);
+                        let speed = if item.state == "Queued" { "—".into() } else { format!("{:.2}", item.speed_mib_s) };
+                        file_text_cell(ui, speed_width, row_height, &speed, false);
+                        let elapsed = item.started_at.map(|start| {
+                            item.finished_at.unwrap_or_else(Instant::now).saturating_duration_since(start)
+                        });
+                        file_text_cell(ui, elapsed_width, row_height, &elapsed.map(duration_text).unwrap_or_else(|| "—".into()), false);
+                        let remaining = if item.state == "Complete" {
+                            Some(Duration::ZERO)
+                        } else if (item.state == "Downloading" || item.state == "Uploading") && item.transferred > 0 && item.total > item.transferred {
+                            elapsed.map(|duration| {
+                                let rate = item.transferred as f64 / duration.as_secs_f64().max(0.001);
+                                Duration::from_secs_f64(((item.total - item.transferred) as f64 / rate).max(0.0))
+                            })
+                        } else { None };
+                        let remaining = remaining.map(duration_text).unwrap_or_else(|| {
+                            if failed { "Failed".into() }
+                            else if item.state == "Cancelled" { "Cancelled".into() }
+                            else if item.state == "Queued" { "Queued".into() }
+                            else { "Calculating…".into() }
+                        });
+                        file_text_cell(ui, remaining_width, row_height, &remaining, false);
+                    });
+                }
+                if let Some(id) = select {
+                    self.sessions[a].selected_transfer = Some(id);
+                }
+                match stop {
+                    Some(Some(operation)) => self.sessions[a].cancel_operation(operation),
+                    Some(None) => self.sessions[a].cancel_all(),
+                    None => {}
+                }
+            });
+        });
+    }
+
+    /// The selected session's log lines (kept in memory whether or not file logging is on).
+    fn log_tab(&mut self, ui: &mut egui::Ui) {
+        let a = self.active;
+        let entries = self.sessions[a].recent_log();
+        let list_height = ui.available_height().max(40.0);
+        win32::list_view(ui, list_height, |ui| {
+            if entries.is_empty() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| { ui.add_space(6.0); ui.weak("Nothing has been logged for this session yet."); });
+                return;
+            }
+            let area = egui::ScrollArea::both()
+                .id_salt(("session_log", self.sessions[a].id))
+                .auto_shrink([false, false])
+                .stick_to_bottom(true);
+            win32::scroll(ui, area, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add_space(2.0);
+                for entry in &entries {
+                    let color = match entry.severity {
+                        crate::logging::Severity::Error => win32::ERROR_RED,
+                        crate::logging::Severity::Warning => win32::WARN_AMBER,
+                        _ => win32::TEXT,
+                    };
+                    let time = crate::logging::iso8601_utc(entry.time);
+                    let line = format!(
+                        " {}  {:<6}  {:<8}  {}",
+                        time.replace('T', " ").trim_end_matches('Z'),
+                        entry.severity.label(),
+                        entry.msgid,
+                        entry.message
+                    );
+                    ui.add(egui::Label::new(egui::RichText::new(line).monospace().color(color)).wrap_mode(egui::TextWrapMode::Extend));
+                }
+            });
+        });
+    }
+
+    /// Speed graph and counters of the selected session.
+    fn statistics_tab(&mut self, ui: &mut egui::Ui) {
+        let a = self.active;
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label("Timespan:");
+            egui::ComboBox::from_id_salt("stats_span")
+                .width(80.0)
+                .selected_text(format!("{} min", self.stats_span_minutes))
+                .show_ui(ui, |ui| {
+                    for minutes in [1_u32, 2, 5, 10, 15, 30] {
+                        ui.selectable_value(&mut self.stats_span_minutes, minutes, format!("{minutes} min"));
+                    }
+                });
+            ui.add_space(12.0);
+            ui.weak("Download and upload speed of this session; one sample per second.");
+        });
+        ui.add_space(2.0);
+        let session = &self.sessions[a];
+        let span = Duration::from_secs(u64::from(self.stats_span_minutes) * 60);
+        let now = Instant::now();
+        let window: Vec<SpeedSample> = session
+            .speed_history
+            .iter()
+            .copied()
+            .filter(|sample| now.saturating_duration_since(sample.at) <= span)
+            .collect();
+        let peak = |pick: fn(&SpeedSample) -> f64| window.iter().map(pick).fold(0.0_f64, f64::max);
+        let average = |pick: fn(&SpeedSample) -> f64| {
+            if window.is_empty() { 0.0 } else { window.iter().map(pick).sum::<f64>() / window.len() as f64 }
+        };
+        let (bytes_down, bytes_up) = session.bytes_transferred();
+        let count = |tab: QueueTab| session.transfers.iter().filter(|item| item.tab() == tab).count();
+        let connected_for = session.connected_at.map(|since| duration_text(now.saturating_duration_since(since)));
+        let rows: Vec<(&str, String)> = vec![
+            ("Downloading now:", speed_text(session.speed("Downloading"))),
+            ("Uploading now:", speed_text(session.speed("Uploading"))),
+            ("Peak download:", speed_text(peak(|sample| sample.down))),
+            ("Peak upload:", speed_text(peak(|sample| sample.up))),
+            ("Average download:", speed_text(average(|sample| sample.down))),
+            ("Average upload:", speed_text(average(|sample| sample.up))),
+            ("Downloaded:", size_text(bytes_down)),
+            ("Uploaded:", size_text(bytes_up)),
+            ("Transfers:", format!("{} active, {} complete, {} failed", count(QueueTab::Pending), count(QueueTab::Complete), count(QueueTab::Failed))),
+            ("Connected for:", connected_for.unwrap_or_else(|| "—".into())),
+        ];
+        let height = ui.available_height().max(60.0);
+        ui.horizontal_top(|ui| {
+            let stats_width = 300.0;
+            let graph_width = (ui.available_width() - stats_width - 8.0).max(120.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(graph_width, height), egui::Sense::hover());
+            paint_speed_graph(ui, rect, &window, span, now);
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.set_width(stats_width);
+                egui::Grid::new("stats_grid").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                    for (label, value) in &rows {
+                        ui.label(*label);
+                        ui.label(value);
+                        ui.end_row();
+                    }
+                });
+            });
+        });
     }
 
     fn dialog_window(&mut self, ctx: &egui::Context) {
@@ -1662,7 +1948,8 @@ impl SftpApp {
             if window_ctx.input(|input| input.viewport().close_requested()) { close = true; }
         });
         if apply {
-            let result = self.settings_draft.parse().and_then(|settings| {
+            let last_local_dir = self.settings.last_local_dir.clone();
+            let result = self.settings_draft.parse().map(|settings| AppSettings { last_local_dir, ..settings }).and_then(|settings| {
                 if settings.logging.enabled {
                     fs::create_dir_all(&settings.logging.directory)
                         .map_err(|error| format!("Cannot create log directory {}: {error}", settings.logging.directory.display()))?;
@@ -1698,6 +1985,15 @@ impl eframe::App for SftpApp {
         self.poll_ops();
         self.poll_password_lookup();
         self.poll_credentials();
+        for session in &mut self.sessions {
+            session.sample_speeds();
+        }
+        // Remember the folder being browsed, so the next run opens there.
+        let browsing = self.session().path.clone();
+        if self.settings.last_local_dir.as_ref() != Some(&browsing) {
+            self.settings.last_local_dir = Some(browsing);
+            let _ = crate::settings::save(&self.settings);
+        }
 
         let connected = self.session().is_connected();
         let can_close = self.can_close_active();
@@ -1782,172 +2078,26 @@ impl eframe::App for SftpApp {
         });
         egui::TopBottomPanel::bottom("queue")
             .resizable(true)
-            .default_height(180.0)
+            .default_height(200.0)
             .min_height(100.0)
             .max_height(600.0)
             .frame(win32::panel_frame(6))
             .show(ctx, |ui| {
             let a = self.active;
-            let queued = self.sessions[a].transfers.iter().filter(|item| item.state == "Queued").count();
-            let active = self.sessions[a].transfers.iter().filter(|item| item.state == "Downloading" || item.state == "Uploading").count();
-            let failed = self.sessions[a].transfers.iter().filter(|item| item.state.starts_with("Failed")).count();
-            let pending_count = self.sessions[a].transfers.iter().filter(|item| item.is_pending()).count();
-            let finished_count = self.sessions[a].transfers.len() - pending_count;
-            ui.horizontal(|ui| {
-                ui.strong("Transfer queue");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("{queued} queued, {active} active, {failed} failed"));
-                });
-            });
-            win32::tab_strip(ui, &mut self.sessions[a].queue_tab, &[
-                (QueueTab::Pending, format!("Pending ({pending_count})")),
-                (QueueTab::Complete, format!("Complete ({finished_count})")),
-            ]);
-            let show_pending = self.sessions[a].queue_tab == QueueTab::Pending;
-            let list_height = ui.available_height().max(40.0);
-            win32::list_view(ui, list_height, |ui| {
-                let file_width = 220.0;
-                let protocol_width = 70.0;
-                let percent_width = 80.0;
-                let speed_width = 95.0;
-                let elapsed_width = 90.0;
-                let remaining_width = 105.0;
-                let header_height = 19.0;
-                let row_height = 18.0;
-                let fixed = file_width + protocol_width + percent_width + speed_width + elapsed_width + remaining_width;
-                let progress_width = (ui.available_width() - fixed - ui.spacing().scroll.bar_width).max(160.0);
-                ui.horizontal(|ui| {
-                    win32::header_cell(ui, file_width, header_height, "File");
-                    win32::header_cell(ui, protocol_width, header_height, "Protocol");
-                    win32::header_cell(ui, progress_width, header_height, "Progress");
-                    win32::header_cell(ui, percent_width, header_height, "Complete");
-                    win32::header_cell(ui, speed_width, header_height, "Speed (MiB/s)");
-                    win32::header_cell(ui, elapsed_width, header_height, "Elapsed");
-                    win32::header_cell(ui, remaining_width, header_height, "Remaining");
-                    let rest = ui.available_width();
-                    if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
-                });
-                win32::scroll(ui, egui::ScrollArea::vertical().id_salt(("queue_list", self.sessions[a].id)).auto_shrink([false, false]), |ui| {
-                    if !self.sessions[a].transfers.iter().any(|item| item.is_pending() == show_pending) {
-                        let empty = if show_pending { "There are no pending transfers." } else { "There are no completed transfers." };
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| { ui.add_space(6.0); ui.weak(empty); });
-                        return;
-                    }
-                    let session = &self.sessions[a];
-                    let any_active = session.has_active_operations();
-                    let mut select = None;
-                    let mut stop = None;
-                    for item in session.transfers.iter().filter(|item| item.is_pending() == show_pending) {
-                        // The whole row is one click target; the cells are drawn on top of it.
-                        let (row_rect, row_response) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), row_height), egui::Sense::click()
-                        );
-                        if session.selected_transfer == Some(item.id) {
-                            ui.painter().rect_filled(row_rect, 0.0, QUEUE_SELECTION);
-                        }
-                        if row_response.clicked() || row_response.secondary_clicked() {
-                            select = Some(item.id);
-                        }
-                        // Rows of a folder transfer stop the whole folder transfer.
-                        let operation = item.operation_id.unwrap_or(item.id);
-                        row_response.context_menu(|ui| {
-                            win32::menu_item_style(ui.style_mut());
-                            let label = if item.operation_id.is_some() { "Stop folder transfer" } else { "Stop transfer" };
-                            if ui.add_enabled(session.is_operation_active(operation), egui::Button::new(label)).clicked() {
-                                stop = Some(Some(operation));
-                                ui.close();
-                            }
-                            if ui.add_enabled(any_active, egui::Button::new("Stop all transfers")).clicked() {
-                                stop = Some(None);
-                                ui.close();
-                            }
-                        });
-                        let row_layout = egui::UiBuilder::new()
-                            .max_rect(row_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center));
-                        ui.scope_builder(row_layout, |ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            file_text_cell(ui, file_width, row_height, &item.name, false);
-                            file_text_cell(ui, protocol_width, row_height, item.protocol.unwrap_or("—"), false);
-                            let (cell_rect, response) = ui.allocate_exact_size(
-                                egui::vec2(progress_width, row_height), egui::Sense::hover()
-                            );
-                            let bar_rect = cell_rect.shrink2(egui::vec2(4.0, 2.0));
-                            let painter = ui.painter();
-                            painter.rect_filled(bar_rect, 0.0, win32::WINDOW);
-                            win32::thin_sunken(painter, bar_rect);
-                            let bar_rect = bar_rect.shrink(1.0);
-                            let failed = item.state.starts_with("Failed");
-                            let complete = item.state == "Complete";
-                            let pieces: Vec<Piece> = if !item.segments.is_empty() && item.total > 0 {
-                                item.segments.iter().map(|segment| {
-                                    let length = segment.end_exclusive.saturating_sub(segment.start);
-                                    Piece {
-                                        start: segment.start,
-                                        end: segment.end_exclusive,
-                                        done: if segment.complete { length } else { segment.transferred_bytes.min(length) },
-                                        failed: segment.failed,
-                                    }
-                                }).collect()
-                            } else {
-                                let total = item.total.max(1);
-                                let done = if complete { total } else { item.transferred.min(total) };
-                                vec![Piece { start: 0, end: total, done, failed }]
-                            };
-                            let total = if item.segments.is_empty() || item.total == 0 { item.total.max(1) } else { item.total };
-                            let fill = if complete {
-                                win32::OK_GREEN
-                            } else if item.state == "Cancelled" {
-                                win32::SHADOW
-                            } else {
-                                PIECE_FILL
-                            };
-                            paint_piece_bar(painter, bar_rect, total, &pieces, fill);
-                            if response.hovered() {
-                                let details = item.details.as_deref().map(|details| format!("\n\n{details}")).unwrap_or_default();
-                                response.on_hover_text(format!(
-                                    "{} / {} · {} segments\n{}{details}",
-                                    size_text(item.transferred), size_text(item.total), item.segments.len(), item.state
-                                ));
-                            }
-                            let percent = if item.total == 0 {
-                                if item.state == "Complete" { 100.0 } else { 0.0 }
-                            } else { item.transferred as f64 * 100.0 / item.total as f64 };
-                            file_text_cell(ui, percent_width, row_height, &format!("{percent:.1}%"), false);
-                            let speed = if item.state == "Queued" { "—".into() } else { format!("{:.2}", item.speed_mib_s) };
-                            file_text_cell(ui, speed_width, row_height, &speed, false);
-                            let elapsed = item.started_at.map(|start| {
-                                item.finished_at.unwrap_or_else(Instant::now).saturating_duration_since(start)
-                            });
-                            file_text_cell(ui, elapsed_width, row_height, &elapsed.map(duration_text).unwrap_or_else(|| "—".into()), false);
-                            let remaining = if item.state == "Complete" {
-                                Some(Duration::ZERO)
-                            } else if (item.state == "Downloading" || item.state == "Uploading") && item.transferred > 0 && item.total > item.transferred {
-                                elapsed.map(|duration| {
-                                    let rate = item.transferred as f64 / duration.as_secs_f64().max(0.001);
-                                    Duration::from_secs_f64(((item.total - item.transferred) as f64 / rate).max(0.0))
-                                })
-                            } else { None };
-                            let remaining = remaining.map(duration_text).unwrap_or_else(|| {
-                                if failed { "Failed".into() }
-                                else if item.state == "Cancelled" { "Cancelled".into() }
-                                else if item.state == "Queued" { "Queued".into() }
-                                else { "Calculating…".into() }
-                            });
-                            file_text_cell(ui, remaining_width, row_height, &remaining, false);
-                        });
-                    }
-                    if let Some(id) = select {
-                        self.sessions[a].selected_transfer = Some(id);
-                    }
-                    match stop {
-                        Some(Some(operation)) => self.sessions[a].cancel_operation(operation),
-                        Some(None) => self.sessions[a].cancel_all(),
-                        None => {}
-                    }
-                });
-            });
+            let count = |tab: QueueTab| self.sessions[a].transfers.iter().filter(|item| item.tab() == tab).count();
+            let tabs = [
+                (QueueTab::Pending, format!("Pending ({})", count(QueueTab::Pending))),
+                (QueueTab::Complete, format!("Complete ({})", count(QueueTab::Complete))),
+                (QueueTab::Failed, format!("Failed ({})", count(QueueTab::Failed))),
+                (QueueTab::Log, "Log".to_owned()),
+                (QueueTab::Statistics, "Statistics".to_owned()),
+            ];
+            win32::tab_strip(ui, &mut self.sessions[a].queue_tab, &tabs);
+            match self.sessions[a].queue_tab {
+                QueueTab::Log => self.log_tab(ui),
+                QueueTab::Statistics => self.statistics_tab(ui),
+                tab => self.transfer_list_tab(ui, tab),
+            }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |columns| {
@@ -1964,6 +2114,10 @@ impl eframe::App for SftpApp {
         }
         if self.sessions.iter().any(Session::is_busy) || self.password_lookup.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.session().queue_tab == QueueTab::Statistics {
+            // Keep the graph moving and sampling while it is visible.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 }
@@ -2096,10 +2250,10 @@ const TYPE_WIDTH: f32 = 80.0;
 /// Draws the file list column headers and returns the width of the Name column.
 const HEADER_HEIGHT: f32 = 19.0;
 
-/// Scroll area of a file list: scroll bars on both axes, always shown, so
-/// columns cut off in a narrow pane can be scrolled into view.
+/// Scroll area of a file list: vertical only, always shown. The Name column
+/// takes whatever width the fixed columns leave, so nothing scrolls sideways.
 fn file_list_scroll(id: impl std::hash::Hash) -> egui::ScrollArea {
-    egui::ScrollArea::both()
+    egui::ScrollArea::vertical()
         .id_salt(id)
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -2107,27 +2261,134 @@ fn file_list_scroll(id: impl std::hash::Hash) -> egui::ScrollArea {
 
 /// Reserves the column header row of a file list and returns the Name column
 /// width with it. The header is painted afterwards by [`paint_list_header`],
-/// once the list's horizontal scroll offset is known, so it moves with the rows.
+/// over the rows, so it stays put while they scroll.
 fn reserve_list_header(ui: &mut egui::Ui) -> (f32, egui::Rect) {
     let name_width = (ui.available_width() - SIZE_WIDTH - MODIFIED_WIDTH - TYPE_WIDTH - ui.spacing().scroll.bar_width).max(100.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), HEADER_HEIGHT), egui::Sense::hover());
     (name_width, rect)
 }
 
-/// Paints the column headers into `rect`, shifted left by the rows' horizontal scroll.
-fn paint_list_header(ui: &mut egui::Ui, rect: egui::Rect, name_width: f32, scroll_x: f32) {
-    let columns = name_width + SIZE_WIDTH + MODIFIED_WIDTH + TYPE_WIDTH;
-    let width = columns.max(rect.width() + scroll_x);
-    let shifted = egui::Rect::from_min_size(rect.min - egui::vec2(scroll_x, 0.0), egui::vec2(width, HEADER_HEIGHT));
-    let mut header = ui.new_child(egui::UiBuilder::new().max_rect(shifted).layout(egui::Layout::left_to_right(egui::Align::Min)));
+/// Paints the sortable column headers into `rect`; returns the column clicked.
+fn paint_list_header(ui: &mut egui::Ui, rect: egui::Rect, name_width: f32, order: SortOrder) -> Option<SortColumn> {
+    let mut header = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Min)));
     header.set_clip_rect(rect.intersect(ui.clip_rect()));
     header.spacing_mut().item_spacing.x = 0.0;
-    win32::header_cell(&mut header, name_width, HEADER_HEIGHT, "Name");
-    win32::header_cell(&mut header, SIZE_WIDTH, HEADER_HEIGHT, "Size");
-    win32::header_cell(&mut header, MODIFIED_WIDTH, HEADER_HEIGHT, "Modified (UTC)");
-    win32::header_cell(&mut header, TYPE_WIDTH, HEADER_HEIGHT, "Type");
+    let mut clicked = None;
+    for (column, width, label) in [
+        (SortColumn::Name, name_width, "Name"),
+        (SortColumn::Size, SIZE_WIDTH, "Size"),
+        (SortColumn::Modified, MODIFIED_WIDTH, "Modified (UTC)"),
+        (SortColumn::Type, TYPE_WIDTH, "Type"),
+    ] {
+        let sorted = (order.column == column).then_some(order.ascending);
+        if win32::header_button(&mut header, width, HEADER_HEIGHT, label, sorted).clicked() {
+            clicked = Some(column);
+        }
+    }
     let rest = header.available_width();
     if rest > 0.0 { win32::header_cell(&mut header, rest, HEADER_HEIGHT, ""); }
+    clicked
+}
+
+/// Ctrl (Command on macOS) and Shift state of the click that produced `response`.
+fn click_modifiers(response: &egui::Response) -> (bool, bool) {
+    response.ctx.input(|input| (input.modifiers.ctrl || input.modifiers.command, input.modifiers.shift))
+}
+
+const GRAPH_DOWN: egui::Color32 = egui::Color32::from_rgb(40, 100, 210);
+const GRAPH_UP: egui::Color32 = egui::Color32::from_rgb(0, 140, 60);
+const GRAPH_GRID: egui::Color32 = egui::Color32::from_rgb(225, 225, 225);
+
+/// Line graph of download and upload speed over the last `span`, newest at the right.
+fn paint_speed_graph(ui: &egui::Ui, rect: egui::Rect, samples: &[SpeedSample], span: Duration, now: Instant) {
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, win32::WINDOW);
+    win32::sunken(&painter, rect);
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let plot = egui::Rect::from_min_max(rect.min + egui::vec2(62.0, 8.0), rect.max - egui::vec2(10.0, 18.0));
+    if plot.width() < 20.0 || plot.height() < 20.0 {
+        return;
+    }
+    let peak = samples.iter().map(|sample| sample.down.max(sample.up)).fold(0.0_f64, f64::max);
+    let y_max = nice_ceiling(peak.max(0.5));
+    let x_of = |at: Instant| plot.right() - now.saturating_duration_since(at).as_secs_f32() / span.as_secs_f32() * plot.width();
+    let y_of = |value: f64| plot.bottom() - (value / y_max).clamp(0.0, 1.0) as f32 * plot.height();
+
+    // Grid and axis labels.
+    for step in 0..=4 {
+        let fraction = step as f32 / 4.0;
+        let y = plot.bottom() - fraction * plot.height();
+        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, GRAPH_GRID));
+        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, speed_text(y_max * f64::from(fraction)), font.clone(), win32::GRAY_TEXT);
+        let x = plot.left() + fraction * plot.width();
+        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], egui::Stroke::new(1.0, GRAPH_GRID));
+        let ago = span.mul_f32(1.0 - fraction);
+        let label = if step == 4 { "now".to_owned() } else { format!("-{}", short_duration(ago)) };
+        let anchor = if step == 0 { egui::Align2::LEFT_TOP } else if step == 4 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
+        painter.text(egui::pos2(x, plot.bottom() + 3.0), anchor, label, font.clone(), win32::GRAY_TEXT);
+    }
+    painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0, win32::SHADOW), egui::StrokeKind::Outside);
+
+    // Series. Samples stop while the app is idle; a gap wider than a few
+    // sample intervals is drawn as zero so the line does not bridge it.
+    let series = |pick: fn(&SpeedSample) -> f64| -> Vec<egui::Pos2> {
+        let mut points = Vec::with_capacity(samples.len() + 4);
+        let mut previous: Option<&SpeedSample> = None;
+        for sample in samples {
+            if let Some(last) = previous {
+                if sample.at.saturating_duration_since(last.at) > Duration::from_millis(2500) {
+                    points.push(egui::pos2(x_of(last.at + Duration::from_secs(1)), y_of(0.0)));
+                    let before = sample.at.checked_sub(Duration::from_secs(1)).unwrap_or(sample.at);
+                    points.push(egui::pos2(x_of(before), y_of(0.0)));
+                }
+            }
+            points.push(egui::pos2(x_of(sample.at), y_of(pick(sample))));
+            previous = Some(sample);
+        }
+        if let Some(last) = previous {
+            if now.saturating_duration_since(last.at) > Duration::from_millis(2500) {
+                points.push(egui::pos2(x_of(last.at + Duration::from_secs(1)), y_of(0.0)));
+                points.push(egui::pos2(plot.right(), y_of(0.0)));
+            }
+        }
+        points
+    };
+    let picks: [(fn(&SpeedSample) -> f64, egui::Color32); 2] = [(|sample| sample.up, GRAPH_UP), (|sample| sample.down, GRAPH_DOWN)];
+    for (pick, color) in picks {
+        let points = series(pick);
+        if points.len() >= 2 {
+            painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+        } else if let Some(point) = points.first() {
+            painter.circle_filled(*point, 2.0, color);
+        }
+    }
+
+    // Legend.
+    let mut x = plot.right() - 6.0;
+    for (label, color) in [("Upload", GRAPH_UP), ("Download", GRAPH_DOWN)] {
+        let galley = painter.layout_no_wrap(label.to_owned(), font.clone(), win32::TEXT);
+        x -= galley.size().x;
+        painter.galley(egui::pos2(x, plot.top() + 4.0), galley, win32::TEXT);
+        x -= 14.0;
+        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, plot.top() + 7.0), egui::vec2(10.0, 8.0)), 0.0, color);
+        x -= 14.0;
+    }
+}
+
+/// Smallest 1, 2 or 5 × 10ⁿ that is at least `value`.
+fn nice_ceiling(value: f64) -> f64 {
+    let magnitude = 10_f64.powf(value.log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .iter()
+        .map(|factor| factor * magnitude)
+        .find(|candidate| *candidate >= value)
+        .unwrap_or(10.0 * magnitude)
+}
+
+/// "45 s" or "5 min".
+fn short_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds % 60 == 0 { format!("{} min", seconds / 60) } else { format!("{seconds} s") }
 }
 
 fn file_row_details(ui: &mut egui::Ui, dir: bool, size: u64, modified: &str) {

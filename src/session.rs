@@ -2,7 +2,7 @@
 //! transfer queue. Each session has its own concurrency limit and log context.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{mpsc as std_mpsc, Arc},
@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{
     connection::{ConnectError, ConnectionProfile, NetworkSettings, SftpConnection},
-    logging::{Category, Logger, SessionLog, Severity},
+    logging::{Category, LogEntry, Logger, SessionLog, Severity},
     transfer::{CancelToken, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
 };
 
@@ -38,6 +38,120 @@ pub struct RemoteEntry {
     pub modified: String,
 }
 
+/// Column a file list is sorted by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortColumn {
+    Name,
+    Size,
+    Modified,
+    Type,
+}
+
+/// Sort order of a file list. Folders always come before files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SortOrder {
+    pub column: SortColumn,
+    pub ascending: bool,
+}
+
+impl Default for SortOrder {
+    fn default() -> Self {
+        Self { column: SortColumn::Name, ascending: true }
+    }
+}
+
+impl SortOrder {
+    /// Clicking a header sorts by that column; clicking it again flips the order.
+    pub fn toggle(&mut self, column: SortColumn) {
+        if self.column == column {
+            self.ascending = !self.ascending;
+        } else {
+            *self = Self { column, ascending: true };
+        }
+    }
+}
+
+/// What the file lists sort on.
+pub trait Sortable {
+    fn sort_name(&self) -> &str;
+    fn sort_dir(&self) -> bool;
+    fn sort_size(&self) -> u64;
+    /// ISO 8601 UTC, so its text order is its time order.
+    fn sort_modified(&self) -> &str;
+}
+
+impl Sortable for LocalEntry {
+    fn sort_name(&self) -> &str { &self.name }
+    fn sort_dir(&self) -> bool { self.dir }
+    fn sort_size(&self) -> u64 { self.size }
+    fn sort_modified(&self) -> &str { &self.modified }
+}
+
+impl Sortable for RemoteEntry {
+    fn sort_name(&self) -> &str { &self.name }
+    fn sort_dir(&self) -> bool { self.dir }
+    fn sort_size(&self) -> u64 { self.size }
+    fn sort_modified(&self) -> &str { &self.modified }
+}
+
+/// Sorts `rows` by `order`: folders first, then the column, then the name.
+pub fn sort_rows<T: Sortable>(rows: &mut [T], order: SortOrder) {
+    use std::cmp::Ordering;
+    rows.sort_by(|a, b| {
+        let by_name = || a.sort_name().to_lowercase().cmp(&b.sort_name().to_lowercase());
+        let by_column = match order.column {
+            SortColumn::Name => by_name(),
+            SortColumn::Size => a.sort_size().cmp(&b.sort_size()),
+            SortColumn::Modified => a.sort_modified().cmp(b.sort_modified()),
+            // Folders and files are already apart; files share one type.
+            SortColumn::Type => Ordering::Equal,
+        };
+        let by_column = if order.ascending { by_column } else { by_column.reverse() };
+        b.sort_dir().cmp(&a.sort_dir()).then(by_column).then_with(by_name)
+    });
+}
+
+/// Applies a click with modifiers to a selection, Explorer-style: plain click
+/// selects only the item, Ctrl toggles it, Shift selects the range from the
+/// anchor (the last item clicked without Shift) in `order`, Ctrl+Shift adds
+/// that range.
+pub fn select_click<T: Clone + PartialEq>(
+    selected: &mut Vec<T>,
+    anchor: &mut Option<T>,
+    order: &[T],
+    clicked: &T,
+    ctrl: bool,
+    shift: bool,
+) {
+    let position = |item: &T| order.iter().position(|other| other == item);
+    match (shift, anchor.as_ref().and_then(position), position(clicked)) {
+        (true, Some(from), Some(to)) => {
+            let (low, high) = if from <= to { (from, to) } else { (to, from) };
+            if !ctrl {
+                selected.clear();
+            }
+            for item in &order[low..=high] {
+                if !selected.contains(item) {
+                    selected.push(item.clone());
+                }
+            }
+        }
+        _ => {
+            if ctrl {
+                if let Some(index) = selected.iter().position(|item| item == clicked) {
+                    selected.remove(index);
+                } else {
+                    selected.push(clicked.clone());
+                }
+            } else {
+                selected.clear();
+                selected.push(clicked.clone());
+            }
+            *anchor = Some(clicked.clone());
+        }
+    }
+}
+
 pub struct TransferItem {
     pub id: usize,
     pub operation_id: Option<usize>,
@@ -52,6 +166,8 @@ pub struct TransferItem {
     pub last_speed_sample_bytes: u64,
     pub speed_mib_s: f64,
     pub state: String,
+    /// Download (into the local folder) or upload.
+    pub download: bool,
     /// "UDP" (rsftp-turbo) or "SFTP", known once data flows.
     pub protocol: Option<&'static str>,
     /// Diagnostic summary of a finished turbo download.
@@ -59,7 +175,7 @@ pub struct TransferItem {
 }
 
 impl TransferItem {
-    fn queued(id: usize, name: String, destination: PathBuf, total: u64) -> Self {
+    fn queued(id: usize, name: String, destination: PathBuf, total: u64, download: bool) -> Self {
         Self {
             id,
             operation_id: None,
@@ -74,6 +190,7 @@ impl TransferItem {
             last_speed_sample_bytes: 0,
             speed_mib_s: 0.0,
             state: "Queued".into(),
+            download,
             protocol: None,
             details: None,
         }
@@ -82,13 +199,43 @@ impl TransferItem {
     pub fn is_pending(&self) -> bool {
         matches!(self.state.as_str(), "Queued" | "Downloading" | "Uploading")
     }
+
+    pub fn is_failed(&self) -> bool {
+        self.state.starts_with("Failed") || self.state == "Cancelled"
+    }
+
+    /// Which queue tab lists this transfer.
+    pub fn tab(&self) -> QueueTab {
+        if self.is_pending() {
+            QueueTab::Pending
+        } else if self.is_failed() {
+            QueueTab::Failed
+        } else {
+            QueueTab::Complete
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum QueueTab {
     Pending,
     Complete,
+    Failed,
+    Log,
+    Statistics,
 }
+
+/// Download and upload speed of a session at one moment, in MiB/s.
+#[derive(Clone, Copy, Debug)]
+pub struct SpeedSample {
+    pub at: Instant,
+    pub down: f64,
+    pub up: f64,
+}
+
+/// How far back the statistics graph can look.
+pub const SPEED_HISTORY: Duration = Duration::from_secs(30 * 60);
+const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub enum QueueEvent {
     Started { id: usize, state: String },
@@ -121,12 +268,17 @@ pub struct Session {
     pub path: PathBuf,
     pub local_entries: Vec<LocalEntry>,
     pub local_filter: String,
-    pub local_selected: Option<PathBuf>,
+    pub local_selected: Vec<PathBuf>,
+    /// Start of a Shift-click range: the item last clicked without Shift.
+    pub local_anchor: Option<PathBuf>,
+    pub local_sort: SortOrder,
 
     pub remote_path: String,
     pub remote_entries: Vec<RemoteEntry>,
     pub remote_filter: String,
     pub remote_selected: Vec<String>,
+    pub remote_anchor: Option<String>,
+    pub remote_sort: SortOrder,
 
     pub connection: Option<Arc<SftpConnection>>,
     pub profile: Option<ConnectionProfile>,
@@ -155,6 +307,9 @@ pub struct Session {
     cancelled_operations: HashSet<usize>,
     /// Row selected in the transfer queue.
     pub selected_transfer: Option<usize>,
+    /// One sample per second, oldest first, for the statistics graph.
+    pub speed_history: VecDeque<SpeedSample>,
+    pub connected_at: Option<Instant>,
 
     pub status: String,
 }
@@ -170,11 +325,15 @@ impl Session {
             path,
             local_entries: Vec::new(),
             local_filter: String::new(),
-            local_selected: None,
+            local_selected: Vec::new(),
+            local_anchor: None,
+            local_sort: SortOrder::default(),
             remote_path: String::new(),
             remote_entries: Vec::new(),
             remote_filter: String::new(),
             remote_selected: Vec::new(),
+            remote_anchor: None,
+            remote_sort: SortOrder::default(),
             connection: None,
             profile: None,
             created_for_connect: false,
@@ -193,6 +352,8 @@ impl Session {
             operations: HashMap::new(),
             cancelled_operations: HashSet::new(),
             selected_transfer: None,
+            speed_history: VecDeque::new(),
+            connected_at: None,
             status: "Ready · No active SFTP session".into(),
         };
         session.refresh_local();
@@ -229,6 +390,30 @@ impl Session {
         self.logger.log(&self.log, category, severity, msgid, message);
     }
 
+    /// Log lines of this session, oldest first.
+    pub fn recent_log(&self) -> Vec<LogEntry> {
+        self.logger.recent(self.id)
+    }
+
+    /// Records the current speeds about once a second (call every frame).
+    pub fn sample_speeds(&mut self) {
+        let now = Instant::now();
+        if self.speed_history.back().is_some_and(|last| now.saturating_duration_since(last.at) < SPEED_SAMPLE_INTERVAL) {
+            return;
+        }
+        self.speed_history.push_back(SpeedSample { at: now, down: self.speed("Downloading"), up: self.speed("Uploading") });
+        while self.speed_history.front().is_some_and(|first| now.saturating_duration_since(first.at) > SPEED_HISTORY) {
+            self.speed_history.pop_front();
+        }
+    }
+
+    /// Bytes moved so far in this session: (downloaded, uploaded).
+    pub fn bytes_transferred(&self) -> (u64, u64) {
+        self.transfers.iter().fold((0, 0), |(down, up), item| {
+            if item.download { (down + item.transferred, up) } else { (down, up + item.transferred) }
+        })
+    }
+
     // ----- local side -----
 
     pub fn refresh_local(&mut self) {
@@ -254,7 +439,8 @@ impl Session {
 
     pub fn open_local_dir(&mut self, path: PathBuf) {
         self.path = path;
-        self.local_selected = None;
+        self.local_selected.clear();
+        self.local_anchor = None;
         self.refresh_local();
     }
 
@@ -304,6 +490,7 @@ impl Session {
                     ),
                 );
                 let host = connection.host.clone();
+                self.connected_at = Some(Instant::now());
                 let connection = Arc::new(connection);
                 if connection.begin_turbo_probe() {
                     let probe = Arc::clone(&connection);
@@ -373,6 +560,7 @@ impl Session {
         self.connect_rx = None;
         self.list_rx = None;
         self.home_fallback = false;
+        self.connected_at = None;
         self.remote_entries.clear();
         self.remote_selected.clear();
         self.status = "Disconnected".into();
@@ -560,7 +748,7 @@ impl Session {
         for entry in files {
             let id = self.next_id();
             let destination = self.path.join(&entry.name);
-            self.transfers.push(TransferItem::queued(id, entry.name.clone(), destination.clone(), entry.size));
+            self.transfers.push(TransferItem::queued(id, entry.name.clone(), destination.clone(), entry.size, true));
             self.record(id, "download", entry.path.clone(), destination.display().to_string());
             let connection = connection.clone();
             self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
@@ -583,7 +771,7 @@ impl Session {
         let remote_destination = crate::app::join_remote(&self.remote_path, &name);
         let total = fs::metadata(&local_path).map(|meta| if meta.is_file() { meta.len() } else { 0 }).unwrap_or(0);
         let id = self.next_id();
-        self.transfers.push(TransferItem::queued(id, name.clone(), local_path.clone(), total));
+        self.transfers.push(TransferItem::queued(id, name.clone(), local_path.clone(), total, false));
         self.record(id, "upload", local_path.display().to_string(), remote_destination.clone());
         let destination = remote_destination.clone();
         self.spawn_transfer(id, "Uploading", move |progress, cancel| async move {
@@ -598,7 +786,7 @@ impl Session {
         let name = remote_path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(&remote_path).to_owned();
         let destination = self.path.join(&name);
         let id = self.next_id();
-        self.transfers.push(TransferItem::queued(id, name, destination.clone(), 0));
+        self.transfers.push(TransferItem::queued(id, name, destination.clone(), 0, true));
         self.record(id, "download", remote_path.clone(), destination.display().to_string());
         let (source, target) = (remote_path.clone(), destination.clone());
         self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
@@ -640,12 +828,13 @@ impl Session {
             if let Some(existing) = self.transfers.iter().find(|item| item.operation_id == Some(id) && item.name == *relative) {
                 existing.id
             } else {
-                let child_state = self.transfers.iter().find(|item| item.id == id)
-                    .map(|item| item.state.clone()).unwrap_or_else(|| "Downloading".into());
+                let parent = self.transfers.iter().find(|item| item.id == id);
+                let child_state = parent.map(|item| item.state.clone()).unwrap_or_else(|| "Downloading".into());
+                let download = parent.is_none_or(|item| item.download);
                 self.transfers.retain(|item| item.id != id);
                 let child_id = self.next_id();
                 let now = Instant::now();
-                let mut child = TransferItem::queued(child_id, relative.clone(), PathBuf::from(relative), progress.total_bytes);
+                let mut child = TransferItem::queued(child_id, relative.clone(), PathBuf::from(relative), progress.total_bytes, download);
                 child.operation_id = Some(id);
                 child.started_at = Some(now);
                 child.last_speed_sample_at = Some(now);
@@ -796,9 +985,14 @@ impl Session {
         }
     }
 
+    /// Selected local items that can be uploaded (the ".." row cannot).
+    pub fn uploadable_selection(&self) -> Vec<PathBuf> {
+        let parent = self.path.parent();
+        self.local_selected.iter().filter(|path| Some(path.as_path()) != parent).cloned().collect()
+    }
+
     pub fn can_upload(&self) -> bool {
-        self.is_connected()
-            && self.local_selected.as_deref().is_some_and(|path| Some(path) != self.path.parent())
+        self.is_connected() && !self.uploadable_selection().is_empty()
     }
 }
 
@@ -810,7 +1004,53 @@ pub(crate) fn needs_canonical_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::needs_canonical_path;
+    use super::*;
+
+    fn local(name: &str, dir: bool, size: u64, modified: &str) -> LocalEntry {
+        LocalEntry { name: name.into(), path: PathBuf::from(name), dir, size, modified: modified.into() }
+    }
+
+    #[test]
+    fn sorting_keeps_folders_first_and_flips_on_toggle() {
+        let mut rows = vec![
+            local("b.txt", false, 5, "2026-01-02T00:00:00Z"),
+            local("zdir", true, 0, "2026-01-01T00:00:00Z"),
+            local("a.txt", false, 9, "2026-01-03T00:00:00Z"),
+            local("adir", true, 0, "2026-01-04T00:00:00Z"),
+        ];
+        let names = |rows: &[LocalEntry]| rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+        let mut order = SortOrder::default();
+        sort_rows(&mut rows, order);
+        assert_eq!(names(&rows), ["adir", "zdir", "a.txt", "b.txt"]);
+        order.toggle(SortColumn::Size);
+        sort_rows(&mut rows, order);
+        assert_eq!(names(&rows), ["adir", "zdir", "b.txt", "a.txt"]);
+        order.toggle(SortColumn::Size);
+        assert!(!order.ascending);
+        sort_rows(&mut rows, order);
+        assert_eq!(names(&rows), ["zdir", "adir", "a.txt", "b.txt"]);
+        order.toggle(SortColumn::Modified);
+        sort_rows(&mut rows, order);
+        assert_eq!(names(&rows), ["zdir", "adir", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn clicks_select_toggle_and_range() {
+        let order: Vec<u32> = (1..=6).collect();
+        let (mut selected, mut anchor) = (Vec::new(), None);
+        select_click(&mut selected, &mut anchor, &order, &2, false, false);
+        assert_eq!(selected, [2]);
+        select_click(&mut selected, &mut anchor, &order, &4, true, false);
+        assert_eq!(selected, [2, 4]);
+        select_click(&mut selected, &mut anchor, &order, &4, true, false);
+        assert_eq!((selected.clone(), anchor), (vec![2], Some(4)));
+        select_click(&mut selected, &mut anchor, &order, &6, false, true);
+        assert_eq!(selected, [4, 5, 6]);
+        select_click(&mut selected, &mut anchor, &order, &1, true, true);
+        assert_eq!(selected, [4, 5, 6, 1, 2, 3]);
+        select_click(&mut selected, &mut anchor, &order, &3, false, false);
+        assert_eq!((selected.clone(), anchor), (vec![3], Some(3)));
+    }
 
     #[test]
     fn only_clean_absolute_paths_skip_canonicalisation() {

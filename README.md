@@ -68,11 +68,13 @@ one. If both fail, an error dialog explains why and the details are appended to
 - Optionally save passwords per login (user, host and port) in the system credential store: Windows Credential Manager, or a Secret Service keyring such as GNOME Keyring or KWallet on Linux. Passwords are never written to the profiles file; a password is saved only after it has logged in successfully or when a profile is saved with one entered.
 - Store trusted fingerprints in `~/.config/rust-sftp-client/known_hosts.json`.
 - Browse remote directories, navigate into directories and to the parent, and filter remote entries.
-- Select multiple remote files with Ctrl/Command-click and download them into the current local pane directory.
+- Select several items in either pane with Ctrl/Command-click (toggle) and Shift-click (range), then upload or download them together; sort either pane by clicking the Name, Size, Modified or Type column header (folders stay first).
+- The local pane opens in the folder browsed last time the app ran.
 - Drag local files or folders onto the remote pane to upload them recursively; each discovered file appears as its own transfer row.
 - Drag remote files or folders onto the local pane to download them recursively; each discovered file appears as its own transfer row and large files retain segmented downloads.
 - Stop a single transfer (or a whole folder transfer) or all transfers from the transfer queue's right-click menu. Stopped transfers clean up after themselves: partial downloads' temporary files and partially uploaded remote files are removed.
-- Show per-file queued, active, completed, and failed transfers with independent byte progress, elapsed time, and ETA.
+- Show per-file queued, active, completed, and failed transfers with independent byte progress, elapsed time, and ETA, on Pending, Complete and Failed tabs of the queue panel.
+- A Log tab shows the selected session's events (kept in memory, whether or not file logging is on), and a Statistics tab graphs the session's download and upload speed over the last 1–30 minutes with peak, average and total figures.
 - Download large files through the existing bounded, retrying segmented range-download engine.
 - Open connection, password, host-key trust, error, and transfer-settings prompts in separate native windows.
 

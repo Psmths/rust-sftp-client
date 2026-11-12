@@ -12,6 +12,9 @@ pub struct AppSettings {
     pub transfer: TransferSettings,
     pub network: NetworkSettings,
     pub logging: LoggingSettings,
+    /// Local folder shown when the app starts: the one last browsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_local_dir: Option<PathBuf>,
 }
 
 pub fn config_dir() -> Result<PathBuf, String> {
@@ -52,5 +55,6 @@ mod tests {
         assert!(parsed.logging.log_connections);
         assert_eq!(parsed.transfer, TransferSettings::default());
         assert_eq!(parsed.network, NetworkSettings::default());
+        assert_eq!(parsed.last_local_dir, None);
     }
 }

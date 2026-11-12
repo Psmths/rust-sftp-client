@@ -239,14 +239,42 @@ pub fn button_sized(ui: &mut Ui, enabled: bool, text: &str, min_width: f32) -> R
 
 /// List-view column header cell.
 pub fn header_cell(ui: &mut Ui, width: f32, height: f32, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    let _ = header_button(ui, width, height, text, None);
+}
+
+/// Clickable list-view column header; `sorted` shows the sort direction
+/// (`Some(true)` ascending) on the column the list is sorted by.
+pub fn header_button(ui: &mut Ui, width: f32, height: f32, text: &str, sorted: Option<bool>) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
+        let pressed = response.is_pointer_button_down_on() && response.contains_pointer();
         painter.rect_filled(rect, 0.0, FACE);
-        thin_raised(painter, rect);
-        let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), width - 10.0, TextStyle::Body);
-        painter.galley(Pos2::new(rect.left() + 5.0, rect.center().y - galley.size().y / 2.0), galley, TEXT);
+        if pressed {
+            edge(painter, painter.round_rect_to_pixels(rect), SHADOW, HIGHLIGHT);
+        } else {
+            thin_raised(painter, rect);
+        }
+        let nudge = if pressed { 1.0 } else { 0.0 };
+        let arrow_room = if sorted.is_some() { 14.0 } else { 0.0 };
+        let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), (width - 10.0 - arrow_room).max(0.0), TextStyle::Body);
+        painter.galley(Pos2::new(rect.left() + 5.0 + nudge, rect.center().y - galley.size().y / 2.0 + nudge), galley, TEXT);
+        if let Some(ascending) = sorted {
+            // Explorer-style sort arrow at the right edge of the header.
+            let center = Pos2::new(rect.right() - 9.0 + nudge, rect.center().y + nudge);
+            let (tip, base) = if ascending { (-3.0, 2.0) } else { (3.0, -2.0) };
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(center.x, center.y + tip),
+                    Pos2::new(center.x + 4.0, center.y + base),
+                    Pos2::new(center.x - 4.0, center.y + base),
+                ],
+                SHADOW,
+                Stroke::NONE,
+            ));
+        }
     }
+    response
 }
 
 /// COLOR_SCROLLBAR: the scroll bar track (classic Windows dithers white and
