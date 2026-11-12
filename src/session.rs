@@ -649,8 +649,10 @@ impl Session {
         self.connect_rx = Some(rx);
         self.status = format!("Connecting to {}:{} …", profile.host, profile.port);
         let events = self.event_log();
+        // Listed through the rsftp-turbo helper while the SFTP channels open.
+        let start_folder = Some(start_folder(&profile).0);
         self.runtime.spawn(async move {
-            let result = SftpConnection::connect(&profile, password.as_deref(), trusted.as_deref(), network, events).await;
+            let result = SftpConnection::connect(&profile, password.as_deref(), trusted.as_deref(), network, events, start_folder).await;
             let _ = tx.send(result);
         });
     }
@@ -682,25 +684,22 @@ impl Session {
                 self.remote_path = String::new();
                 self.remote_selected.clear();
                 self.status = format!("Connected to {host}");
-                let default_path = self
-                    .profile
-                    .as_ref()
-                    .and_then(|profile| profile.default_remote_path.clone())
-                    .filter(|path| !path.trim().is_empty());
-                match default_path {
-                    Some(path) => {
-                        // SFTP servers do not expand `~`; relative paths start at home.
-                        let path = path.trim();
-                        let path = match path.strip_prefix('~') {
-                            Some("") => ".",
-                            Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/'),
-                            _ => path,
-                        };
-                        self.load_remote(if path.is_empty() { "." } else { path });
-                        self.home_fallback = true;
+                let (folder, is_default) = self.profile.as_ref().map(start_folder).unwrap_or_else(|| (".".into(), false));
+                let early = self.connection.as_ref().and_then(|connection| connection.take_early_listing());
+                match early {
+                    // Already listed during connect: hand it to the usual listing handling.
+                    Some((result, took)) => {
+                        let (tx, rx) = std_mpsc::channel();
+                        let _ = tx.send(result.map(|(path, listed)| {
+                            let entries = remote_entries(&path, listed);
+                            (path, entries)
+                        }));
+                        self.list_rx = Some(rx);
+                        self.list_started = Some((Instant::now().checked_sub(took).unwrap_or_else(Instant::now), folder));
                     }
-                    None => self.load_remote("."),
+                    None => self.load_remote(&folder),
                 }
+                self.home_fallback = is_default;
                 ConnectOutcome::Connected { password }
             }
             Err(ConnectError::HostKeyRequired { fingerprint }) => {
@@ -764,18 +763,7 @@ impl Session {
             let result = async {
                 // Through the rsftp-turbo helper when it can list, else SFTP.
                 let (path, listed) = connection.list_directory(&requested).await?;
-                let mut entries: Vec<RemoteEntry> = listed
-                    .into_iter()
-                    .map(|entry| RemoteEntry {
-                        path: crate::app::join_remote(&path, &entry.name),
-                        name: entry.name,
-                        dir: entry.dir,
-                        size: entry.size,
-                        modified: entry.mtime.map(|t| crate::app::format_unix_utc(t as i64)).unwrap_or_else(|| "—".into()),
-                        folder: String::new(),
-                    })
-                    .collect();
-                entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+                let entries = remote_entries(&path, listed);
                 Ok((path, entries))
             }.await;
             let _ = tx.send(result);
@@ -1262,6 +1250,38 @@ impl Session {
 }
 
 
+/// Listing entries of the remote folder `path`, folders first.
+fn remote_entries(path: &str, listed: Vec<crate::connection::DirEntry>) -> Vec<RemoteEntry> {
+    let mut entries: Vec<RemoteEntry> = listed
+        .into_iter()
+        .map(|entry| RemoteEntry {
+            path: crate::app::join_remote(path, &entry.name),
+            name: entry.name,
+            dir: entry.dir,
+            size: entry.size,
+            modified: entry.mtime.map(|t| crate::app::format_unix_utc(t as i64)).unwrap_or_else(|| "—".into()),
+            folder: String::new(),
+        })
+        .collect();
+    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    entries
+}
+
+/// The remote folder to open after connecting, and whether it is the
+/// profile's default folder (which falls back to home if it cannot be listed).
+/// SFTP servers do not expand `~`; relative paths start at the home folder.
+fn start_folder(profile: &ConnectionProfile) -> (String, bool) {
+    let Some(path) = profile.default_remote_path.as_deref().map(str::trim).filter(|path| !path.is_empty()) else {
+        return (".".into(), false);
+    };
+    let path = match path.strip_prefix('~') {
+        Some("") => ".",
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/'),
+        _ => path,
+    };
+    (if path.is_empty() { ".".into() } else { path.to_owned() }, true)
+}
+
 /// True unless `path` is already absolute and free of `.`/`..` segments.
 pub(crate) fn needs_canonical_path(path: &str) -> bool {
     !path.starts_with('/') || path.split('/').any(|part| part == "." || part == "..")
@@ -1303,6 +1323,20 @@ mod tests {
         assert!(!order.ascending);
         sort_rows(&mut rows, order);
         assert_eq!(names(&rows), ["zdir", "adir", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn start_folder_follows_the_profile() {
+        let profile = |folder: Option<&str>| ConnectionProfile {
+            name: "p".into(), host: "h".into(), port: 22, username: "u".into(),
+            auth_method: crate::connection::AuthMethod::Password, private_key_path: None,
+            save_password: false, default_remote_path: folder.map(str::to_owned),
+        };
+        assert_eq!(start_folder(&profile(None)), (".".to_owned(), false));
+        assert_eq!(start_folder(&profile(Some("  "))), (".".to_owned(), false));
+        assert_eq!(start_folder(&profile(Some("/srv/media"))), ("/srv/media".to_owned(), true));
+        assert_eq!(start_folder(&profile(Some("~"))), (".".to_owned(), true));
+        assert_eq!(start_folder(&profile(Some("~/projects"))), ("projects".to_owned(), true));
     }
 
     #[test]

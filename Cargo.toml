@@ -19,6 +19,7 @@ eframe = { version = "0.33", features = ["wgpu"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
 russh = { version = "0.63.3", features = ["aws-lc-rs"] }
 russh-sftp = "3.0.1"

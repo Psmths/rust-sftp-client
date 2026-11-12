@@ -3675,6 +3675,7 @@ name = "rust-sftp-client"
 version = "0.4.4"
 dependencies = [
  "eframe",
+ "futures",
  "keyring",
  "md5",
  "rsftp-turbo-proto",

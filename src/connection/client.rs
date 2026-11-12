@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering}, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use russh::{client, keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate}, ChannelMsg};
 use russh::keys::ssh_key::HashAlg;
@@ -167,6 +167,9 @@ pub struct SftpConnection {
     events: EventLog,
     /// `HELPER_LISTING_*`: learned from the first listing.
     helper_listing: AtomicU8,
+    /// The start folder, listed through the helper during connect, and how
+    /// long that took; taken by the session.
+    early_listing: Mutex<Option<(Result<(String, Vec<DirEntry>), String>, Duration)>>,
     /// Turbo segments in flight across all downloads of this connection.
     turbo_slots: Arc<Semaphore>,
     turbo_slot_count: AtomicUsize,
@@ -185,6 +188,7 @@ impl SftpConnection {
         trusted_fingerprint: Option<&str>,
         network: NetworkSettings,
         events: EventLog,
+        start_folder: Option<String>,
     ) -> Result<Self, ConnectError> {
         use crate::logging::Severity;
         profile.validate().map_err(|e| ConnectError::Ssh(e.to_string()))?;
@@ -250,10 +254,10 @@ impl SftpConnection {
         }
         events(Severity::Notice, "AUTH", &format!("Authentication succeeded as {}", profile.username));
 
-        let sftp = Arc::new(open_sftp_channel(&ssh, &network).await?);
-        // Reserve the rsftp-turbo ticket channel before the extra SFTP
-        // channels take the remaining session slots (OpenSSH MaxSessions).
-        let (tickets, turbo_state) = if network.turbo {
+        // The rsftp-turbo helper first: it reserves its channel before the
+        // SFTP channels take the remaining session slots (OpenSSH
+        // MaxSessions), and it can list the start folder while they open.
+        let (mut tickets, mut turbo_state) = if network.turbo {
             match open_ticket_stream(&ssh).await {
                 Ok(stream) => {
                     events(Severity::Info, "TURBO", "Started the rsftp-turbo helper over SSH");
@@ -268,16 +272,44 @@ impl SftpConnection {
             events(Severity::Info, "TURBO", "rsftp-turbo is turned off in the settings; downloads use SFTP");
             (None, TurboState::Disabled)
         };
-        let mut channels = vec![Arc::clone(&sftp)];
-        // Extra channels are an optimisation: stop quietly at the server's
-        // session limit (OpenSSH MaxSessions defaults to 10).
-        while channels.len() < network.channel_count() {
-            match open_sftp_channel(&ssh, &network).await {
-                Ok(extra) => channels.push(Arc::new(extra)),
-                Err(_) => break,
-            }
-        }
+
+        let early = async {
+            let (stream, path) = (tickets.as_mut()?, start_folder.as_deref()?);
+            events(Severity::Info, "LIST", &format!("Listing {path} through the rsftp-turbo helper while the SFTP channels open"));
+            let started = Instant::now();
+            Some(match exchange_line(stream, list_request(path)?, LIST_TIMEOUT).await {
+                Ok(reply) => match listing_from_reply(reply) {
+                    Some(result) => EarlyListing::Listed(result, started.elapsed()),
+                    None => EarlyListing::NotSupported,
+                },
+                Err(TicketError::Unavailable(reason) | TicketError::Refused(reason)) => EarlyListing::HelperFailed(reason),
+            })
+        };
+        let (early, channels) = tokio::join!(early, open_sftp_channels(&ssh, &network, network.channel_count()));
+        let channels = channels?;
+        let sftp = Arc::clone(&channels[0]);
         events(Severity::Info, "SFTP", &format!("Opened {} SFTP channel(s)", channels.len()));
+
+        let mut helper_listing = HELPER_LISTING_UNKNOWN;
+        let early_listing = match early {
+            Some(EarlyListing::Listed(result, took)) => {
+                helper_listing = HELPER_LISTING_YES;
+                Some((result, took))
+            }
+            Some(EarlyListing::NotSupported) => {
+                helper_listing = HELPER_LISTING_NO;
+                events(Severity::Info, "LIST", "Directory listings use SFTP (the rsftp-turbo helper is too old to list)");
+                None
+            }
+            Some(EarlyListing::HelperFailed(reason)) => {
+                // Its stream is out of step now: turbo is off for this connection.
+                tickets = None;
+                events(Severity::Warning, "TURBO", &format!("rsftp-turbo helper stopped ({reason}); falling back to SFTP"));
+                turbo_state = TurboState::Unavailable(reason);
+                None
+            }
+            None => None,
+        };
 
         Ok(Self {
             events,
@@ -288,7 +320,8 @@ impl SftpConnection {
             network,
             turbo: Mutex::new(TurboInfo { state: turbo_state, last_fallback: None }),
             tickets: tokio::sync::Mutex::new(tickets),
-            helper_listing: AtomicU8::new(HELPER_LISTING_UNKNOWN),
+            helper_listing: AtomicU8::new(helper_listing),
+            early_listing: Mutex::new(early_listing),
             turbo_slots: Arc::new(Semaphore::new(turbo::CONNECTION_FETCH_SLOTS)),
             turbo_slot_count: AtomicUsize::new(turbo::CONNECTION_FETCH_SLOTS),
             host: profile.host.clone(),
@@ -345,6 +378,11 @@ impl SftpConnection {
         self.sftp_list(path).await
     }
 
+    /// The start folder's listing if the helper produced it during connect.
+    pub fn take_early_listing(&self) -> Option<(Result<(String, Vec<DirEntry>), String>, Duration)> {
+        self.early_listing.lock().ok().and_then(|mut early| early.take())
+    }
+
     /// `Some(true)` once a listing came from the rsftp-turbo helper,
     /// `Some(false)` once listings fell back to SFTP, `None` before the first.
     pub fn listing_via_helper(&self) -> Option<bool> {
@@ -358,26 +396,8 @@ impl SftpConnection {
     /// `None` if the helper cannot list (use SFTP); otherwise its answer,
     /// which may be an error such as "permission denied".
     async fn helper_list(&self, path: &str) -> Option<Result<(String, Vec<DirEntry>), String>> {
-        let request = StreamRequest { list: Some(path.to_owned()) };
-        let line = serde_json::to_string(&request).ok()?;
-        let reply = self.helper_exchange(line, LIST_TIMEOUT).await.ok()?;
-        // A helper too old to list answered as if the request were a file name.
-        if !reply.list_reply {
-            return None;
-        }
-        Some(match (reply.listing, reply.error) {
-            (Some(listing), _) => Ok((
-                listing.path,
-                listing
-                    .entries
-                    .into_iter()
-                    .filter(|entry| entry.name != "." && entry.name != "..")
-                    .map(|entry| DirEntry { name: entry.name, dir: entry.dir, size: entry.size, mtime: entry.mtime })
-                    .collect(),
-            )),
-            (None, Some(error)) => Err(error),
-            (None, None) => Err("empty listing reply from rsftp-turbo".into()),
-        })
+        let reply = self.helper_exchange(list_request(path)?, LIST_TIMEOUT).await.ok()?;
+        listing_from_reply(reply)
     }
 
     async fn sftp_list(&self, path: &str) -> Result<(String, Vec<DirEntry>), String> {
@@ -1010,49 +1030,115 @@ impl SftpConnection {
     /// Requests are serialised on the one channel. A helper that fails,
     /// answers garbage or times out is dropped (its stream would be out of
     /// step), which turns turbo off for this connection.
-    async fn helper_exchange(&self, mut line: String, limit: Duration) -> Result<StreamReply, TicketError> {
-        if !line.ends_with('\n') {
-            line.push('\n');
-        }
+    async fn helper_exchange(&self, line: String, limit: Duration) -> Result<StreamReply, TicketError> {
         let mut guard = self.tickets.lock().await;
         let Some(stream) = guard.as_mut() else {
             return Err(TicketError::Unavailable("the rsftp-turbo helper is not running".into()));
         };
-        let exchange = async {
-            stream.channel.data(line.as_bytes()).await
-                .map_err(|error| TicketError::Unavailable(format!("rsftp-turbo channel failed: {error}")))?;
-            let mut exit_status = None;
-            loop {
-                if let Some(end) = stream.stdout.iter().position(|&byte| byte == b'\n') {
-                    let line: Vec<u8> = stream.stdout.drain(..=end).collect();
-                    return serde_json::from_slice::<StreamReply>(&line).map_err(|error| {
-                        TicketError::Unavailable(format!("unexpected reply from rsftp-turbo: {error}"))
-                    });
-                }
-                match stream.channel.wait().await {
-                    Some(ChannelMsg::Data { data }) => stream.stdout.extend_from_slice(&data),
-                    Some(ChannelMsg::ExtendedData { data, .. }) => stream.stderr.extend_from_slice(&data),
-                    Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
-                    Some(ChannelMsg::Failure) => {
-                        return Err(TicketError::Unavailable("the server refused to run rsftp-turbo".into()));
-                    }
-                    // Eof may come before the exit status; wait for Close.
-                    Some(ChannelMsg::Close) | None => return Err(helper_exited(exit_status, &stream.stderr)),
-                    Some(_) => {}
-                }
-            }
-        };
-        let result = match tokio::time::timeout(limit, exchange).await {
-            Ok(result) => result,
-            Err(_) => Err(TicketError::Unavailable(
-                "timed out waiting for the rsftp-turbo helper (is rsftp-turbo on the server up to date?)".into(),
-            )),
-        };
+        let result = exchange_line(stream, line, limit).await;
         // A helper that died or stopped answering is unusable from now on.
         if matches!(result, Err(TicketError::Unavailable(_))) {
             *guard = None;
         }
         result
+    }
+}
+
+/// Writes one request line to the helper and reads its JSON reply line.
+/// After an `Unavailable` error the stream is out of step and must be dropped.
+async fn exchange_line(stream: &mut TicketStream, mut line: String, limit: Duration) -> Result<StreamReply, TicketError> {
+    if !line.ends_with('\n') {
+        line.push('\n');
+    }
+    let exchange = async {
+        stream.channel.data(line.as_bytes()).await
+            .map_err(|error| TicketError::Unavailable(format!("rsftp-turbo channel failed: {error}")))?;
+        let mut exit_status = None;
+        loop {
+            if let Some(end) = stream.stdout.iter().position(|&byte| byte == b'\n') {
+                let line: Vec<u8> = stream.stdout.drain(..=end).collect();
+                return serde_json::from_slice::<StreamReply>(&line).map_err(|error| {
+                    TicketError::Unavailable(format!("unexpected reply from rsftp-turbo: {error}"))
+                });
+            }
+            match stream.channel.wait().await {
+                Some(ChannelMsg::Data { data }) => stream.stdout.extend_from_slice(&data),
+                Some(ChannelMsg::ExtendedData { data, .. }) => stream.stderr.extend_from_slice(&data),
+                Some(ChannelMsg::ExitStatus { exit_status: status }) => exit_status = Some(status),
+                Some(ChannelMsg::Failure) => {
+                    return Err(TicketError::Unavailable("the server refused to run rsftp-turbo".into()));
+                }
+                // Eof may come before the exit status; wait for Close.
+                Some(ChannelMsg::Close) | None => return Err(helper_exited(exit_status, &stream.stderr)),
+                Some(_) => {}
+            }
+        }
+    };
+    let result = match tokio::time::timeout(limit, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(TicketError::Unavailable(
+            "timed out waiting for the rsftp-turbo helper (is rsftp-turbo on the server up to date?)".into(),
+        )),
+    };
+    result
+}
+
+/// Interprets the helper's answer to a list request; `None` if the helper is
+/// too old to list (it answered as if the request were a file name).
+fn listing_from_reply(reply: StreamReply) -> Option<Result<(String, Vec<DirEntry>), String>> {
+    if !reply.list_reply {
+        return None;
+    }
+    Some(match (reply.listing, reply.error) {
+        (Some(listing), _) => Ok((
+            listing.path,
+            listing
+                .entries
+                .into_iter()
+                .filter(|entry| entry.name != "." && entry.name != "..")
+                .map(|entry| DirEntry { name: entry.name, dir: entry.dir, size: entry.size, mtime: entry.mtime })
+                .collect(),
+        )),
+        (None, Some(error)) => Err(error),
+        (None, None) => Err("empty listing reply from rsftp-turbo".into()),
+    })
+}
+
+fn list_request(path: &str) -> Option<String> {
+    serde_json::to_string(&StreamRequest { list: Some(path.to_owned()) }).ok()
+}
+
+/// What listing the start folder through the helper during connect gave.
+enum EarlyListing {
+    /// The helper listed it (or reported why it could not), and how long it took.
+    Listed(Result<(String, Vec<DirEntry>), String>, Duration),
+    /// The helper is too old to list.
+    NotSupported,
+    /// The helper stopped working.
+    HelperFailed(String),
+}
+
+/// Opens `count` SFTP channels at once; at least one must open. Channels
+/// beyond the server's session limit (OpenSSH MaxSessions) fail quietly.
+async fn open_sftp_channels(
+    ssh: &client::Handle<VerifyHostKey>,
+    network: &NetworkSettings,
+    count: usize,
+) -> Result<Vec<Arc<SftpSession>>, ConnectError> {
+    let results = futures::future::join_all((0..count.max(1)).map(|_| open_sftp_channel(ssh, network))).await;
+    let mut channels = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(channel) => channels.push(Arc::new(channel)),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match (channels.is_empty(), first_error) {
+        (true, Some(error)) => Err(error),
+        _ => Ok(channels),
     }
 }
 
