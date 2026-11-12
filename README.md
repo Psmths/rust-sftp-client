@@ -70,6 +70,8 @@ one. If both fail, an error dialog explains why and the details are appended to
 - Browse remote directories, navigate into directories and to the parent, and filter remote entries.
 - Select several items in either pane with Ctrl/Command-click (toggle) and Shift-click (range), then upload or download them together; sort either pane by clicking the Name, Size, Modified or Type column header (folders stay first).
 - The local pane opens in the folder browsed last time the app ran.
+- The eye button on the toolbar shows or hides hidden items in both panes (dot files, and on Windows files marked hidden); hidden items are shown by default and the choice is remembered.
+- Tick *Recursive* next to a pane's filter box to search every folder below the current one for names containing the filter text. Results show their relative folder and can be transferred, dragged, renamed and deleted like any item; double-clicking a found folder opens it. Remote searches list folders through the rsftp-turbo helper when available, else SFTP. Symbolic links are not followed and at most 5000 results are listed.
 - Drag local files or folders onto the remote pane to upload them recursively; each discovered file appears as its own transfer row.
 - Drag remote files or folders onto the local pane to download them recursively; each discovered file appears as its own transfer row and large files retain segmented downloads.
 - Stop a single transfer (or a whole folder transfer) or all transfers from the transfer queue's right-click menu. Stopped transfers clean up after themselves: partial downloads' temporary files and partially uploaded remote files are removed.

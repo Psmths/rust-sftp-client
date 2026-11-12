@@ -477,6 +477,8 @@ pub enum Icon {
     Download,
     Warning,
     Information,
+    /// An eye: show / hide hidden items.
+    HiddenItems,
 }
 
 /// Paint `icon` into `rect` (any square size; drawn on a 16-unit grid).
@@ -599,6 +601,23 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
             fill_rect(7.2, 5.0, 8.8, 10.5, Color32::BLACK);
             fill_rect(7.2, 11.8, 8.8, 13.4, Color32::BLACK);
         }
+        Icon::HiddenItems => {
+            // Almond-shaped eye with an iris and pupil.
+            let outline: Vec<Pos2> = (0..=16)
+                .map(|k| {
+                    let t = k as f32 / 16.0 * std::f32::consts::PI;
+                    p(8.0 - 7.0 * t.cos(), 8.0 - 4.6 * t.sin())
+                })
+                .chain((1..16).map(|k| {
+                    let t = k as f32 / 16.0 * std::f32::consts::PI;
+                    p(8.0 + 7.0 * t.cos(), 8.0 + 4.6 * t.sin())
+                }))
+                .collect();
+            painter.add(egui::Shape::convex_polygon(outline, c(Color32::WHITE), Stroke::new(scale.max(1.0), c(DARK_SHADOW))));
+            painter.circle_filled(p(8.0, 8.0), 3.0 * scale, c(blue));
+            painter.circle_filled(p(8.0, 8.0), 1.3 * scale, c(Color32::BLACK));
+            painter.circle_filled(p(7.0, 7.0), 0.7 * scale, c(Color32::WHITE));
+        }
         Icon::Information => {
             let center = p(8.0, 8.0);
             painter.circle(center, 7.2 * scale, c(Color32::from_rgb(30, 90, 200)), Stroke::new(scale.max(1.0), c(Color32::from_rgb(10, 50, 130))));
@@ -623,6 +642,30 @@ pub fn icon_button(ui: &mut Ui, enabled: bool, icon: Icon, tooltip: &str) -> Res
             edge(painter, painter.round_rect_to_pixels(rect), HIGHLIGHT, SHADOW);
         }
         paint_icon(painter, icon_rect, icon, enabled);
+    }
+    response.on_hover_text(tooltip)
+}
+
+/// Toolbar button that stays pressed in while `on`, like a checked Win32
+/// toolbar button.
+pub fn icon_toggle(ui: &mut Ui, on: bool, icon: Icon, tooltip: &str) -> Response {
+    let size = egui::vec2(25.0, 23.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let pressed = response.is_pointer_button_down_on() && response.contains_pointer();
+        let mut icon_rect = Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0));
+        if on || pressed {
+            if on {
+                // Checked buttons show the dithered light face.
+                painter.rect_filled(rect, 0.0, SCROLL_TRACK);
+            }
+            thin_sunken(painter, rect);
+            icon_rect = icon_rect.translate(egui::vec2(1.0, 1.0));
+        } else if response.hovered() {
+            edge(painter, painter.round_rect_to_pixels(rect), HIGHLIGHT, SHADOW);
+        }
+        paint_icon(painter, icon_rect, icon, true);
     }
     response.on_hover_text(tooltip)
 }

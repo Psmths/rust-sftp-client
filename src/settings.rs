@@ -12,6 +12,8 @@ pub struct AppSettings {
     pub transfer: TransferSettings,
     pub network: NetworkSettings,
     pub logging: LoggingSettings,
+    /// Hide dot files (and, on Windows, files marked hidden) in both panes.
+    pub hide_hidden_items: bool,
     /// Local folder shown when the app starts: the one last browsed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_local_dir: Option<PathBuf>,

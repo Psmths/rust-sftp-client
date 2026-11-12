@@ -815,12 +815,14 @@ impl SftpApp {
                 let Some(entry) = entries.first().cloned() else { return true; };
                 if entry.name == new_name { return true; }
                 let session = &self.sessions[index];
-                if session.remote_entries.iter().any(|existing| existing.name == new_name) {
+                // Search results may sit in a subfolder: rename within their own folder.
+                // (The server refuses to rename onto an existing name there.)
+                if entry.folder.is_empty() && session.remote_entries.iter().any(|existing| existing.name == new_name) {
                     self.rename_error = format!("\"{new_name}\" already exists.");
                     return false;
                 }
                 let Some(connection) = session.connection.clone() else { return true; };
-                let destination = join_remote(&session.remote_path, &new_name);
+                let destination = join_remote(&remote_parent(&entry.path), &new_name);
                 let tx = self.op_tx.clone();
                 let session_id = session.id;
                 self.ops_pending += 1;
@@ -1061,7 +1063,8 @@ impl SftpApp {
             }
             ui.add_space(6.0);
             ui.label("Filter:");
-            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].local_filter).desired_width(f32::INFINITY));
+            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].local_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
+            ui.checkbox(&mut self.sessions[a].local_recursive, "Recursive").on_hover_text(RECURSIVE_TIP);
         });
         ui.horizontal(|ui| {
             ui.label("Address:");
@@ -1085,16 +1088,28 @@ impl SftpApp {
         });
         ui.add_space(2.0);
 
-        let filter = self.sessions[a].local_filter.to_lowercase();
-        let mut rows: Vec<LocalEntry> = self.sessions[a].local_entries.iter()
-            .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        let filter = self.sessions[a].local_filter.trim().to_lowercase();
+        let searching = self.sessions[a].searching_local();
+        let show_hidden = self.sessions[a].show_hidden;
+        let mut rows: Vec<LocalEntry> = if searching {
+            self.sessions[a].local_search.as_ref().map(|search| search.results.clone()).unwrap_or_default()
+        } else {
+            self.sessions[a].local_entries.iter()
+                .filter(|entry| (show_hidden || !entry.hidden) && entry.name.to_lowercase().contains(&filter))
+                .cloned().collect()
+        };
         sort_rows(&mut rows, self.sessions[a].local_sort);
-        if let Some(parent) = self.sessions[a].path.parent() {
+        let footer = list_footer(rows.len(), self.sessions[a].uploadable_selection().len(), searching,
+            self.sessions[a].local_search.as_ref().map(|search| (search.done, search.truncated)));
+        // Rows the context menu can act on (".." excluded).
+        let listed = rows.clone();
+        if let (Some(parent), false) = (self.sessions[a].path.parent(), searching) {
             rows.insert(0, LocalEntry {
                 name: "..".into(), path: parent.to_path_buf(), dir: true,
-                size: 0, modified: "—".into(),
+                size: 0, modified: "—".into(), hidden: false, folder: String::new(),
             });
         }
+        let mut open_dir = None;
         // Row order for Shift-click ranges (".." is never part of a range).
         let order: Vec<PathBuf> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
@@ -1106,7 +1121,7 @@ impl SftpApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let selected = self.sessions[a].local_selected.contains(&entry.path);
-                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.name, entry.dir, selected);
+                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.label(), entry.dir, selected);
                         // Dragging a selected item drags the whole selection; dragging
                         // any other item selects just it first, as Explorer does.
                         if response.dragged() && entry.name != ".." {
@@ -1152,13 +1167,13 @@ impl SftpApp {
                         let targets = || -> Vec<LocalEntry> {
                             if in_selection {
                                 let selected = &self.sessions[a].local_selected;
-                                self.sessions[a].local_entries.iter().filter(|e| selected.contains(&e.path)).cloned().collect()
+                                listed.iter().filter(|e| selected.contains(&e.path)).cloned().collect()
                             } else {
                                 vec![entry.clone()]
                             }
                         };
                         match action {
-                            Some(RowAction::Open) => self.sessions[a].open_local_dir(entry.path.clone()),
+                            Some(RowAction::Open) => open_dir = Some(entry.path.clone()),
                             Some(RowAction::Transfer) => {
                                 for target in targets() { self.sessions[a].queue_upload(target.path); }
                             }
@@ -1170,7 +1185,7 @@ impl SftpApp {
                             }
                             None => {}
                         }
-                        if response.double_clicked() && entry.dir { self.sessions[a].open_local_dir(entry.path.clone()); }
+                        if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
                         file_row_details(ui, entry.dir, entry.size, &entry.modified);
                     });
                 }
@@ -1178,8 +1193,12 @@ impl SftpApp {
             sort_click = paint_list_header(ui, header, name_width, self.sessions[a].local_sort);
         });
         if let Some(column) = sort_click { self.sessions[a].local_sort.toggle(column); }
-        let visible = self.sessions[a].local_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
-        ui.label(format!("{} selected, {visible} object(s)", self.sessions[a].uploadable_selection().len()));
+        if let Some(path) = open_dir {
+            // Opening a folder found by a search shows that folder, not more results.
+            if searching { self.sessions[a].local_filter.clear(); }
+            self.sessions[a].open_local_dir(path);
+        }
+        ui.label(footer);
     }
 
     fn remote_pane(&mut self, ui: &mut egui::Ui) {
@@ -1211,7 +1230,8 @@ impl SftpApp {
             }
             ui.add_space(6.0);
             ui.label("Filter:");
-            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].remote_filter).desired_width(f32::INFINITY));
+            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].remote_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
+            ui.add_enabled(connected, egui::Checkbox::new(&mut self.sessions[a].remote_recursive, "Recursive")).on_hover_text(RECURSIVE_TIP);
         });
         ui.horizontal(|ui| {
             ui.label("Address:");
@@ -1219,17 +1239,28 @@ impl SftpApp {
         });
         ui.add_space(2.0);
 
-        let filter = self.sessions[a].remote_filter.to_lowercase();
-        let mut rows: Vec<RemoteEntry> = self.sessions[a].remote_entries.iter()
-            .filter(|entry| entry.name.to_lowercase().contains(&filter)).cloned().collect();
+        let filter = self.sessions[a].remote_filter.trim().to_lowercase();
+        let searching = self.sessions[a].searching_remote();
+        let show_hidden = self.sessions[a].show_hidden;
+        let mut rows: Vec<RemoteEntry> = if searching {
+            self.sessions[a].remote_search.as_ref().map(|search| search.results.clone()).unwrap_or_default()
+        } else {
+            self.sessions[a].remote_entries.iter()
+                .filter(|entry| (show_hidden || !entry.hidden()) && entry.name.to_lowercase().contains(&filter))
+                .cloned().collect()
+        };
         sort_rows(&mut rows, self.sessions[a].remote_sort);
+        let footer = list_footer(rows.len(), self.sessions[a].remote_selected.len(), searching,
+            self.sessions[a].remote_search.as_ref().map(|search| (search.done, search.truncated)));
+        let listed = rows.clone();
         let remote_path_trimmed = self.sessions[a].remote_path.trim_end_matches('/');
-        if !remote_path_trimmed.is_empty() && remote_path_trimmed != "/" {
+        if !searching && !remote_path_trimmed.is_empty() && remote_path_trimmed != "/" {
             rows.insert(0, RemoteEntry {
                 name: "..".into(), path: remote_parent(&self.sessions[a].remote_path), dir: true,
-                size: 0, modified: "—".into(),
+                size: 0, modified: "—".into(), folder: String::new(),
             });
         }
+        let mut open_dir = None;
         let order: Vec<String> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
         let mut open_profiles = false;
         let mut sort_click = None;
@@ -1252,7 +1283,7 @@ impl SftpApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let selected = self.sessions[a].remote_selected.contains(&entry.path);
-                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.name, entry.dir, selected);
+                        let response = file_name_cell(ui, name_width, ROW_HEIGHT, &entry.label(), entry.dir, selected);
                         if response.dragged() && entry.name != ".." {
                             let session = &mut self.sessions[a];
                             if response.drag_started() && !selected {
@@ -1292,13 +1323,13 @@ impl SftpApp {
                         }
                         let targets = || -> Vec<RemoteEntry> {
                             if in_selection {
-                                self.sessions[a].remote_entries.iter().filter(|e| self.sessions[a].remote_selected.contains(&e.path)).cloned().collect()
+                                listed.iter().filter(|e| self.sessions[a].remote_selected.contains(&e.path)).cloned().collect()
                             } else {
                                 vec![entry.clone()]
                             }
                         };
                         match action {
-                            Some(RowAction::Open) => self.sessions[a].navigate_remote(entry.path.clone()),
+                            Some(RowAction::Open) => open_dir = Some(entry.path.clone()),
                             Some(RowAction::Transfer) => {
                                 for target in targets() { self.sessions[a].queue_download(target.path, self.settings.transfer); }
                             }
@@ -1309,7 +1340,7 @@ impl SftpApp {
                             }
                             Some(RowAction::Hash(_)) | None => {}
                         }
-                        if response.double_clicked() && entry.dir { self.sessions[a].navigate_remote(entry.path.clone()); }
+                        if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
                         file_row_details(ui, entry.dir, entry.size, &entry.modified);
                     });
                 }
@@ -1317,9 +1348,12 @@ impl SftpApp {
             sort_click = paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
         });
         if let Some(column) = sort_click { self.sessions[a].remote_sort.toggle(column); }
+        if let Some(path) = open_dir {
+            if searching { self.sessions[a].remote_filter.clear(); }
+            self.sessions[a].navigate_remote(path);
+        }
         if open_profiles { self.dialog = Some(Dialog::Profiles); }
-        let visible = self.sessions[a].remote_entries.iter().filter(|entry| entry.name.to_lowercase().contains(&filter)).count();
-        ui.label(format!("{} selected, {visible} object(s)", self.sessions[a].remote_selected.len()));
+        ui.label(footer);
     }
 
     /// Transfer rows of one queue tab (pending, complete or failed).
@@ -2045,8 +2079,11 @@ impl eframe::App for SftpApp {
         self.poll_ops();
         self.poll_password_lookup();
         self.poll_credentials();
+        let show_hidden = !self.settings.hide_hidden_items;
         for session in &mut self.sessions {
+            session.show_hidden = show_hidden;
             session.sample_speeds();
+            session.update_searches();
         }
         // Remember the folder being browsed, so the next run opens there.
         let browsing = self.session().path.clone();
@@ -2069,6 +2106,19 @@ impl eframe::App for SftpApp {
                 win32::toolbar_separator(ui);
                 if win32::icon_button(ui, can_upload, win32::Icon::Upload, "Upload selected local items").clicked() { self.upload_selected(); }
                 if win32::icon_button(ui, can_download, win32::Icon::Download, "Download selected remote files").clicked() { self.download_selected(); }
+                win32::toolbar_separator(ui);
+                let showing = !self.settings.hide_hidden_items;
+                let tip = if showing {
+                    "Hidden items are shown (dot files; on Windows also files marked hidden). Click to hide them."
+                } else {
+                    "Hidden items are hidden (dot files; on Windows also files marked hidden). Click to show them."
+                };
+                if win32::icon_toggle(ui, showing, win32::Icon::HiddenItems, tip).clicked() {
+                    self.settings.hide_hidden_items = showing;
+                    if let Err(error) = crate::settings::save(&self.settings) {
+                        self.session_mut().status = format!("Could not save settings: {error}");
+                    }
+                }
                 win32::toolbar_separator(ui);
                 if win32::icon_button(ui, true, win32::Icon::Settings, "Settings").clicked() { self.open_settings(); }
             });
@@ -2323,6 +2373,28 @@ fn paint_list_header(ui: &mut egui::Ui, rect: egui::Rect, name_width: f32, order
     let rest = header.available_width();
     if rest > 0.0 { win32::header_cell(&mut header, rest, HEADER_HEIGHT, ""); }
     clicked
+}
+
+/// Room left next to a filter box for its "Recursive" check box.
+const RECURSIVE_WIDTH: f32 = 82.0;
+
+const RECURSIVE_TIP: &str = "Search every folder below this one for names containing the filter text, \
+instead of filtering only this folder. Results show their folder relative to this one; double-click a folder to \
+open it. Symbolic links are not followed, and hidden folders are searched only while hidden items are shown. \
+At most 5000 results are listed.";
+
+/// Footer of a file pane: selection and item counts, or search progress.
+fn list_footer(shown: usize, selected: usize, searching: bool, search: Option<(bool, bool)>) -> String {
+    if !searching {
+        return format!("{selected} selected, {shown} object(s)");
+    }
+    let state = match search {
+        None => " · waiting for typing to pause…",
+        Some((false, _)) => " · searching…",
+        Some((true, true)) => " · stopped at the 5000-result limit",
+        Some((true, false)) => "",
+    };
+    format!("{selected} selected, {shown} found in subfolders{state}")
 }
 
 /// Ctrl (Command on macOS) and Shift state of the click that produced `response`.
@@ -2667,7 +2739,7 @@ mod tests {
     #[test]
     fn delete_message_describes_targets() {
         let entry = |name: &str, dir: bool| RemoteEntry {
-            name: name.into(), path: format!("/{name}"), dir, size: 0, modified: String::new(),
+            name: name.into(), path: format!("/{name}"), dir, size: 0, modified: String::new(), folder: String::new(),
         };
         let one = FileTarget::Remote(vec![entry("a.txt", false)]);
         assert!(delete_message(&one).contains("\"a.txt\" from the server"));

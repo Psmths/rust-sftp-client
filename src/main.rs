@@ -7,6 +7,7 @@ mod credentials;
 mod logging;
 mod transfer;
 mod places;
+mod search;
 mod session;
 mod settings;
 mod win32;

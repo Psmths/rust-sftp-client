@@ -17,6 +17,7 @@ use tokio::{
 use crate::{
     connection::{ConnectError, ConnectionProfile, NetworkSettings, SftpConnection},
     logging::{Category, LogEntry, Logger, SessionLog, Severity},
+    search::{self, Search, SearchKey},
     transfer::{CancelToken, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
 };
 
@@ -27,6 +28,17 @@ pub struct LocalEntry {
     pub dir: bool,
     pub size: u64,
     pub modified: String,
+    /// Dot name, or (Windows) marked hidden.
+    pub hidden: bool,
+    /// For recursive search results: the folder relative to the searched one.
+    pub folder: String,
+}
+
+impl LocalEntry {
+    /// Name as listed: with its relative folder for search results.
+    pub fn label(&self) -> String {
+        if self.folder.is_empty() { self.name.clone() } else { format!("{}{}{}", self.folder, std::path::MAIN_SEPARATOR, self.name) }
+    }
 }
 
 #[derive(Clone)]
@@ -36,6 +48,18 @@ pub struct RemoteEntry {
     pub dir: bool,
     pub size: u64,
     pub modified: String,
+    /// For recursive search results: the folder relative to the searched one.
+    pub folder: String,
+}
+
+impl RemoteEntry {
+    pub fn label(&self) -> String {
+        if self.folder.is_empty() { self.name.clone() } else { format!("{}/{}", self.folder, self.name) }
+    }
+
+    pub fn hidden(&self) -> bool {
+        self.name.starts_with('.')
+    }
 }
 
 /// Column a file list is sorted by.
@@ -311,6 +335,11 @@ pub struct Session {
     /// Start of a Shift-click range: the item last clicked without Shift.
     pub local_anchor: Option<PathBuf>,
     pub local_sort: SortOrder,
+    /// "Recursive" box next to the filter: search the whole tree below.
+    pub local_recursive: bool,
+    pub local_search: Option<Search<LocalEntry>>,
+    /// Filter text and when it last changed, to start searches after typing pauses.
+    local_filter_seen: (String, Instant),
 
     pub remote_path: String,
     pub remote_entries: Vec<RemoteEntry>,
@@ -318,6 +347,11 @@ pub struct Session {
     pub remote_selected: Vec<String>,
     pub remote_anchor: Option<String>,
     pub remote_sort: SortOrder,
+    pub remote_recursive: bool,
+    pub remote_search: Option<Search<RemoteEntry>>,
+    remote_filter_seen: (String, Instant),
+    /// Show hidden items (set by the app from its settings every frame).
+    pub show_hidden: bool,
 
     pub connection: Option<Arc<SftpConnection>>,
     pub profile: Option<ConnectionProfile>,
@@ -369,12 +403,19 @@ impl Session {
             local_selected: Vec::new(),
             local_anchor: None,
             local_sort: SortOrder::default(),
+            local_recursive: false,
+            local_search: None,
+            local_filter_seen: (String::new(), Instant::now()),
             remote_path: String::new(),
             remote_entries: Vec::new(),
             remote_filter: String::new(),
             remote_selected: Vec::new(),
             remote_anchor: None,
             remote_sort: SortOrder::default(),
+            remote_recursive: false,
+            remote_search: None,
+            remote_filter_seen: (String::new(), Instant::now()),
+            show_hidden: true,
             connection: None,
             profile: None,
             created_for_connect: false,
@@ -420,7 +461,9 @@ impl Session {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.connect_rx.is_some()
+        self.searching_local() && self.local_search.as_ref().is_none_or(|search| !search.done)
+            || self.searching_remote() && self.remote_search.as_ref().is_none_or(|search| !search.done)
+            || self.connect_rx.is_some()
             || self.list_rx.is_some()
             || self.transfers.iter().any(TransferItem::is_pending)
             || self.connection.as_ref().is_some_and(|connection| {
@@ -464,20 +507,92 @@ impl Session {
         })
     }
 
+    // ----- recursive search -----
+
+    /// Remote entries the pane shows: search results while searching, else the folder.
+    pub fn remote_shown(&self) -> Box<dyn Iterator<Item = &RemoteEntry> + '_> {
+        match (&self.remote_search, self.searching_remote()) {
+            (Some(search), true) => Box::new(search.results.iter()),
+            _ => Box::new(self.remote_entries.iter()),
+        }
+    }
+
+    /// The local pane shows recursive search results instead of the folder.
+    pub fn searching_local(&self) -> bool {
+        self.local_recursive && !self.local_filter.trim().is_empty()
+    }
+
+    pub fn searching_remote(&self) -> bool {
+        self.remote_recursive && !self.remote_filter.trim().is_empty() && self.is_connected()
+    }
+
+    /// Starts, restarts or stops the recursive searches to match the filters
+    /// (once typing pauses) and takes in their results. Call every frame.
+    pub fn update_searches(&mut self) {
+        const TYPING_PAUSE: Duration = Duration::from_millis(300);
+        let now = Instant::now();
+        if self.local_filter != self.local_filter_seen.0 {
+            self.local_filter_seen = (self.local_filter.clone(), now);
+        }
+        if self.remote_filter != self.remote_filter_seen.0 {
+            self.remote_filter_seen = (self.remote_filter.clone(), now);
+        }
+
+        if self.searching_local() {
+            let key = SearchKey {
+                query: self.local_filter.trim().to_lowercase(),
+                root: self.path.display().to_string(),
+                show_hidden: self.show_hidden,
+            };
+            let stale = self.local_search.as_ref().is_none_or(|search| search.key != key);
+            if stale && now.saturating_duration_since(self.local_filter_seen.1) >= TYPING_PAUSE {
+                self.local_search = Some(search::local(self.path.clone(), key));
+            }
+        } else {
+            self.local_search = None;
+        }
+        if let Some(search) = &mut self.local_search {
+            search.poll();
+        }
+
+        match self.connection.clone().filter(|_| self.searching_remote()) {
+            Some(connection) => {
+                let key = SearchKey {
+                    query: self.remote_filter.trim().to_lowercase(),
+                    root: self.remote_path.clone(),
+                    show_hidden: self.show_hidden,
+                };
+                let stale = self.remote_search.as_ref().is_none_or(|search| search.key != key);
+                if stale && now.saturating_duration_since(self.remote_filter_seen.1) >= TYPING_PAUSE {
+                    self.remote_search = Some(search::remote(&self.runtime, connection, self.remote_path.clone(), key));
+                }
+            }
+            None => self.remote_search = None,
+        }
+        if let Some(search) = &mut self.remote_search {
+            search.poll();
+        }
+    }
+
     // ----- local side -----
 
     pub fn refresh_local(&mut self) {
+        // A search below this folder is run again with the fresh contents.
+        self.local_search = None;
         self.local_entries.clear();
         if let Ok(read_dir) = fs::read_dir(&self.path) {
             for item in read_dir.flatten() {
                 let path = item.path();
                 if let Ok(meta) = item.metadata() {
+                    let name = item.file_name().to_string_lossy().into_owned();
                     self.local_entries.push(LocalEntry {
-                        name: item.file_name().to_string_lossy().into_owned(),
+                        hidden: crate::search::is_hidden_local(&name, Some(&meta)),
+                        name,
                         path,
                         dir: meta.is_dir(),
                         size: meta.len(),
                         modified: meta.modified().ok().map(crate::app::format_iso8601).unwrap_or_else(|| "—".into()),
+                        folder: String::new(),
                     });
                 }
             }
@@ -622,6 +737,8 @@ impl Session {
     /// resolved on the server first, so `remote_path` is always absolute.
     pub fn load_remote(&mut self, path: &str) {
         let Some(connection) = self.connection.clone() else { return; };
+        // A search below this folder is run again with the fresh contents.
+        self.remote_search = None;
         self.home_fallback = false;
         let requested = if path.is_empty() { ".".to_owned() } else { path.to_owned() };
         let (tx, rx) = std_mpsc::channel();
@@ -639,6 +756,7 @@ impl Session {
                         dir: entry.dir,
                         size: entry.size,
                         modified: entry.mtime.map(|t| crate::app::format_unix_utc(t as i64)).unwrap_or_else(|| "—".into()),
+                        folder: String::new(),
                     })
                     .collect();
                 entries.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -786,7 +904,7 @@ impl Session {
     /// Downloads the selected remote files (not folders) into the local folder.
     pub fn download_selected(&mut self, settings: TransferSettings) {
         if !self.is_connected() || self.remote_selected.is_empty() { return; }
-        let files: Vec<RemoteEntry> = self.remote_entries.iter()
+        let files: Vec<RemoteEntry> = self.remote_shown()
             .filter(|entry| self.remote_selected.contains(&entry.path) && !entry.dir)
             .cloned().collect();
         if files.is_empty() {
@@ -900,7 +1018,10 @@ impl Session {
         let name = remote_path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(&remote_path).to_owned();
         let destination = self.path.join(&name);
         // From the listing; an unknown path is treated as a folder.
-        let dir = self.remote_entries.iter().find(|entry| entry.path == remote_path).is_none_or(|entry| entry.dir);
+        let dir = self.remote_entries.iter()
+            .chain(self.remote_search.iter().flat_map(|search| search.results.iter()))
+            .find(|entry| entry.path == remote_path)
+            .is_none_or(|entry| entry.dir);
         let job = Job::DownloadPath { remote: remote_path.clone(), local: destination.clone(), dir };
         if self.start_job(job, settings) {
             self.status = format!("Queued recursive download: {remote_path} → {}", destination.display());
@@ -1121,7 +1242,7 @@ mod tests {
     use super::*;
 
     fn local(name: &str, dir: bool, size: u64, modified: &str) -> LocalEntry {
-        LocalEntry { name: name.into(), path: PathBuf::from(name), dir, size, modified: modified.into() }
+        LocalEntry { name: name.into(), path: PathBuf::from(name), dir, size, modified: modified.into(), hidden: false, folder: String::new() }
     }
 
     #[test]
