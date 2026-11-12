@@ -232,7 +232,8 @@ impl SettingsDraft {
             directory: if directory.is_empty() { default_log_dir() } else { PathBuf::from(directory) },
             split_sessions: self.split_sessions,
         };
-        Ok(AppSettings { transfer, network, logging, last_local_dir: None })
+        // Settings not edited in this window are carried over when applying.
+        Ok(AppSettings { transfer, network, logging, hide_hidden_items: false, last_local_dir: None })
     }
 }
 
@@ -2043,7 +2044,8 @@ impl SftpApp {
         });
         if apply {
             let last_local_dir = self.settings.last_local_dir.clone();
-            let result = self.settings_draft.parse().map(|settings| AppSettings { last_local_dir, ..settings }).and_then(|settings| {
+            let hide_hidden_items = self.settings.hide_hidden_items;
+            let result = self.settings_draft.parse().map(|settings| AppSettings { last_local_dir, hide_hidden_items, ..settings }).and_then(|settings| {
                 if settings.logging.enabled {
                     fs::create_dir_all(&settings.logging.directory)
                         .map_err(|error| format!("Cannot create log directory {}: {error}", settings.logging.directory.display()))?;
