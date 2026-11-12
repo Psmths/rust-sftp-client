@@ -1142,8 +1142,14 @@ mod tests {
         order.toggle(SortColumn::Size);
         assert!(!order.ascending);
         sort_rows(&mut rows, order);
-        assert_eq!(names(&rows), ["zdir", "adir", "a.txt", "b.txt"]);
+        // Both folders are 0 bytes: ties keep the A-Z name order.
+        assert_eq!(names(&rows), ["adir", "zdir", "a.txt", "b.txt"]);
         order.toggle(SortColumn::Modified);
+        sort_rows(&mut rows, order);
+        assert_eq!(names(&rows), ["zdir", "adir", "b.txt", "a.txt"]);
+        order.toggle(SortColumn::Name);
+        order.toggle(SortColumn::Name);
+        assert!(!order.ascending);
         sort_rows(&mut rows, order);
         assert_eq!(names(&rows), ["zdir", "adir", "b.txt", "a.txt"]);
     }
