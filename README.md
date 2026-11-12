@@ -77,6 +77,8 @@ one. If both fail, an error dialog explains why and the details are appended to
 - Stop a single transfer (or a whole folder transfer) or all transfers from the transfer queue's right-click menu. Stopped transfers clean up after themselves: partial downloads' temporary files and partially uploaded remote files are removed.
 - Show per-file queued, active, completed, and failed transfers with independent byte progress, elapsed time, and ETA, on Pending, Complete and Failed tabs of the queue panel.
 - A Log tab shows the selected session's events (kept in memory, whether or not file logging is on), and a Statistics tab graphs the session's download and upload speed over the last 1–30 minutes with peak, average and total figures.
+- The Statistics graph draws dotted lines at the average download (red) and upload (magenta) speed; averages count only the seconds in which that direction was transferring.
+- *Settings → Appearance* switches between the light Windows Classic theme and a dark theme.
 - Download large files through the existing bounded, retrying segmented range-download engine.
 - Open connection, password, host-key trust, error, and transfer-settings prompts in separate native windows.
 

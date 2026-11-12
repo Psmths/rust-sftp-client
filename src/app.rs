@@ -131,6 +131,7 @@ enum RowAction {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
+    Appearance,
     Transfers,
     Segmentation,
     Network,
@@ -138,10 +139,17 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 4] = [SettingsPage::Transfers, SettingsPage::Segmentation, SettingsPage::Network, SettingsPage::Logging];
+    const ALL: [SettingsPage; 5] = [
+        SettingsPage::Appearance,
+        SettingsPage::Transfers,
+        SettingsPage::Segmentation,
+        SettingsPage::Network,
+        SettingsPage::Logging,
+    ];
 
     fn title(self) -> &'static str {
         match self {
+            SettingsPage::Appearance => "Appearance",
             SettingsPage::Transfers => "Transfers",
             SettingsPage::Segmentation => "Segmented downloads",
             SettingsPage::Network => "Network Settings",
@@ -172,6 +180,7 @@ struct SettingsDraft {
     log_transfers: bool,
     log_directory: String,
     split_sessions: bool,
+    theme: win32::Theme,
 }
 
 impl SettingsDraft {
@@ -199,6 +208,7 @@ impl SettingsDraft {
             log_transfers: logging.log_transfers,
             log_directory: logging.directory.display().to_string(),
             split_sessions: logging.split_sessions,
+            theme: settings.theme,
         }
     }
 
@@ -233,7 +243,7 @@ impl SettingsDraft {
             split_sessions: self.split_sessions,
         };
         // Settings not edited in this window are carried over when applying.
-        Ok(AppSettings { transfer, network, logging, hide_hidden_items: false, last_local_dir: None })
+        Ok(AppSettings { transfer, network, logging, theme: self.theme, hide_hidden_items: false, last_local_dir: None })
     }
 }
 
@@ -368,8 +378,8 @@ pub struct SftpApp {
 
 impl SftpApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        win32::apply(&cc.egui_ctx);
         let settings = crate::settings::load();
+        win32::apply(&cc.egui_ctx, settings.theme);
         // Open where the user left off; the home folder the first time (or if it is gone).
         let path = settings
             .last_local_dir
@@ -915,7 +925,7 @@ impl SftpApp {
                                 let done = job.done.load(Ordering::Relaxed);
                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
                                 let painter = ui.painter();
-                                painter.rect_filled(rect, 0.0, win32::WINDOW);
+                                painter.rect_filled(rect, 0.0, win32::window());
                                 win32::thin_sunken(painter, rect);
                                 let total = job.total.max(1);
                                 let piece = Piece { start: 0, end: total, done: done.min(total), failed: false };
@@ -927,7 +937,7 @@ impl SftpApp {
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(f32::INFINITY));
                             }
-                            Some(Err(error)) => { ui.colored_label(win32::ERROR_RED, error); }
+                            Some(Err(error)) => { ui.colored_label(win32::error_red(), error); }
                         }
                         ui.end_row();
                     });
@@ -1407,7 +1417,7 @@ impl SftpApp {
                         egui::vec2(ui.available_width(), row_height), egui::Sense::click()
                     );
                     if session.selected_transfer == Some(item.id) {
-                        ui.painter().rect_filled(row_rect, 0.0, QUEUE_SELECTION);
+                        ui.painter().rect_filled(row_rect, 0.0, win32::queue_selection());
                     }
                     if row_response.clicked() || row_response.secondary_clicked() {
                         select = Some(item.id);
@@ -1450,7 +1460,7 @@ impl SftpApp {
                         );
                         let bar_rect = cell_rect.shrink2(egui::vec2(4.0, 2.0));
                         let painter = ui.painter();
-                        painter.rect_filled(bar_rect, 0.0, win32::WINDOW);
+                        painter.rect_filled(bar_rect, 0.0, win32::window());
                         win32::thin_sunken(painter, bar_rect);
                         let bar_rect = bar_rect.shrink(1.0);
                         let failed = item.state.starts_with("Failed");
@@ -1472,9 +1482,9 @@ impl SftpApp {
                         };
                         let total = if item.segments.is_empty() || item.total == 0 { item.total.max(1) } else { item.total };
                         let fill = if complete {
-                            win32::OK_GREEN
+                            win32::ok_green()
                         } else if item.state == "Cancelled" {
-                            win32::SHADOW
+                            win32::shadow()
                         } else {
                             PIECE_FILL
                         };
@@ -1551,9 +1561,9 @@ impl SftpApp {
                 ui.add_space(2.0);
                 for entry in &entries {
                     let color = match entry.severity {
-                        crate::logging::Severity::Error => win32::ERROR_RED,
-                        crate::logging::Severity::Warning => win32::WARN_AMBER,
-                        _ => win32::TEXT,
+                        crate::logging::Severity::Error => win32::error_red(),
+                        crate::logging::Severity::Warning => win32::warn_amber(),
+                        _ => win32::text_color(),
                     };
                     let time = crate::logging::iso8601_utc(entry.time);
                     let line = format!(
@@ -1599,10 +1609,13 @@ impl SftpApp {
         let peak = |pick: fn(&SpeedSample) -> f64| window.iter().map(pick).fold(0.0_f64, f64::max);
         // Averages cover only the seconds in which that direction was transferring,
         // so idle time does not pull them towards zero.
+        // None when that direction never ran in the timespan.
         let average = |pick: fn(&SpeedSample) -> Option<f64>| {
             let active: Vec<f64> = window.iter().filter_map(pick).collect();
-            if active.is_empty() { 0.0 } else { active.iter().sum::<f64>() / active.len() as f64 }
+            (!active.is_empty()).then(|| active.iter().sum::<f64>() / active.len() as f64)
         };
+        let average_down = average(|sample| sample.downloading.then_some(sample.down));
+        let average_up = average(|sample| sample.uploading.then_some(sample.up));
         let (bytes_down, bytes_up) = session.bytes_transferred();
         let count = |tab: QueueTab| session.transfers.iter().filter(|item| item.tab() == tab).count();
         let connected_for = session.connected_at.map(|since| duration_text(now.saturating_duration_since(since)));
@@ -1611,8 +1624,8 @@ impl SftpApp {
             ("Uploading now:", speed_text(session.speed("Uploading"))),
             ("Peak download:", speed_text(peak(|sample| sample.down))),
             ("Peak upload:", speed_text(peak(|sample| sample.up))),
-            ("Average download:", speed_text(average(|sample| sample.downloading.then_some(sample.down)))),
-            ("Average upload:", speed_text(average(|sample| sample.uploading.then_some(sample.up)))),
+            ("Average download:", speed_text(average_down.unwrap_or(0.0))),
+            ("Average upload:", speed_text(average_up.unwrap_or(0.0))),
             ("Downloaded:", size_text(bytes_down)),
             ("Uploaded:", size_text(bytes_up)),
             ("Transfers:", format!("{} active, {} complete, {} failed", count(QueueTab::Pending), count(QueueTab::Complete), count(QueueTab::Failed))),
@@ -1623,7 +1636,7 @@ impl SftpApp {
             let stats_width = 300.0;
             let graph_width = (ui.available_width() - stats_width - 8.0).max(120.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(graph_width, height), egui::Sense::hover());
-            paint_speed_graph(ui, rect, &window, span, now);
+            paint_speed_graph(ui, rect, &window, span, now, (average_down, average_up));
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.set_width(stats_width);
@@ -1843,7 +1856,7 @@ impl SftpApp {
                         }
                         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) { confirm_rename = true; }
                         if !self.rename_error.is_empty() {
-                            ui.colored_label(win32::ERROR_RED, &self.rename_error);
+                            ui.colored_label(win32::error_red(), &self.rename_error);
                         }
                         dialog_buttons(ui, |ui| {
                             if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
@@ -2000,7 +2013,22 @@ impl SftpApp {
                                 ui.add_space(6.0);
                                 ui.weak("Hover an information icon for details about a setting.");
                                 ui.add_space(4.0);
-                                ui.colored_label(win32::WARN_AMBER, "Network settings apply to new connections.");
+                                ui.colored_label(win32::warn_amber(), "Network settings apply to new connections.");
+                            }
+                            SettingsPage::Appearance => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Theme:");
+                                    egui::ComboBox::from_id_salt("theme")
+                                        .width(180.0)
+                                        .selected_text(draft.theme.label())
+                                        .show_ui(ui, |ui| {
+                                            for theme in [win32::Theme::Light, win32::Theme::Dark] {
+                                                ui.selectable_value(&mut draft.theme, theme, theme.label());
+                                            }
+                                        });
+                                });
+                                ui.add_space(6.0);
+                                ui.weak("Applies to every window as soon as you click OK or Apply.");
                             }
                             SettingsPage::Logging => {
                                 ui.checkbox(&mut draft.logging_enabled, "Enable logging");
@@ -2030,7 +2058,7 @@ impl SftpApp {
                         }
                         if !self.settings_error.is_empty() {
                             ui.add_space(6.0);
-                            ui.colored_label(win32::ERROR_RED, &self.settings_error);
+                            ui.colored_label(win32::error_red(), &self.settings_error);
                         }
                     });
                 });
@@ -2055,6 +2083,9 @@ impl SftpApp {
             });
             match result {
                 Ok(settings) => {
+                    if settings.theme != self.settings.theme {
+                        win32::apply(ctx, settings.theme);
+                    }
                     if settings.transfer.max_concurrent_transfers != self.settings.transfer.max_concurrent_transfers {
                         for session in &mut self.sessions {
                             session.set_concurrency(settings.transfer.max_concurrent_transfers);
@@ -2406,12 +2437,19 @@ fn click_modifiers(response: &egui::Response) -> (bool, bool) {
 
 const GRAPH_DOWN: egui::Color32 = egui::Color32::from_rgb(40, 100, 210);
 const GRAPH_UP: egui::Color32 = egui::Color32::from_rgb(0, 140, 60);
-const GRAPH_GRID: egui::Color32 = egui::Color32::from_rgb(225, 225, 225);
 
-/// Line graph of download and upload speed over the last `span`, newest at the right.
-fn paint_speed_graph(ui: &egui::Ui, rect: egui::Rect, samples: &[SpeedSample], span: Duration, now: Instant) {
+/// Line graph of download and upload speed over the last `span`, newest at the
+/// right, with dotted lines at the (active-time) average download and upload speed.
+fn paint_speed_graph(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    samples: &[SpeedSample],
+    span: Duration,
+    now: Instant,
+    (average_down, average_up): (Option<f64>, Option<f64>),
+) {
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, win32::WINDOW);
+    painter.rect_filled(rect, 0.0, win32::window());
     win32::sunken(&painter, rect);
     let font = egui::TextStyle::Small.resolve(ui.style());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(62.0, 8.0), rect.max - egui::vec2(10.0, 18.0));
@@ -2427,16 +2465,16 @@ fn paint_speed_graph(ui: &egui::Ui, rect: egui::Rect, samples: &[SpeedSample], s
     for step in 0..=4 {
         let fraction = step as f32 / 4.0;
         let y = plot.bottom() - fraction * plot.height();
-        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, GRAPH_GRID));
-        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, speed_text(y_max * f64::from(fraction)), font.clone(), win32::GRAY_TEXT);
+        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, win32::grid()));
+        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, speed_text(y_max * f64::from(fraction)), font.clone(), win32::gray_text());
         let x = plot.left() + fraction * plot.width();
-        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], egui::Stroke::new(1.0, GRAPH_GRID));
+        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], egui::Stroke::new(1.0, win32::grid()));
         let ago = span.mul_f32(1.0 - fraction);
         let label = if step == 4 { "now".to_owned() } else { format!("-{}", short_duration(ago)) };
         let anchor = if step == 0 { egui::Align2::LEFT_TOP } else if step == 4 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
-        painter.text(egui::pos2(x, plot.bottom() + 3.0), anchor, label, font.clone(), win32::GRAY_TEXT);
+        painter.text(egui::pos2(x, plot.bottom() + 3.0), anchor, label, font.clone(), win32::gray_text());
     }
-    painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0, win32::SHADOW), egui::StrokeKind::Outside);
+    painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0, win32::shadow()), egui::StrokeKind::Outside);
 
     // Series. Samples stop while the app is idle; a gap wider than a few
     // sample intervals is drawn as zero so the line does not bridge it.
@@ -2472,14 +2510,46 @@ fn paint_speed_graph(ui: &egui::Ui, rect: egui::Rect, samples: &[SpeedSample], s
         }
     }
 
+    // Averages: dotted lines across the plot, labelled at the left.
+    let (average_down_color, average_up_color) = if ui.visuals().dark_mode {
+        (egui::Color32::from_rgb(255, 95, 95), egui::Color32::from_rgb(240, 100, 240))
+    } else {
+        (egui::Color32::from_rgb(220, 0, 0), egui::Color32::from_rgb(200, 0, 200))
+    };
+    let mut label_slots: Vec<f32> = Vec::new();
+    for (average, color, label) in [(average_down, average_down_color, "avg ↓"), (average_up, average_up_color, "avg ↑")] {
+        let Some(average) = average else { continue };
+        let y = y_of(average).round() + 0.5;
+        painter.extend(egui::Shape::dotted_line(&[egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], color, 4.0, 0.9));
+        // Label above the line; below it if the other label is already there.
+        let mut label_y = y - 2.0;
+        if label_slots.iter().any(|other| (other - label_y).abs() < 12.0) {
+            label_y = y + 13.0;
+        }
+        label_slots.push(label_y);
+        painter.text(egui::pos2(plot.left() + 4.0, label_y), egui::Align2::LEFT_BOTTOM, format!("{label} {}", speed_text(average)), font.clone(), color);
+    }
+
     // Legend.
     let mut x = plot.right() - 6.0;
-    for (label, color) in [("Upload", GRAPH_UP), ("Download", GRAPH_DOWN)] {
-        let galley = painter.layout_no_wrap(label.to_owned(), font.clone(), win32::TEXT);
+    let entries = [
+        ("Avg upload", average_up_color, true),
+        ("Avg download", average_down_color, true),
+        ("Upload", GRAPH_UP, false),
+        ("Download", GRAPH_DOWN, false),
+    ];
+    for (label, color, dotted) in entries {
+        let galley = painter.layout_no_wrap(label.to_owned(), font.clone(), win32::text_color());
         x -= galley.size().x;
-        painter.galley(egui::pos2(x, plot.top() + 4.0), galley, win32::TEXT);
+        painter.galley(egui::pos2(x, plot.top() + 4.0), galley, win32::text_color());
         x -= 14.0;
-        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, plot.top() + 7.0), egui::vec2(10.0, 8.0)), 0.0, color);
+        let swatch = egui::Rect::from_min_size(egui::pos2(x, plot.top() + 7.0), egui::vec2(10.0, 8.0));
+        if dotted {
+            let y = swatch.center().y;
+            painter.extend(egui::Shape::dotted_line(&[egui::pos2(swatch.left(), y), egui::pos2(swatch.right(), y)], color, 3.0, 0.9));
+        } else {
+            painter.rect_filled(swatch, 0.0, color);
+        }
         x -= 14.0;
     }
 }
@@ -2522,14 +2592,14 @@ fn file_name_cell(
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         let icon = egui::Rect::from_min_size(rect.left_center() + egui::vec2(4.0, -6.0), egui::vec2(14.0, 12.0));
         paint_file_icon(&painter, icon, dir);
-        let color = if selected { win32::SELECTION_TEXT } else { win32::TEXT };
+        let color = if selected { win32::selection_text() } else { win32::text_color() };
         let galley = painter.layout_no_wrap(text.to_owned(), egui::TextStyle::Body.resolve(ui.style()), color);
         let text_rect = egui::Rect::from_min_size(
             egui::pos2(icon.right() + 4.0, rect.center().y - galley.size().y / 2.0),
             galley.size(),
         ).expand2(egui::vec2(2.0, 1.0));
         if selected {
-            painter.rect_filled(text_rect, 0.0, win32::SELECTION);
+            painter.rect_filled(text_rect, 0.0, win32::selection());
         }
         painter.galley(text_rect.min + egui::vec2(2.0, 1.0), galley, color);
     }
@@ -2537,8 +2607,9 @@ fn file_name_cell(
 }
 
 /// Small Explorer-style icon: a manila folder or a dog-eared page.
+/// Icons keep their own colours in both themes, like Explorer's.
 fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, dir: bool) {
-    let outline = egui::Stroke::new(1.0, if dir { egui::Color32::from_rgb(128, 96, 0) } else { win32::SHADOW });
+    let outline = egui::Stroke::new(1.0, if dir { egui::Color32::from_rgb(128, 96, 0) } else { egui::Color32::from_rgb(128, 128, 128) });
     if dir {
         let tab = egui::Rect::from_min_size(rect.min, egui::vec2(6.0, 3.0));
         let body = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 2.0), rect.max);
@@ -2546,9 +2617,9 @@ fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, dir: bool) {
         painter.rect(body, 0.0, egui::Color32::from_rgb(255, 222, 110), outline, egui::StrokeKind::Inside);
     } else {
         let page = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
-        painter.rect(page, 0.0, win32::WINDOW, outline, egui::StrokeKind::Inside);
+        painter.rect(page, 0.0, egui::Color32::WHITE, outline, egui::StrokeKind::Inside);
         let corner = egui::Rect::from_min_max(egui::pos2(page.right() - 4.0, page.top()), egui::pos2(page.right(), page.top() + 4.0));
-        painter.rect(corner, 0.0, win32::LIGHT, outline, egui::StrokeKind::Inside);
+        painter.rect(corner, 0.0, egui::Color32::from_rgb(223, 223, 223), outline, egui::StrokeKind::Inside);
     }
 }
 
@@ -2564,12 +2635,10 @@ fn file_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, right_
     } else {
         (egui::Align2::LEFT_CENTER, rect.left_center() + egui::vec2(5.0, 0.0))
     };
-    painter.text(pos, anchor, text, egui::TextStyle::Body.resolve(ui.style()), win32::TEXT);
+    painter.text(pos, anchor, text, egui::TextStyle::Body.resolve(ui.style()), win32::text_color());
 }
 
 const PIECE_FILL: egui::Color32 = egui::Color32::from_rgb(40, 100, 210);
-/// Selected transfer row: light enough to keep black text readable.
-const QUEUE_SELECTION: egui::Color32 = egui::Color32::from_rgb(204, 220, 245);
 
 /// A byte range of a transfer and how much of it (from its start) is done.
 struct Piece {
@@ -2587,7 +2656,7 @@ fn paint_piece_bar(painter: &egui::Painter, rect: egui::Rect, total: u64, pieces
     let column_width = rect.width() / columns as f32;
     let bytes_per_column = total as f64 / columns as f64;
     let paint_run = |from: usize, to: usize, color: egui::Color32| {
-        if color == win32::WINDOW { return; }
+        if color == win32::window() { return; }
         let x0 = rect.left() + from as f32 * column_width;
         let x1 = rect.left() + to as f32 * column_width;
         painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())), 0.0, color);
@@ -2610,7 +2679,7 @@ fn paint_piece_bar(painter: &egui::Painter, rect: egui::Rect, total: u64, pieces
         }
         let done = (done / bytes_per_column).clamp(0.0, 1.0) as f32;
         let failed = (failed / bytes_per_column).clamp(0.0, 1.0) as f32;
-        let color = mix(mix(win32::WINDOW, fill, done), win32::ERROR_RED, failed);
+        let color = mix(mix(win32::window(), fill, done), win32::error_red(), failed);
         match run {
             Some((_, run_color)) if run_color == color => {}
             Some((run_start, run_color)) => {

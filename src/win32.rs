@@ -1,41 +1,161 @@
 //! Classic Win32 ("Windows Classic" theme) look for egui: system colours,
 //! square corners, 3D bevelled controls, sunken list views and status panels.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use serde::{Deserialize, Serialize};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
     Response, Sense, Shadow, Stroke, TextStyle, TextWrapMode, Ui, WidgetText,
 };
 
-/// COLOR_3DFACE / COLOR_BTNFACE
-pub const FACE: Color32 = Color32::from_rgb(212, 208, 200);
-/// COLOR_3DHIGHLIGHT
-pub const HIGHLIGHT: Color32 = Color32::WHITE;
-/// COLOR_3DLIGHT
-pub const LIGHT: Color32 = Color32::from_rgb(223, 223, 223);
-/// COLOR_3DSHADOW
-pub const SHADOW: Color32 = Color32::from_rgb(128, 128, 128);
-/// COLOR_3DDKSHADOW
-pub const DARK_SHADOW: Color32 = Color32::from_rgb(64, 64, 64);
-/// COLOR_WINDOW (list views, edit controls)
-pub const WINDOW: Color32 = Color32::WHITE;
-/// COLOR_WINDOWTEXT / COLOR_BTNTEXT
-pub const TEXT: Color32 = Color32::BLACK;
-/// COLOR_GRAYTEXT
-pub const GRAY_TEXT: Color32 = Color32::from_rgb(128, 128, 128);
-/// COLOR_HIGHLIGHT (selection background)
-pub const SELECTION: Color32 = Color32::from_rgb(10, 36, 106);
-/// COLOR_HIGHLIGHTTEXT
-pub const SELECTION_TEXT: Color32 = Color32::WHITE;
-pub const OK_GREEN: Color32 = Color32::from_rgb(0, 128, 0);
-pub const ERROR_RED: Color32 = Color32::from_rgb(170, 0, 0);
-pub const WARN_AMBER: Color32 = Color32::from_rgb(150, 80, 0);
+/// Light (Windows Classic) or dark colours.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+}
 
-/// Install the Win32 theme and, if available, a Windows-like UI font.
-pub fn apply(ctx: &egui::Context) {
+impl Theme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Light => "Light (Windows Classic)",
+            Theme::Dark => "Dark",
+        }
+    }
+}
+
+/// The colours of one theme, named after the Win32 system colours.
+struct Palette {
+    /// COLOR_3DFACE / COLOR_BTNFACE
+    face: Color32,
+    /// COLOR_3DHIGHLIGHT
+    highlight: Color32,
+    /// COLOR_3DLIGHT
+    light: Color32,
+    /// COLOR_3DSHADOW
+    shadow: Color32,
+    /// COLOR_3DDKSHADOW
+    dark_shadow: Color32,
+    /// COLOR_WINDOW (list views, edit controls)
+    window: Color32,
+    /// COLOR_WINDOWTEXT / COLOR_BTNTEXT
+    text: Color32,
+    /// COLOR_GRAYTEXT
+    gray_text: Color32,
+    /// COLOR_HIGHLIGHT (selection background)
+    selection: Color32,
+    /// COLOR_HIGHLIGHTTEXT
+    selection_text: Color32,
+    ok_green: Color32,
+    error_red: Color32,
+    warn_amber: Color32,
+    /// COLOR_SCROLLBAR: the scroll bar track (classic Windows dithers the
+    /// highlight and button face; this is the blend). Also checked toolbar buttons.
+    scroll_track: Color32,
+    scroll_thumb: Color32,
+    scroll_thumb_hovered: Color32,
+    scroll_thumb_dragged: Color32,
+    /// Face of a pressed button.
+    pressed_face: Color32,
+    /// Background of selected text in edit boxes.
+    text_selection: Color32,
+    hyperlink: Color32,
+    faint_bg: Color32,
+    /// Selected row of the transfer queue: light enough for normal text.
+    queue_selection: Color32,
+    /// Grid lines of graphs.
+    grid: Color32,
+}
+
+const LIGHT_PALETTE: Palette = Palette {
+    face: Color32::from_rgb(212, 208, 200),
+    highlight: Color32::WHITE,
+    light: Color32::from_rgb(223, 223, 223),
+    shadow: Color32::from_rgb(128, 128, 128),
+    dark_shadow: Color32::from_rgb(64, 64, 64),
+    window: Color32::WHITE,
+    text: Color32::BLACK,
+    gray_text: Color32::from_rgb(128, 128, 128),
+    selection: Color32::from_rgb(10, 36, 106),
+    selection_text: Color32::WHITE,
+    ok_green: Color32::from_rgb(0, 128, 0),
+    error_red: Color32::from_rgb(170, 0, 0),
+    warn_amber: Color32::from_rgb(150, 80, 0),
+    scroll_track: Color32::from_rgb(234, 232, 228),
+    scroll_thumb: Color32::from_rgb(176, 172, 166),
+    scroll_thumb_hovered: Color32::from_rgb(150, 147, 141),
+    scroll_thumb_dragged: Color32::from_rgb(128, 128, 128),
+    pressed_face: Color32::from_rgb(196, 192, 184),
+    text_selection: Color32::from_rgb(166, 202, 240),
+    hyperlink: Color32::from_rgb(0, 0, 255),
+    faint_bg: Color32::from_rgb(236, 234, 230),
+    queue_selection: Color32::from_rgb(204, 220, 245),
+    grid: Color32::from_rgb(225, 225, 225),
+};
+
+const DARK_PALETTE: Palette = Palette {
+    face: Color32::from_rgb(48, 48, 52),
+    highlight: Color32::from_rgb(96, 96, 102),
+    light: Color32::from_rgb(70, 70, 75),
+    shadow: Color32::from_rgb(24, 24, 26),
+    dark_shadow: Color32::from_rgb(8, 8, 9),
+    window: Color32::from_rgb(30, 30, 33),
+    text: Color32::from_rgb(222, 222, 222),
+    gray_text: Color32::from_rgb(140, 140, 145),
+    selection: Color32::from_rgb(38, 79, 150),
+    selection_text: Color32::WHITE,
+    ok_green: Color32::from_rgb(110, 200, 110),
+    error_red: Color32::from_rgb(240, 110, 110),
+    warn_amber: Color32::from_rgb(235, 175, 70),
+    scroll_track: Color32::from_rgb(40, 40, 44),
+    scroll_thumb: Color32::from_rgb(88, 88, 94),
+    scroll_thumb_hovered: Color32::from_rgb(110, 110, 116),
+    scroll_thumb_dragged: Color32::from_rgb(132, 132, 138),
+    pressed_face: Color32::from_rgb(38, 38, 42),
+    text_selection: Color32::from_rgb(50, 90, 150),
+    hyperlink: Color32::from_rgb(120, 170, 255),
+    faint_bg: Color32::from_rgb(40, 40, 44),
+    queue_selection: Color32::from_rgb(45, 66, 102),
+    grid: Color32::from_rgb(58, 58, 62),
+};
+
+static DARK: AtomicBool = AtomicBool::new(false);
+
+fn palette() -> &'static Palette {
+    if DARK.load(Ordering::Relaxed) { &DARK_PALETTE } else { &LIGHT_PALETTE }
+}
+
+pub fn face() -> Color32 { palette().face }
+pub fn highlight() -> Color32 { palette().highlight }
+pub fn light() -> Color32 { palette().light }
+pub fn shadow() -> Color32 { palette().shadow }
+pub fn dark_shadow() -> Color32 { palette().dark_shadow }
+pub fn window() -> Color32 { palette().window }
+pub fn text_color() -> Color32 { palette().text }
+pub fn gray_text() -> Color32 { palette().gray_text }
+pub fn selection() -> Color32 { palette().selection }
+pub fn selection_text() -> Color32 { palette().selection_text }
+pub fn ok_green() -> Color32 { palette().ok_green }
+pub fn error_red() -> Color32 { palette().error_red }
+pub fn warn_amber() -> Color32 { palette().warn_amber }
+pub fn scroll_track() -> Color32 { palette().scroll_track }
+pub fn queue_selection() -> Color32 { palette().queue_selection }
+pub fn grid() -> Color32 { palette().grid }
+
+/// Install the Win32 theme in light or dark colours and, if available, a
+/// Windows-like UI font. Call again to switch themes.
+pub fn apply(ctx: &egui::Context, theme: Theme) {
     install_font(ctx);
-    ctx.set_theme(egui::ThemePreference::Light);
+    DARK.store(theme == Theme::Dark, Ordering::Relaxed);
+    let colors = palette();
+    ctx.set_theme(if theme == Theme::Dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
     ctx.all_styles_mut(|style| {
         style.text_styles = [
             (TextStyle::Small, FontId::proportional(11.0)),
@@ -64,28 +184,28 @@ pub fn apply(ctx: &egui::Context) {
         spacing.scroll.interact_handle_opacity = 1.0;
 
         let visuals = &mut style.visuals;
-        *visuals = egui::Visuals::light();
+        *visuals = if theme == Theme::Dark { egui::Visuals::dark() } else { egui::Visuals::light() };
         visuals.override_text_color = None;
-        visuals.weak_text_color = Some(GRAY_TEXT);
-        visuals.hyperlink_color = Color32::from_rgb(0, 0, 255);
-        visuals.faint_bg_color = Color32::from_rgb(236, 234, 230);
-        visuals.extreme_bg_color = WINDOW;
-        visuals.text_edit_bg_color = Some(WINDOW);
-        visuals.code_bg_color = WINDOW;
-        visuals.warn_fg_color = WARN_AMBER;
-        visuals.error_fg_color = ERROR_RED;
-        visuals.panel_fill = FACE;
-        visuals.window_fill = FACE;
-        visuals.window_stroke = Stroke::new(1.0, DARK_SHADOW);
+        visuals.weak_text_color = Some(gray_text());
+        visuals.hyperlink_color = colors.hyperlink;
+        visuals.faint_bg_color = colors.faint_bg;
+        visuals.extreme_bg_color = window();
+        visuals.text_edit_bg_color = Some(window());
+        visuals.code_bg_color = window();
+        visuals.warn_fg_color = warn_amber();
+        visuals.error_fg_color = error_red();
+        visuals.panel_fill = face();
+        visuals.window_fill = face();
+        visuals.window_stroke = Stroke::new(1.0, dark_shadow());
         visuals.window_corner_radius = CornerRadius::ZERO;
         visuals.menu_corner_radius = CornerRadius::ZERO;
         visuals.window_shadow = Shadow::NONE;
         visuals.popup_shadow = Shadow { offset: [2, 2], blur: 0, spread: 0, color: Color32::from_black_alpha(90) };
         // egui does not recolour selected text in edit boxes, so use a light
         // highlight for generic selection; navy is reserved for list views/menus.
-        visuals.selection.bg_fill = Color32::from_rgb(166, 202, 240);
-        visuals.selection.stroke = Stroke::new(1.0, TEXT);
-        visuals.text_cursor.stroke = Stroke::new(1.0, TEXT);
+        visuals.selection.bg_fill = colors.text_selection;
+        visuals.selection.stroke = Stroke::new(1.0, text_color());
+        visuals.text_cursor.stroke = Stroke::new(1.0, text_color());
         visuals.text_cursor.blink = true;
         visuals.slider_trailing_fill = false;
         visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
@@ -101,27 +221,27 @@ pub fn apply(ctx: &egui::Context) {
         ] {
             w.corner_radius = CornerRadius::ZERO;
             w.expansion = 0.0;
-            w.fg_stroke = Stroke::new(1.0, TEXT);
+            w.fg_stroke = Stroke::new(1.0, text_color());
         }
-        widgets.noninteractive.bg_fill = FACE;
-        widgets.noninteractive.weak_bg_fill = FACE;
-        widgets.noninteractive.bg_stroke = Stroke::new(1.0, SHADOW);
+        widgets.noninteractive.bg_fill = face();
+        widgets.noninteractive.weak_bg_fill = face();
+        widgets.noninteractive.bg_stroke = Stroke::new(1.0, shadow());
 
-        widgets.inactive.bg_fill = WINDOW; // checkbox / edit backgrounds
-        widgets.inactive.weak_bg_fill = FACE; // button / combo backgrounds
-        widgets.inactive.bg_stroke = Stroke::new(1.0, SHADOW);
+        widgets.inactive.bg_fill = window(); // checkbox / edit backgrounds
+        widgets.inactive.weak_bg_fill = face(); // button / combo backgrounds
+        widgets.inactive.bg_stroke = Stroke::new(1.0, shadow());
 
-        widgets.hovered.bg_fill = WINDOW;
-        widgets.hovered.weak_bg_fill = FACE;
-        widgets.hovered.bg_stroke = Stroke::new(1.0, DARK_SHADOW);
+        widgets.hovered.bg_fill = window();
+        widgets.hovered.weak_bg_fill = face();
+        widgets.hovered.bg_stroke = Stroke::new(1.0, dark_shadow());
 
-        widgets.active.bg_fill = WINDOW;
-        widgets.active.weak_bg_fill = Color32::from_rgb(196, 192, 184);
-        widgets.active.bg_stroke = Stroke::new(1.0, DARK_SHADOW);
+        widgets.active.bg_fill = window();
+        widgets.active.weak_bg_fill = colors.pressed_face;
+        widgets.active.bg_stroke = Stroke::new(1.0, dark_shadow());
 
-        widgets.open.bg_fill = WINDOW;
-        widgets.open.weak_bg_fill = FACE;
-        widgets.open.bg_stroke = Stroke::new(1.0, DARK_SHADOW);
+        widgets.open.bg_fill = window();
+        widgets.open.weak_bg_fill = face();
+        widgets.open.bg_stroke = Stroke::new(1.0, dark_shadow());
     });
 }
 
@@ -164,28 +284,28 @@ fn pixel(painter: &egui::Painter) -> f32 {
 pub fn raised(painter: &egui::Painter, rect: Rect) {
     let rect = painter.round_rect_to_pixels(rect);
     let px = pixel(painter);
-    edge(painter, rect, LIGHT, DARK_SHADOW);
-    edge(painter, rect.shrink(px), HIGHLIGHT, SHADOW);
+    edge(painter, rect, light(), dark_shadow());
+    edge(painter, rect.shrink(px), highlight(), shadow());
 }
 
 /// EDGE_SUNKEN, as used by list views and edit controls.
 pub fn sunken(painter: &egui::Painter, rect: Rect) {
     let rect = painter.round_rect_to_pixels(rect);
     let px = pixel(painter);
-    edge(painter, rect, SHADOW, HIGHLIGHT);
-    edge(painter, rect.shrink(px), DARK_SHADOW, LIGHT);
+    edge(painter, rect, shadow(), highlight());
+    edge(painter, rect.shrink(px), dark_shadow(), light());
 }
 
 /// BDR_SUNKENOUTER, the shallow edge used by status-bar panes and progress bars.
 pub fn thin_sunken(painter: &egui::Painter, rect: Rect) {
-    edge(painter, painter.round_rect_to_pixels(rect), SHADOW, HIGHLIGHT);
+    edge(painter, painter.round_rect_to_pixels(rect), shadow(), highlight());
 }
 
 /// BDR_RAISEDINNER, used by list-view column headers.
 pub fn thin_raised(painter: &egui::Painter, rect: Rect) {
     let rect = painter.round_rect_to_pixels(rect);
-    edge(painter, rect, HIGHLIGHT, DARK_SHADOW);
-    edge(painter, rect.shrink(pixel(painter)), FACE, SHADOW);
+    edge(painter, rect, highlight(), dark_shadow());
+    edge(painter, rect.shrink(pixel(painter)), face(), shadow());
 }
 
 fn text_galley(ui: &Ui, text: impl Into<WidgetText>) -> Arc<egui::Galley> {
@@ -196,10 +316,10 @@ fn text_galley(ui: &Ui, text: impl Into<WidgetText>) -> Arc<egui::Galley> {
 /// Paint text the way Win32 draws disabled labels: white emboss under gray.
 fn paint_text(painter: &egui::Painter, pos: Pos2, galley: Arc<egui::Galley>, enabled: bool) {
     if enabled {
-        painter.galley(pos, galley, TEXT);
+        painter.galley(pos, galley, text_color());
     } else {
-        painter.galley(pos + egui::vec2(1.0, 1.0), galley.clone(), HIGHLIGHT);
-        painter.galley(pos, galley, GRAY_TEXT);
+        painter.galley(pos + egui::vec2(1.0, 1.0), galley.clone(), highlight());
+        painter.galley(pos, galley, gray_text());
     }
 }
 
@@ -213,13 +333,13 @@ pub fn button_sized(ui: &mut Ui, enabled: bool, text: &str, min_width: f32) -> R
     let (rect, response) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, FACE);
+        painter.rect_filled(rect, 0.0, face());
         let pressed = enabled && response.is_pointer_button_down_on() && response.contains_pointer();
         let mut text_pos = rect.center() - galley.size() / 2.0;
         if pressed {
             let rect = painter.round_rect_to_pixels(rect);
-            edge(painter, rect, DARK_SHADOW, DARK_SHADOW);
-            edge(painter, rect.shrink(pixel(painter)), SHADOW, SHADOW);
+            edge(painter, rect, dark_shadow(), dark_shadow());
+            edge(painter, rect.shrink(pixel(painter)), shadow(), shadow());
             text_pos += egui::vec2(1.0, 1.0);
         } else {
             raised(painter, rect);
@@ -228,7 +348,7 @@ pub fn button_sized(ui: &mut Ui, enabled: bool, text: &str, min_width: f32) -> R
             painter.rect_stroke(
                 rect.shrink(4.0),
                 0.0,
-                Stroke::new(1.0, DARK_SHADOW),
+                Stroke::new(1.0, dark_shadow()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -249,16 +369,16 @@ pub fn header_button(ui: &mut Ui, width: f32, height: f32, text: &str, sorted: O
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let pressed = response.is_pointer_button_down_on() && response.contains_pointer();
-        painter.rect_filled(rect, 0.0, FACE);
+        painter.rect_filled(rect, 0.0, face());
         if pressed {
-            edge(painter, painter.round_rect_to_pixels(rect), SHADOW, HIGHLIGHT);
+            edge(painter, painter.round_rect_to_pixels(rect), shadow(), highlight());
         } else {
             thin_raised(painter, rect);
         }
         let nudge = if pressed { 1.0 } else { 0.0 };
         let arrow_room = if sorted.is_some() { 14.0 } else { 0.0 };
         let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), (width - 10.0 - arrow_room).max(0.0), TextStyle::Body);
-        painter.galley(Pos2::new(rect.left() + 5.0 + nudge, rect.center().y - galley.size().y / 2.0 + nudge), galley, TEXT);
+        painter.galley(Pos2::new(rect.left() + 5.0 + nudge, rect.center().y - galley.size().y / 2.0 + nudge), galley, text_color());
         if let Some(ascending) = sorted {
             // Explorer-style sort arrow at the right edge of the header.
             let center = Pos2::new(rect.right() - 9.0 + nudge, rect.center().y + nudge);
@@ -269,20 +389,13 @@ pub fn header_button(ui: &mut Ui, width: f32, height: f32, text: &str, sorted: O
                     Pos2::new(center.x + 4.0, center.y + base),
                     Pos2::new(center.x - 4.0, center.y + base),
                 ],
-                SHADOW,
+                shadow(),
                 Stroke::NONE,
             ));
         }
     }
     response
 }
-
-/// COLOR_SCROLLBAR: the scroll bar track (classic Windows dithers white and
-/// button face; this is the blend).
-pub const SCROLL_TRACK: Color32 = Color32::from_rgb(234, 232, 228);
-const SCROLL_THUMB: Color32 = Color32::from_rgb(176, 172, 166);
-const SCROLL_THUMB_HOVERED: Color32 = Color32::from_rgb(150, 147, 141);
-const SCROLL_THUMB_DRAGGED: Color32 = SHADOW;
 
 /// Shows `area` with visible scroll bars.
 ///
@@ -298,10 +411,11 @@ pub fn scroll<R>(
     let normal = ui.visuals().clone();
     ui.scope(|ui| {
         let visuals = ui.visuals_mut();
-        visuals.extreme_bg_color = SCROLL_TRACK;
-        visuals.widgets.inactive.bg_fill = SCROLL_THUMB;
-        visuals.widgets.hovered.bg_fill = SCROLL_THUMB_HOVERED;
-        visuals.widgets.active.bg_fill = SCROLL_THUMB_DRAGGED;
+        let colors = palette();
+        visuals.extreme_bg_color = colors.scroll_track;
+        visuals.widgets.inactive.bg_fill = colors.scroll_thumb;
+        visuals.widgets.hovered.bg_fill = colors.scroll_thumb_hovered;
+        visuals.widgets.active.bg_fill = colors.scroll_thumb_dragged;
         area.show(ui, |ui| {
             *ui.visuals_mut() = normal;
             add_contents(ui)
@@ -314,7 +428,7 @@ pub fn scroll<R>(
 /// `height` is the total outer height, including the 2 px edge.
 pub fn list_view<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     let inner = egui::Frame::new()
-        .fill(WINDOW)
+        .fill(window())
         .inner_margin(egui::Margin::same(2))
         .show(ui, |ui| {
             ui.set_height((height - 4.0).max(0.0));
@@ -348,13 +462,13 @@ pub fn tab_strip<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, tabs: &[(T, 
             // Selected tabs are taller and overlap their neighbours slightly.
             let tab = if selected { rect.expand2(egui::vec2(2.0, 0.0)) } else { Rect::from_min_max(rect.min + egui::vec2(0.0, 2.0), rect.max) };
             let tab = painter.round_rect_to_pixels(tab);
-            painter.rect_filled(tab, 0.0, FACE);
-            painter.rect_filled(Rect::from_min_max(tab.min, Pos2::new(tab.min.x + px, tab.max.y)), 0.0, HIGHLIGHT);
-            painter.rect_filled(Rect::from_min_max(tab.min, Pos2::new(tab.max.x, tab.min.y + px)), 0.0, HIGHLIGHT);
-            painter.rect_filled(Rect::from_min_max(Pos2::new(tab.max.x - px, tab.min.y), tab.max), 0.0, DARK_SHADOW);
-            painter.rect_filled(Rect::from_min_max(Pos2::new(tab.max.x - 2.0 * px, tab.min.y + px), Pos2::new(tab.max.x - px, tab.max.y)), 0.0, SHADOW);
+            painter.rect_filled(tab, 0.0, face());
+            painter.rect_filled(Rect::from_min_max(tab.min, Pos2::new(tab.min.x + px, tab.max.y)), 0.0, highlight());
+            painter.rect_filled(Rect::from_min_max(tab.min, Pos2::new(tab.max.x, tab.min.y + px)), 0.0, highlight());
+            painter.rect_filled(Rect::from_min_max(Pos2::new(tab.max.x - px, tab.min.y), tab.max), 0.0, dark_shadow());
+            painter.rect_filled(Rect::from_min_max(Pos2::new(tab.max.x - 2.0 * px, tab.min.y + px), Pos2::new(tab.max.x - px, tab.max.y)), 0.0, shadow());
             let text_pos = (tab.center() - galley.size() / 2.0 + egui::vec2(0.0, if selected { -1.0 } else { 0.0 })).round();
-            painter.galley(text_pos, galley, TEXT);
+            painter.galley(text_pos, galley, text_color());
             if selected { selected_span = Some(tab.x_range()); }
         }
     });
@@ -365,7 +479,7 @@ pub fn tab_strip<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, tabs: &[(T, 
     let right = ui.max_rect().right();
     let line = |from: f32, to: f32| {
         if to > from {
-            painter.rect_filled(Rect::from_min_max(Pos2::new(from, y - px), Pos2::new(to, y)), 0.0, HIGHLIGHT);
+            painter.rect_filled(Rect::from_min_max(Pos2::new(from, y - px), Pos2::new(to, y)), 0.0, highlight());
         }
     };
     match selected_span {
@@ -384,7 +498,7 @@ pub fn status_pane(ui: &mut Ui, width: f32, text: impl Into<WidgetText>) -> Resp
         thin_sunken(painter, rect);
         let text: WidgetText = text.into();
         let galley = text.into_galley(ui, Some(TextWrapMode::Truncate), width - 8.0, TextStyle::Body);
-        painter.galley(Pos2::new(rect.left() + 4.0, rect.center().y - galley.size().y / 2.0).round(), galley, TEXT);
+        painter.galley(Pos2::new(rect.left() + 4.0, rect.center().y - galley.size().y / 2.0).round(), galley, text_color());
     }
     response
 }
@@ -395,8 +509,8 @@ pub fn toolbar_separator(ui: &mut Ui) {
     let painter = ui.painter();
     let px = pixel(painter);
     let x = rect.center().x.round();
-    painter.rect_filled(Rect::from_min_max(Pos2::new(x - px, rect.top()), Pos2::new(x, rect.bottom())), 0.0, SHADOW);
-    painter.rect_filled(Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + px, rect.bottom())), 0.0, HIGHLIGHT);
+    painter.rect_filled(Rect::from_min_max(Pos2::new(x - px, rect.top()), Pos2::new(x, rect.bottom())), 0.0, shadow());
+    painter.rect_filled(Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + px, rect.bottom())), 0.0, highlight());
 }
 
 /// Etched horizontal line (SS_ETCHEDHORZ).
@@ -405,13 +519,13 @@ pub fn etched_hline(ui: &mut Ui) {
     let painter = ui.painter();
     let px = pixel(painter);
     let y = rect.center().y.round();
-    painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), y - px), Pos2::new(rect.right(), y)), 0.0, SHADOW);
-    painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(rect.right(), y + px)), 0.0, HIGHLIGHT);
+    painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), y - px), Pos2::new(rect.right(), y)), 0.0, shadow());
+    painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(rect.right(), y + px)), 0.0, highlight());
 }
 
 /// Panel frame with no inner stroke and the 3D face colour.
 pub fn panel_frame(margin: i8) -> egui::Frame {
-    egui::Frame::new().fill(FACE).inner_margin(egui::Margin::same(margin))
+    egui::Frame::new().fill(face()).inner_margin(egui::Margin::same(margin))
 }
 
 /// Menu items: flat, highlighted in navy with white text on hover.
@@ -419,10 +533,10 @@ pub fn menu_item_style(style: &mut egui::Style) {
     egui::containers::menu::menu_style(style);
     style.spacing.button_padding = egui::vec2(8.0, 2.0);
     for w in [&mut style.visuals.widgets.hovered, &mut style.visuals.widgets.active, &mut style.visuals.widgets.open] {
-        w.weak_bg_fill = SELECTION;
-        w.bg_fill = SELECTION;
+        w.weak_bg_fill = selection();
+        w.bg_fill = selection();
         w.bg_stroke = Stroke::NONE;
-        w.fg_stroke = Stroke::new(1.0, SELECTION_TEXT);
+        w.fg_stroke = Stroke::new(1.0, selection_text());
     }
 }
 
@@ -432,17 +546,17 @@ pub fn field(ui: &mut Ui, text: &str) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, WINDOW);
+        painter.rect_filled(rect, 0.0, window());
         sunken(painter, rect);
         let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), rect.width() - 10.0, TextStyle::Body);
-        painter.galley(Pos2::new(rect.left() + 5.0, rect.center().y - galley.size().y / 2.0).round(), galley, TEXT);
+        painter.galley(Pos2::new(rect.left() + 5.0, rect.center().y - galley.size().y / 2.0).round(), galley, text_color());
     }
 }
 
 /// Edit control with a sunken client edge.
 pub fn text_edit(ui: &mut Ui, edit: egui::TextEdit<'_>) -> Response {
     let inner = egui::Frame::new()
-        .fill(WINDOW)
+        .fill(window())
         .inner_margin(egui::Margin::symmetric(3, 3))
         .show(ui, |ui| ui.add(edit.frame(false).margin(egui::Margin::ZERO)));
     sunken(ui.painter(), inner.response.rect);
@@ -455,9 +569,9 @@ pub fn list_item(ui: &mut Ui, text: &str, selected: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let color = if selected { SELECTION_TEXT } else { TEXT };
+        let color = if selected { selection_text() } else { text_color() };
         if selected {
-            painter.rect_filled(rect, 0.0, SELECTION);
+            painter.rect_filled(rect, 0.0, selection());
         }
         let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), rect.width() - 10.0, TextStyle::Body);
         painter.galley(Pos2::new(rect.left() + 5.0, rect.center().y - galley.size().y / 2.0).round(), galley, color);
@@ -514,7 +628,7 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
     let folder_edge = Color32::from_rgb(128, 96, 0);
     let metal = Color32::from_rgb(90, 90, 90);
     let tray = |painter: &egui::Painter| {
-        let stroke = Stroke::new(1.5 * scale, c(DARK_SHADOW));
+        let stroke = Stroke::new(1.5 * scale, c(dark_shadow()));
         painter.add(egui::Shape::line(vec![p(1.5, 10.0), p(1.5, 14.5), p(14.5, 14.5), p(14.5, 10.0)], stroke));
     };
 
@@ -549,16 +663,16 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
             let gap = if connected { 0.0 } else { 2.0 };
             let body = if connected { Color32::from_rgb(40, 140, 60) } else { metal };
             // Cables.
-            fill_rect(0.0, 7.3, 3.0 - gap, 8.7, DARK_SHADOW);
-            fill_rect(13.0 + gap, 7.3, 16.0, 8.7, DARK_SHADOW);
+            fill_rect(0.0, 7.3, 3.0 - gap, 8.7, dark_shadow());
+            fill_rect(13.0 + gap, 7.3, 16.0, 8.7, dark_shadow());
             // Plug with two prongs.
-            outlined_rect(3.0 - gap, 4.5, 8.0 - gap, 11.5, body, DARK_SHADOW);
-            fill_rect(8.0 - gap, 5.8, 10.5 - gap, 7.0, DARK_SHADOW);
-            fill_rect(8.0 - gap, 9.0, 10.5 - gap, 10.2, DARK_SHADOW);
+            outlined_rect(3.0 - gap, 4.5, 8.0 - gap, 11.5, body, dark_shadow());
+            fill_rect(8.0 - gap, 5.8, 10.5 - gap, 7.0, dark_shadow());
+            fill_rect(8.0 - gap, 9.0, 10.5 - gap, 10.2, dark_shadow());
             // Socket.
-            outlined_rect(10.5 + gap, 3.5, 13.0 + gap, 12.5, body, DARK_SHADOW);
+            outlined_rect(10.5 + gap, 3.5, 13.0 + gap, 12.5, body, dark_shadow());
             if !connected {
-                painter.line_segment([p(2.0, 14.0), p(14.0, 2.0)], Stroke::new(2.0 * scale, c(ERROR_RED)));
+                painter.line_segment([p(2.0, 14.0), p(14.0, 2.0)], Stroke::new(2.0 * scale, c(error_red())));
             }
         }
         Icon::Settings => {
@@ -580,7 +694,7 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
                 ));
             }
             painter.circle_filled(center, 5.2 * scale, c(gear));
-            painter.circle_filled(center, 2.1 * scale, FACE);
+            painter.circle_filled(center, 2.1 * scale, face());
         }
         Icon::Upload => {
             tray(painter);
@@ -613,7 +727,7 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
                     p(8.0 + 7.0 * t.cos(), 8.0 + 4.6 * t.sin())
                 }))
                 .collect();
-            painter.add(egui::Shape::convex_polygon(outline, c(Color32::WHITE), Stroke::new(scale.max(1.0), c(DARK_SHADOW))));
+            painter.add(egui::Shape::convex_polygon(outline, c(Color32::WHITE), Stroke::new(scale.max(1.0), c(dark_shadow()))));
             painter.circle_filled(p(8.0, 8.0), 3.0 * scale, c(blue));
             painter.circle_filled(p(8.0, 8.0), 1.3 * scale, c(Color32::BLACK));
             painter.circle_filled(p(7.0, 7.0), 0.7 * scale, c(Color32::WHITE));
@@ -639,7 +753,7 @@ pub fn icon_button(ui: &mut Ui, enabled: bool, icon: Icon, tooltip: &str) -> Res
             thin_sunken(painter, rect);
             icon_rect = icon_rect.translate(egui::vec2(1.0, 1.0));
         } else if enabled && response.hovered() {
-            edge(painter, painter.round_rect_to_pixels(rect), HIGHLIGHT, SHADOW);
+            edge(painter, painter.round_rect_to_pixels(rect), highlight(), shadow());
         }
         paint_icon(painter, icon_rect, icon, enabled);
     }
@@ -658,12 +772,12 @@ pub fn icon_toggle(ui: &mut Ui, on: bool, icon: Icon, tooltip: &str) -> Response
         if on || pressed {
             if on {
                 // Checked buttons show the dithered light face.
-                painter.rect_filled(rect, 0.0, SCROLL_TRACK);
+                painter.rect_filled(rect, 0.0, scroll_track());
             }
             thin_sunken(painter, rect);
             icon_rect = icon_rect.translate(egui::vec2(1.0, 1.0));
         } else if response.hovered() {
-            edge(painter, painter.round_rect_to_pixels(rect), HIGHLIGHT, SHADOW);
+            edge(painter, painter.round_rect_to_pixels(rect), highlight(), shadow());
         }
         paint_icon(painter, icon_rect, icon, true);
     }

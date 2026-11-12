@@ -12,6 +12,7 @@ pub struct AppSettings {
     pub transfer: TransferSettings,
     pub network: NetworkSettings,
     pub logging: LoggingSettings,
+    pub theme: crate::win32::Theme,
     /// Hide dot files (and, on Windows, files marked hidden) in both panes.
     pub hide_hidden_items: bool,
     /// Local folder shown when the app starts: the one last browsed.
