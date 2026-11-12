@@ -1593,16 +1593,20 @@ impl SftpApp {
             Dialog::ConfirmDelete => "Confirm Delete",
             Dialog::Rename => "Rename",
         };
+        let size = match &dialog {
+            Dialog::Profiles => [660.0, 430.0],
+            Dialog::TrustHostKey => [470.0, 260.0],
+            Dialog::ConfirmDelete => [440.0, 180.0],
+            Dialog::Rename => [420.0, 180.0],
+            _ => [470.0, 210.0],
+        };
+        // The minimum must not exceed the size: on Wayland a fixed-size window
+        // gets max size = its size, and min > max is a protocol error that makes
+        // the compositor disconnect (crash) the app.
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size(match &dialog {
-                Dialog::Profiles => [660.0, 430.0],
-                Dialog::TrustHostKey => [470.0, 260.0],
-                Dialog::ConfirmDelete => [440.0, 170.0],
-                Dialog::Rename => [420.0, 160.0],
-                _ => [470.0, 210.0],
-            })
-            .with_min_inner_size([420.0, 180.0])
+            .with_inner_size(size)
+            .with_min_inner_size(size)
             .with_resizable(false);
         let mut close = false;
         let mut connect = false;
