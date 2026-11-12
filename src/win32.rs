@@ -612,6 +612,8 @@ pub enum Icon {
     Information,
     /// An eye: show / hide hidden items.
     HiddenItems,
+    /// A folder with a green plus.
+    NewFolder,
 }
 
 /// Paint `icon` into `rect` (any square size; drawn on a 16-unit grid).
@@ -733,6 +735,15 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
             ));
             fill_rect(7.2, 5.0, 8.8, 10.5, Color32::BLACK);
             fill_rect(7.2, 11.8, 8.8, 13.4, Color32::BLACK);
+        }
+        Icon::NewFolder => {
+            outlined_rect(0.5, 5.0, 5.5, 7.5, Color32::from_rgb(240, 200, 80), folder_edge);
+            outlined_rect(0.5, 6.5, 12.0, 14.5, folder, folder_edge);
+            // The plus, with a white outline so it stands out from the folder.
+            fill_rect(10.0, 0.0, 14.0, 9.0, Color32::WHITE);
+            fill_rect(7.5, 2.5, 16.0, 6.5, Color32::WHITE);
+            fill_rect(11.0, 1.0, 13.0, 8.0, green);
+            fill_rect(8.5, 3.5, 15.5, 5.5, green);
         }
         Icon::HiddenItems => {
             // Almond-shaped eye with an iris and pupil.

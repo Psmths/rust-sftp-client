@@ -43,6 +43,10 @@ const MAX_RTO: Duration = Duration::from_secs(3);
 /// How often waiting loops re-check for cancellation.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OPEN_ATTEMPTS: u32 = 6;
+/// Shortest wait for a segment's digest before asking again. The server reads
+/// and hashes the whole segment first, which takes a while when it is busy,
+/// and every repeated request makes it read and hash the segment again.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(1);
 /// A segment attempt fails after this long without receiving any data.
 const STALL_LIMIT: Duration = Duration::from_secs(10);
 
@@ -176,6 +180,8 @@ pub struct FetchStats {
     pub peak_window: usize,
     /// Time spent waiting for the server to hash segments before data flows.
     pub open_wait: Duration,
+    /// Segments whose digest had been asked for ahead (see `fetch_ahead`).
+    pub digests_ahead: u64,
     pub smoothed_rtt: Option<Duration>,
 }
 
@@ -188,6 +194,7 @@ impl FetchStats {
         self.stalls += other.stalls;
         self.peak_window = self.peak_window.max(other.peak_window);
         self.open_wait += other.open_wait;
+        self.digests_ahead += other.digests_ahead;
         self.smoothed_rtt = match (self.smoothed_rtt, other.smoothed_rtt) {
             (Some(a), Some(b)) => Some((a + b) / 2),
             (a, b) => a.or(b),
@@ -214,6 +221,20 @@ pub struct SegmentFetcher {
     rto: Duration,
     window: usize,
     ssthresh: usize,
+    /// OPEN_SEGMENT sent ahead for the next segment: (request, offset, len, sent at).
+    prefetch_pending: Option<(u32, u64, u32, Instant)>,
+    /// Its answer: (offset, len, status, digest).
+    prefetched: Option<(u64, u32, SegmentStatus, [u8; 32])>,
+}
+
+/// The digest an OPEN_SEGMENT answer carries, or the error it reports.
+fn digest_result(status: SegmentStatus, sha256: [u8; 32]) -> Result<[u8; 32], FetchError> {
+    match status {
+        SegmentStatus::Ok => Ok(sha256),
+        SegmentStatus::FileChanged => Err(FetchError::FileChanged),
+        SegmentStatus::OutOfRange => Err(FetchError::Server("segment outside the file".into())),
+        SegmentStatus::IoError => Err(FetchError::Server("read error on the server".into())),
+    }
 }
 
 impl SegmentFetcher {
@@ -229,7 +250,23 @@ impl SegmentFetcher {
             window: INITIAL_WINDOW,
             ssthresh: MAX_WINDOW,
             stats: FetchStats::default(),
+            prefetch_pending: None,
+            prefetched: None,
         })
+    }
+
+    /// Keeps the answer to a digest request sent ahead; true if `message` was one.
+    fn keep_prefetched(&mut self, message: &Message) -> bool {
+        if let (Message::SegmentInfo { request, status, sha256, .. }, Some((pending, offset, len, _))) =
+            (message, self.prefetch_pending)
+        {
+            if *request == pending {
+                self.prefetch_pending = None;
+                self.prefetched = Some((offset, len, *status, *sha256));
+                return true;
+            }
+        }
+        false
     }
 
     fn sample_rtt(&mut self, sample: Duration) {
@@ -279,7 +316,41 @@ impl SegmentFetcher {
     }
 
     async fn open_segment(&mut self, offset: u64, len: u32, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<[u8; 32], FetchError> {
-        let mut rto = self.rto.max(INITIAL_RTO);
+        let mut rto = self.rto.max(OPEN_TIMEOUT);
+        // Asked for ahead (see `fetch_ahead`): use that answer, or wait for it.
+        if let Some((pending_offset, pending_len, status, sha256)) = self.prefetched {
+            if (pending_offset, pending_len) == (offset, len) {
+                self.prefetched = None;
+                self.stats.digests_ahead += 1;
+                return digest_result(status, sha256);
+            }
+        }
+        if let Some((request, pending_offset, pending_len, sent_at)) = self.prefetch_pending {
+            if (pending_offset, pending_len) == (offset, len) {
+                let deadline = sent_at + rto;
+                loop {
+                    if cancelled() {
+                        return Err(FetchError::Cancelled);
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match self.receive((deadline - now).min(POLL_INTERVAL)).await? {
+                        Some(Message::SegmentInfo { request: answered, status, sha256, .. }) if answered == request => {
+                            self.prefetch_pending = None;
+                            self.stats.digests_ahead += 1;
+                            return digest_result(status, sha256);
+                        }
+                        Some(Message::Error { message }) => return Err(FetchError::Server(message)),
+                        _ => {}
+                    }
+                }
+                // No answer in time: ask again below, with a longer wait.
+                self.prefetch_pending = None;
+                rto = (rto * 2).min(MAX_RTO * 2);
+            }
+        }
         for _ in 0..OPEN_ATTEMPTS {
             // A fresh request id and packet counter per attempt; the server
             // rejects replayed counters.
@@ -295,15 +366,14 @@ impl SegmentFetcher {
                 if now >= deadline {
                     break;
                 }
-                match self.receive((deadline - now).min(POLL_INTERVAL)).await? {
+                let mut message = self.receive((deadline - now).min(POLL_INTERVAL)).await?;
+                if message.as_ref().is_some_and(|message| self.keep_prefetched(message)) {
+                    message = None;
+                }
+                match message {
                     Some(Message::SegmentInfo { request: answered, status, sha256, .. }) if answered == request => {
                         self.sample_rtt(sent_at.elapsed());
-                        return match status {
-                            SegmentStatus::Ok => Ok(sha256),
-                            SegmentStatus::FileChanged => Err(FetchError::FileChanged),
-                            SegmentStatus::OutOfRange => Err(FetchError::Server("segment outside the file".into())),
-                            SegmentStatus::IoError => Err(FetchError::Server("read error on the server".into())),
-                        };
+                        return digest_result(status, sha256);
                     }
                     Some(Message::Error { message }) => return Err(FetchError::Server(message)),
                     _ => {}
@@ -321,6 +391,22 @@ impl SegmentFetcher {
         &mut self,
         offset: u64,
         len: u32,
+        progress: &mut (dyn FnMut(u64) + Send),
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<u8>, FetchError> {
+        self.fetch_ahead(offset, len, None, progress, cancelled).await
+    }
+
+    /// Like [`fetch`](Self::fetch), and once every chunk of this segment has
+    /// been requested, also asks for the digest of `next` (the segment this
+    /// fetcher fetches after this one). The server reads and hashes it while
+    /// this segment's last data arrives, so the next fetch usually starts
+    /// without waiting for its digest. Uses only protocol version 1 messages.
+    pub async fn fetch_ahead(
+        &mut self,
+        offset: u64,
+        len: u32,
+        next: Option<(u64, u32)>,
         progress: &mut (dyn FnMut(u64) + Send),
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<u8>, FetchError> {
@@ -398,11 +484,28 @@ impl SegmentFetcher {
                 batches.push_back(Batch { start, end, sent_at: now, deadline: now + self.rto, retransmission });
             }
 
+            // Every chunk has been asked for once: ask for the next digest now.
+            if cursor >= chunk_count {
+                if let Some((next_offset, next_len)) = next {
+                    let already = self.prefetch_pending.is_some_and(|(_, o, l, _)| (o, l) == (next_offset, next_len))
+                        || self.prefetched.is_some_and(|(o, l, _, _)| (o, l) == (next_offset, next_len));
+                    if !already {
+                        let request = self.conn.request_id();
+                        self.send(&Message::OpenSegment { request, offset: next_offset, len: next_len }).await?;
+                        self.prefetch_pending = Some((request, next_offset, next_len, Instant::now()));
+                    }
+                }
+            }
+
             // Wait for data until the earliest request deadline.
             let now = Instant::now();
             let deadline = batches.iter().map(|batch| batch.deadline).min().unwrap_or(now + self.rto);
             let wait = deadline.saturating_duration_since(now).min(POLL_INTERVAL);
-            match self.receive(wait).await? {
+            let mut message = self.receive(wait).await?;
+            if message.as_ref().is_some_and(|message| self.keep_prefetched(message)) {
+                message = None;
+            }
+            match message {
                 Some(Message::Data { offset: chunk_offset, data: chunk }) => {
                     if let Some(index) = chunk_index(offset, len_usize, chunk_offset, chunk.len()) {
                         if state[index] == Chunk::Received {

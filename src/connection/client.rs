@@ -162,6 +162,9 @@ pub struct SftpConnection {
     tickets: tokio::sync::Mutex<Option<TicketStream>>,
     /// `HELPER_LISTING_*`: learned from the first listing.
     helper_listing: AtomicU8,
+    /// Turbo segments in flight across all downloads of this connection.
+    turbo_slots: Arc<Semaphore>,
+    turbo_slot_count: AtomicUsize,
     pub host: String,
     pub port: u16,
     pub fingerprint: String,
@@ -258,6 +261,8 @@ impl SftpConnection {
             turbo: Mutex::new(TurboInfo { state: turbo_state, last_fallback: None }),
             tickets: tokio::sync::Mutex::new(tickets),
             helper_listing: AtomicU8::new(HELPER_LISTING_UNKNOWN),
+            turbo_slots: Arc::new(Semaphore::new(turbo::CONNECTION_FETCH_SLOTS)),
+            turbo_slot_count: AtomicUsize::new(turbo::CONNECTION_FETCH_SLOTS),
             host: profile.host.clone(),
             port: profile.port,
             fingerprint: trusted_fingerprint.unwrap_or_default().to_owned(),
@@ -656,6 +661,10 @@ impl SftpConnection {
         Ok(DownloadResult { bytes: completed, segments: segment_count, segmented, accelerated, details })
     }
 
+    pub async fn create_dir(&self, path: &str) -> Result<(), ConnectError> {
+        self.sftp.create_dir(path.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
+    }
+
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), ConnectError> {
         self.sftp.rename(from.to_owned(), to.to_owned()).await.map_err(|e| ConnectError::Sftp(e.to_string()))
     }
@@ -878,7 +887,13 @@ impl SftpConnection {
             self.set_turbo_state(TurboState::Unavailable(format!("cannot resolve {} for UDP", self.host)));
             return TurboOutcome::NotUsed;
         };
-        match turbo::download(server, &ticket, partial, settings, progress, cancel).await {
+        // One file may still use all of its configured workers.
+        let wanted = settings.max_segments_per_file as usize;
+        let current = self.turbo_slot_count.fetch_max(wanted, Ordering::Relaxed);
+        if wanted > current {
+            self.turbo_slots.add_permits(wanted - current);
+        }
+        match turbo::download(server, &ticket, partial, settings, progress, cancel, Arc::clone(&self.turbo_slots)).await {
             Ok(result) => {
                 self.set_turbo_state(TurboState::Active);
                 TurboOutcome::Done(result)

@@ -55,9 +55,13 @@ async fn downloads_verified_segments_despite_packet_loss() {
     let mut fetcher = SegmentFetcher::new(connection.clone()).await.unwrap();
     while (offset as usize) < contents.len() {
         let len = segment_len.min(contents.len() - offset as usize) as u32;
+        // Digests are asked for ahead as well; lossy links must not break that.
+        let next_offset = offset + u64::from(len);
+        let next = ((next_offset as usize) < contents.len())
+            .then(|| (next_offset, segment_len.min(contents.len() - next_offset as usize) as u32));
         let mut last_progress = 0;
         let data = fetcher
-            .fetch(offset, len, &mut |bytes| last_progress = bytes, &|| false)
+            .fetch_ahead(offset, len, next, &mut |bytes| last_progress = bytes, &|| false)
             .await
             .unwrap();
         assert_eq!(last_progress, u64::from(len));
@@ -88,6 +92,32 @@ async fn downloads_without_loss_using_batched_sends() {
         offset += len;
     }
     assert_eq!(downloaded, contents);
+    connection.close().await;
+    let _ = fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn digests_asked_for_ahead_are_used_by_the_next_segment() {
+    let contents = pattern(6 * 1024 * 1024 + 77);
+    let path = temp_file("ahead", &contents);
+    let server = start(Options::default());
+    let ticket = ticket_for(&server, &path);
+    let connection = Connection::new(server.local_addr().unwrap(), &ticket).unwrap();
+    let mut fetcher = SegmentFetcher::new(connection.clone()).await.unwrap();
+    let segment = 2 * 1024 * 1024;
+    let ranges: Vec<(u64, u32)> = (0..contents.len())
+        .step_by(segment)
+        .map(|offset| (offset as u64, segment.min(contents.len() - offset) as u32))
+        .collect();
+    let mut downloaded = Vec::new();
+    for (index, &(offset, len)) in ranges.iter().enumerate() {
+        let next = ranges.get(index + 1).copied();
+        let data = fetcher.fetch_ahead(offset, len, next, &mut |_| {}, &|| false).await.unwrap();
+        downloaded.extend_from_slice(&data);
+    }
+    assert_eq!(downloaded, contents);
+    // Every segment but the first started with its digest already requested.
+    assert_eq!(fetcher.stats().digests_ahead, ranges.len() as u64 - 1);
     connection.close().await;
     let _ = fs::remove_file(&path);
 }

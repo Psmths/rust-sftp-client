@@ -127,6 +127,7 @@ enum RowAction {
     Hash(HashAlgorithm),
     Rename,
     Delete,
+    NewFolder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -317,6 +318,7 @@ enum Dialog {
     Error,
     ConfirmDelete,
     Rename,
+    NewFolder,
 }
 
 #[derive(Clone, Debug)]
@@ -366,9 +368,12 @@ pub struct SftpApp {
     file_target: Option<FileTarget>,
     /// Session that `file_target` belongs to.
     file_target_session: u64,
+    /// Text of the Rename / New folder dialogs.
     rename_value: String,
     rename_error: String,
     rename_focus: bool,
+    /// The New folder dialog creates on the server (else locally).
+    new_folder_remote: bool,
     op_tx: std_mpsc::Sender<OpResult>,
     op_rx: std_mpsc::Receiver<OpResult>,
     ops_pending: usize,
@@ -431,6 +436,7 @@ impl SftpApp {
             rename_value: String::new(),
             rename_error: String::new(),
             rename_focus: false,
+            new_folder_remote: false,
             op_tx,
             op_rx,
             ops_pending: 0,
@@ -737,6 +743,62 @@ impl SftpApp {
         self.dialog = Some(Dialog::ConfirmDelete);
     }
 
+    /// Opens the New folder dialog for the local (or remote) pane.
+    fn begin_new_folder(&mut self, remote: bool) {
+        if remote && !self.session().is_connected() { return; }
+        self.rename_value = "New folder".into();
+        self.rename_error.clear();
+        self.rename_focus = true;
+        self.new_folder_remote = remote;
+        self.file_target_session = self.session().id;
+        self.dialog = Some(Dialog::NewFolder);
+    }
+
+    /// Creates the folder named in the dialog in the pane's current folder;
+    /// false keeps the dialog open (with an error).
+    fn perform_new_folder(&mut self) -> bool {
+        let Some(index) = self.session_index(self.file_target_session) else { return true; };
+        let name = self.rename_value.trim().to_owned();
+        if !valid_file_name(&name, !self.new_folder_remote) {
+            self.rename_error = "That is not a valid folder name.".into();
+            return false;
+        }
+        if self.new_folder_remote {
+            let session = &self.sessions[index];
+            if session.remote_entries.iter().any(|entry| entry.name == name) {
+                self.rename_error = format!("\"{name}\" already exists.");
+                return false;
+            }
+            let Some(connection) = session.connection.clone() else { return true; };
+            let path = join_remote(&session.remote_path, &name);
+            let (tx, session_id) = (self.op_tx.clone(), session.id);
+            self.ops_pending += 1;
+            self.runtime.spawn(async move {
+                let result = connection.create_dir(&path).await
+                    .map(|()| format!("Created remote folder {path}"))
+                    .map_err(|error| format!("Could not create remote folder {path}: {error}"));
+                let _ = tx.send(OpResult { session: session_id, msgid: "MKDIR", remote: true, result });
+            });
+        } else {
+            let session = &mut self.sessions[index];
+            let path = session.path.join(&name);
+            if path.symlink_metadata().is_ok() {
+                self.rename_error = format!("\"{name}\" already exists.");
+                return false;
+            }
+            if let Err(error) = fs::create_dir(&path) {
+                self.rename_error = format!("Could not create the folder: {error}");
+                return false;
+            }
+            session.log_file_operation("MKDIR", &Ok(format!("Created folder {}", path.display())));
+            session.status = format!("Created folder {name}");
+            session.local_selected = vec![path.clone()];
+            session.local_anchor = Some(path);
+            session.refresh_local();
+        }
+        true
+    }
+
     fn begin_rename(&mut self, target: FileTarget) {
         let Some((name, _)) = target.items().first().copied() else { return; };
         self.rename_value = name.to_owned();
@@ -793,12 +855,7 @@ impl SftpApp {
         let Some(target) = self.file_target.clone() else { return true; };
         let Some(index) = self.session_index(self.file_target_session) else { return true; };
         let new_name = self.rename_value.trim().to_owned();
-        let invalid_chars: &[char] = if !target.is_remote() && cfg!(windows) {
-            &['/', '\\', ':', '*', '?', '"', '<', '>', '|']
-        } else {
-            &['/']
-        };
-        if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains(invalid_chars) {
+        if !valid_file_name(&new_name, !target.is_remote()) {
             self.rename_error = "That is not a valid file name.".into();
             return false;
         }
@@ -1072,6 +1129,9 @@ impl SftpApp {
                 self.drives = places::list();
                 self.sessions[a].refresh_local();
             }
+            if win32::icon_button(ui, true, win32::Icon::NewFolder, "New folder").clicked() {
+                self.begin_new_folder(false);
+            }
             ui.add_space(6.0);
             ui.label("Filter:");
             win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].local_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
@@ -1125,6 +1185,7 @@ impl SftpApp {
         let order: Vec<PathBuf> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
         let mut sort_click = None;
+        let mut background_new_folder = false;
         win32::list_view(ui, list_height, |ui| {
             let (name_width, header) = reserve_list_header(ui);
             win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
@@ -1189,6 +1250,7 @@ impl SftpApp {
                                 for target in targets() { self.sessions[a].queue_upload(target.path); }
                             }
                             Some(RowAction::Hash(algorithm)) => self.start_local_hash(&entry, algorithm),
+                            Some(RowAction::NewFolder) => self.begin_new_folder(false),
                             Some(RowAction::Rename) => self.begin_rename(FileTarget::Local(vec![entry.clone()])),
                             Some(RowAction::Delete) => {
                                 let targets = targets();
@@ -1200,9 +1262,15 @@ impl SftpApp {
                         file_row_details(ui, entry.dir, entry.size, &entry.modified);
                     });
                 }
+                let session = &mut self.sessions[a];
+                background_new_folder = list_background(ui, &mut || {
+                    session.local_selected.clear();
+                    session.local_anchor = None;
+                });
             });
             sort_click = paint_list_header(ui, header, name_width, self.sessions[a].local_sort);
         });
+        if background_new_folder { self.begin_new_folder(false); }
         if let Some(column) = sort_click { self.sessions[a].local_sort.toggle(column); }
         if let Some(path) = open_dir {
             // Opening a folder found by a search shows that folder, not more results.
@@ -1238,6 +1306,9 @@ impl SftpApp {
             if win32::icon_button(ui, connected, win32::Icon::Refresh, "Refresh").clicked() {
                 let path = self.sessions[a].remote_path.clone();
                 self.sessions[a].load_remote(&path);
+            }
+            if win32::icon_button(ui, connected, win32::Icon::NewFolder, "New folder").clicked() {
+                self.begin_new_folder(true);
             }
             ui.add_space(6.0);
             ui.label("Filter:");
@@ -1275,6 +1346,7 @@ impl SftpApp {
         let order: Vec<String> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
         let mut open_profiles = false;
         let mut sort_click = None;
+        let mut background_new_folder = false;
         let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
         win32::list_view(ui, list_height, |ui| {
             let (name_width, header) = reserve_list_header(ui);
@@ -1349,15 +1421,22 @@ impl SftpApp {
                                 let targets = targets();
                                 self.begin_delete(FileTarget::Remote(targets));
                             }
+                            Some(RowAction::NewFolder) => self.begin_new_folder(true),
                             Some(RowAction::Hash(_)) | None => {}
                         }
                         if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
                         file_row_details(ui, entry.dir, entry.size, &entry.modified);
                     });
                 }
+                let session = &mut self.sessions[a];
+                background_new_folder = list_background(ui, &mut || {
+                    session.remote_selected.clear();
+                    session.remote_anchor = None;
+                });
             });
             sort_click = paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
         });
+        if background_new_folder { self.begin_new_folder(true); }
         if let Some(column) = sort_click { self.sessions[a].remote_sort.toggle(column); }
         if let Some(path) = open_dir {
             if searching { self.sessions[a].remote_filter.clear(); }
@@ -1661,13 +1740,14 @@ impl SftpApp {
             Dialog::Error => "Operation failed",
             Dialog::ConfirmDelete => "Confirm Delete",
             Dialog::Rename => "Rename",
+            Dialog::NewFolder => "New Folder",
         };
         let size = match &dialog {
             // Fits the tallest form (password logon: eight rows) with 240 px fields.
             Dialog::Profiles => [520.0, 310.0],
             Dialog::TrustHostKey => [470.0, 260.0],
             Dialog::ConfirmDelete => [440.0, 180.0],
-            Dialog::Rename => [420.0, 180.0],
+            Dialog::Rename | Dialog::NewFolder => [420.0, 180.0],
             _ => [470.0, 210.0],
         };
         // The minimum must not exceed the size: on Wayland a fixed-size window
@@ -1685,6 +1765,7 @@ impl SftpApp {
         let mut password_value = None;
         let mut confirm_delete = false;
         let mut confirm_rename = false;
+        let mut confirm_new_folder = false;
         let mut repaint = false;
         ctx.show_viewport_immediate(id, builder, |window_ctx, _class| {
             egui::CentralPanel::default().show(window_ctx, |ui| {
@@ -1844,6 +1925,34 @@ impl SftpApp {
                             if win32::button_sized(ui, true, "Yes", 75.0).clicked() { confirm_delete = true; }
                         });
                     }
+                    Dialog::NewFolder => {
+                        let location = self.session_index(self.file_target_session)
+                            .map(|index| {
+                                let session = &self.sessions[index];
+                                if self.new_folder_remote { session.remote_path.clone() } else { session.path.display().to_string() }
+                            })
+                            .unwrap_or_default();
+                        ui.label(format!("Name of the new folder in {location}:"));
+                        let response = win32::text_edit(ui, egui::TextEdit::singleline(&mut self.rename_value).desired_width(f32::INFINITY));
+                        if self.rename_focus {
+                            response.request_focus();
+                            // Select the suggested name, so typing replaces it.
+                            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                                let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.rename_value.chars().count()));
+                                state.cursor.set_char_range(Some(all));
+                                state.store(ui.ctx(), response.id);
+                            }
+                            self.rename_focus = false;
+                        }
+                        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) { confirm_new_folder = true; }
+                        if !self.rename_error.is_empty() {
+                            ui.colored_label(win32::error_red(), &self.rename_error);
+                        }
+                        dialog_buttons(ui, |ui| {
+                            if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                            if win32::button_sized(ui, true, "OK", 75.0).clicked() { confirm_new_folder = true; }
+                        });
+                    }
                     Dialog::Rename => {
                         let old_name = self.file_target.as_ref()
                             .and_then(|target| target.items().first().map(|(name, _)| name.to_string()))
@@ -1873,6 +1982,9 @@ impl SftpApp {
             self.perform_delete();
         }
         if confirm_rename && self.perform_rename() {
+            self.dialog = None;
+        }
+        if confirm_new_folder && self.perform_new_folder() {
             self.dialog = None;
         }
         if save { self.save_profile(); }
@@ -2278,7 +2390,32 @@ fn row_context_menu(
     ui.separator();
     item(ui, single, "Rename", RowAction::Rename);
     item(ui, true, "Delete", RowAction::Delete);
+    ui.separator();
+    item(ui, true, "New folder", RowAction::NewFolder);
     action
+}
+
+/// Right-click menu and click target for the empty space below a file list.
+/// Returns true if "New folder" was chosen; a click clears `clear_selection`.
+fn list_background(ui: &mut egui::Ui, clear_selection: &mut dyn FnMut()) -> bool {
+    let height = ui.available_height().max(ROW_HEIGHT);
+    let (_, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+    if response.clicked() { clear_selection(); }
+    let mut new_folder = false;
+    response.context_menu(|ui| {
+        win32::menu_item_style(ui.style_mut());
+        if ui.button("New folder").clicked() {
+            new_folder = true;
+            ui.close();
+        }
+    });
+    new_folder
+}
+
+/// Whether `name` can name a file or folder (local names follow Windows' rules on Windows).
+fn valid_file_name(name: &str, local: bool) -> bool {
+    let invalid: &[char] = if local && cfg!(windows) { &['/', '\\', ':', '*', '?', '"', '<', '>', '|'] } else { &['/'] };
+    !name.is_empty() && name != "." && name != ".." && !name.contains(invalid)
 }
 
 fn delete_message(target: &FileTarget) -> String {
@@ -2805,6 +2942,19 @@ mod tests {
         for algorithm in HashAlgorithm::ALL {
             assert_eq!(digest(algorithm, &[b"a", b"bc"]), digest(algorithm, &[b"abc"]));
         }
+    }
+
+    #[test]
+    fn folder_names_are_validated() {
+        assert!(valid_file_name("New folder", true));
+        assert!(valid_file_name(".config", false));
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(!valid_file_name(bad, false), "{bad:?}");
+            assert!(!valid_file_name(bad, true), "{bad:?}");
+        }
+        // Characters Windows forbids are only refused for local names there.
+        assert!(valid_file_name("a:b", false));
+        assert_eq!(valid_file_name("a:b", true), !cfg!(windows));
     }
 
     #[test]

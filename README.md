@@ -45,6 +45,11 @@ back to SFTP automatically when the server has no helper or UDP is blocked.
   so only files that user can read are offered), every UDP packet is encrypted and authenticated with
   AES-256-GCM, lost packets are re-requested, and every segment is verified against a SHA-256 digest
   computed on the server and downloaded again if it does not match.
+* Each worker asks for its next segment's SHA-256 while the current segment's last data arrives, so the
+  server's read-and-hash time is mostly hidden. All downloads of a connection share at most 16 segments in
+  flight (more if *Workers per file* is higher), which keeps many simultaneous files from overrunning the
+  link. A segment that still fails after 5 attempts is left to SFTP while turbo carries on with the rest;
+  turbo gives up on a file only after 3 segments in a row fail.
 * Downloads keep their progress in a hidden `.<name>.rsftp-part` file: if turbo fails part-way, SFTP
   finishes only the missing pieces, and an interrupted download resumes where it stopped (when the
   remote file is unchanged). Stopping a transfer deletes its partial file.
@@ -70,6 +75,7 @@ one. If both fail, an error dialog explains why and the details are appended to
 - Browse remote directories, navigate into directories and to the parent, and filter remote entries.
 - Select several items in either pane with Ctrl/Command-click (toggle) and Shift-click (range), then upload or download them together; sort either pane by clicking the Name, Size, Modified or Type column header (folders stay first).
 - The local pane opens in the folder browsed last time the app ran.
+- Create folders in either pane with the *New folder* button next to Refresh, or by right-clicking an item or the empty space below the list.
 - The eye button on the toolbar shows or hides hidden items in both panes (dot files, and on Windows files marked hidden); hidden items are shown by default and the choice is remembered.
 - Tick *Recursive* next to a pane's filter box to search every folder below the current one for names containing the filter text. Results show their relative folder and can be transferred, dragged, renamed and deleted like any item; double-clicking a found folder opens it. Remote searches list folders through the rsftp-turbo helper when available, else SFTP. Symbolic links are not followed and at most 5000 results are listed.
 - Drag local files or folders onto the remote pane to upload them recursively; each discovered file appears as its own transfer row.
