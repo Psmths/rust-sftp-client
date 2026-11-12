@@ -29,7 +29,7 @@ run as artifacts (`rust-sftp-client-<version>-linux-x86_64.tar.gz` and `rust-sft
 and kept for 30 days. A build can also be started by hand from the Actions tab.
 
 When both builds succeed on a push to `main`, a GitHub Release is published automatically,
-tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.4.0-build.42`), with both binaries,
+tagged `v<Cargo.toml version>-build.<run number>` (e.g. `v0.4.1-build.42`), with both binaries,
 a `SHA256SUMS.txt` file and notes listing the changes since the previous release. Manual runs
 only build.
 
