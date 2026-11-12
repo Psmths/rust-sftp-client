@@ -1615,7 +1615,8 @@ impl SftpApp {
             Dialog::Rename => "Rename",
         };
         let size = match &dialog {
-            Dialog::Profiles => [660.0, 430.0],
+            // Fits the tallest form (password logon: eight rows) with 240 px fields.
+            Dialog::Profiles => [520.0, 310.0],
             Dialog::TrustHostKey => [470.0, 260.0],
             Dialog::ConfirmDelete => [440.0, 180.0],
             Dialog::Rename => [420.0, 180.0],
