@@ -15,9 +15,14 @@ use tokio::{
 };
 
 use crate::{
-    connection::{ConnectError, ConnectionProfile, NetworkSettings, SftpConnection},
+    conflict::ConflictAction,
+    connection::{
+        existing_local_targets, plan_upload, ConnectError, ConnectionProfile, NetworkSettings, SftpConnection, TargetFile,
+        TransferPlan,
+    },
     logging::{Category, LogEntry, Logger, SessionLog, Severity},
     search::{self, Search, SearchKey},
+    terminal::{Terminal, TerminalSettings},
     transfer::{CancelToken, DownloadProgress, DownloadResult, SegmentProgress, TransferSettings},
 };
 
@@ -209,6 +214,49 @@ impl Job {
     }
 }
 
+/// A transfer the user asked for, with what it would write and which of
+/// those files exist already (checked before it is queued).
+pub struct PreparedJob {
+    pub job: Job,
+    pub settings: TransferSettings,
+    /// `None` when listing failed; the transfer then runs and reports the error.
+    pub plan: Option<TransferPlan>,
+    /// For each file of `plan`: the file it would overwrite.
+    pub targets: Vec<Option<TargetFile>>,
+}
+
+impl PreparedJob {
+    pub fn download(&self) -> bool {
+        !matches!(self.job, Job::UploadPath { .. })
+    }
+
+    /// Files that exist already, as indices into the plan's files.
+    pub fn conflicts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.targets.iter().enumerate().filter(|(_, target)| target.is_some()).map(|(index, _)| index)
+    }
+}
+
+/// Transfers waiting for the user to decide about files that exist already.
+pub struct ConflictPrompt {
+    pub jobs: Vec<PreparedJob>,
+    /// The action selected in the dialog.
+    pub action: ConflictAction,
+    /// "Apply to all further conflicts in this session".
+    pub remember: bool,
+}
+
+impl ConflictPrompt {
+    /// Every existing file as (job index, file index).
+    pub fn conflicts(&self) -> Vec<(usize, usize)> {
+        self.jobs.iter().enumerate().flat_map(|(job, prepared)| prepared.conflicts().map(move |file| (job, file))).collect()
+    }
+
+    /// Files that do not exist yet.
+    pub fn new_files(&self) -> usize {
+        self.jobs.iter().map(|prepared| prepared.targets.iter().filter(|target| target.is_none()).count()).sum()
+    }
+}
+
 pub struct TransferItem {
     pub id: usize,
     pub operation_id: Option<usize>,
@@ -231,6 +279,11 @@ pub struct TransferItem {
     pub details: Option<String>,
     /// What to run again for "Retry".
     pub job: Option<Job>,
+    /// A folder transfer: its row sums up the rows of its files, which have
+    /// this row's id as `operation_id`.
+    pub folder: bool,
+    /// The folder's file rows are shown below it.
+    pub expanded: bool,
 }
 
 impl TransferItem {
@@ -253,7 +306,35 @@ impl TransferItem {
             protocol: None,
             details: None,
             job: None,
+            folder: false,
+            expanded: false,
         }
+    }
+
+    /// Updates the speed from the byte count at `now` (sampled at most every 250 ms).
+    fn sample_speed(&mut self, transferred: u64, now: Instant) {
+        if transferred < self.last_speed_sample_bytes {
+            // A segment retry rolled the counter back.
+            self.last_speed_sample_bytes = transferred;
+            self.last_speed_sample_at = Some(now);
+            self.speed_mib_s = 0.0;
+        } else if let Some(sampled_at) = self.last_speed_sample_at {
+            let elapsed = now.saturating_duration_since(sampled_at);
+            if elapsed >= Duration::from_millis(250) {
+                let delta = transferred - self.last_speed_sample_bytes;
+                self.speed_mib_s = delta as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+                self.last_speed_sample_bytes = transferred;
+                self.last_speed_sample_at = Some(now);
+            }
+        } else {
+            self.last_speed_sample_at = Some(now);
+            self.last_speed_sample_bytes = transferred;
+        }
+    }
+
+    /// State while data moves: "Downloading" or "Uploading".
+    fn active_state(&self) -> &'static str {
+        if self.download { "Downloading" } else { "Uploading" }
     }
 
     pub fn is_pending(&self) -> bool {
@@ -283,6 +364,7 @@ pub enum QueueTab {
     Failed,
     Log,
     Statistics,
+    Terminal,
 }
 
 /// Download and upload speed of a session at one moment, in MiB/s.
@@ -375,6 +457,8 @@ pub struct Session {
     next_transfer_id: usize,
     queue_tx: std_mpsc::Sender<QueueEvent>,
     queue_rx: std_mpsc::Receiver<QueueEvent>,
+    /// One permit per file being transferred: individual files and the files
+    /// of folder transfers share them.
     transfer_slots: Arc<Semaphore>,
     transfer_records: HashMap<usize, TransferRecord>,
     /// Job of each running operation, for the rows of its files.
@@ -383,17 +467,33 @@ pub struct Session {
     operations: HashMap<usize, CancelToken>,
     /// Operations the user stopped; their failure is shown as "Cancelled".
     cancelled_operations: HashSet<usize>,
+    /// Transfers asked for this frame, checked for existing files together.
+    incoming: Vec<(Job, TransferSettings)>,
+    /// The check for existing files in progress.
+    scan_rx: Option<std_mpsc::Receiver<Vec<PreparedJob>>>,
+    /// Files exist already: the app asks what to do.
+    pub conflict_prompt: Option<ConflictPrompt>,
+    /// Decision applied to all further conflicts in this session.
+    pub remembered_action: Option<ConflictAction>,
+    /// Rows of folder transfers: (operation id, relative path) -> row id.
+    folder_rows: HashMap<(usize, String), usize>,
+    /// Bytes (downloaded, uploaded) of rows removed with "Clear", so the
+    /// statistics keep counting them.
+    cleared_bytes: (u64, u64),
     /// Row selected in the transfer queue.
     pub selected_transfer: Option<usize>,
     /// One sample per second, oldest first, for the statistics graph.
     pub speed_history: VecDeque<SpeedSample>,
     pub connected_at: Option<Instant>,
+    /// Interactive shell of the "SSH Terminal" tab, opened when first shown.
+    pub terminal: Option<Terminal>,
 
     pub status: String,
 }
 
 impl Session {
-    pub fn new(id: u64, runtime: Handle, logger: Arc<Logger>, path: PathBuf, settings: &TransferSettings) -> Self {
+    /// `file_slots`: files transferred at the same time (see [`Session::set_concurrency`]).
+    pub fn new(id: u64, runtime: Handle, logger: Arc<Logger>, path: PathBuf, file_slots: usize) -> Self {
         let (queue_tx, queue_rx) = std_mpsc::channel();
         let mut session = Self {
             id,
@@ -433,14 +533,21 @@ impl Session {
             next_transfer_id: 1,
             queue_tx,
             queue_rx,
-            transfer_slots: Arc::new(Semaphore::new(settings.max_concurrent_transfers.max(1) as usize)),
+            transfer_slots: Arc::new(Semaphore::new(file_slots.max(1))),
             transfer_records: HashMap::new(),
             operation_jobs: HashMap::new(),
             operations: HashMap::new(),
             cancelled_operations: HashSet::new(),
+            incoming: Vec::new(),
+            scan_rx: None,
+            conflict_prompt: None,
+            remembered_action: None,
+            folder_rows: HashMap::new(),
+            cleared_bytes: (0, 0),
             selected_transfer: None,
             speed_history: VecDeque::new(),
             connected_at: None,
+            terminal: None,
             status: "Ready · No active SFTP session".into(),
         };
         session.refresh_local();
@@ -512,7 +619,7 @@ impl Session {
 
     /// Bytes moved so far in this session: (downloaded, uploaded).
     pub fn bytes_transferred(&self) -> (u64, u64) {
-        self.transfers.iter().fold((0, 0), |(down, up), item| {
+        self.transfers.iter().filter(|item| item.operation_id.is_none()).fold(self.cleared_bytes, |(down, up), item| {
             if item.download { (down + item.transferred, up) } else { (down, up + item.transferred) }
         })
     }
@@ -727,6 +834,22 @@ impl Session {
         self.log_event(Category::Connection, severity, "HOSTKEY", &format!("Host key {verdict} by user: {fingerprint}"));
     }
 
+    /// The shell of the "SSH Terminal" tab, opened on the current connection
+    /// with `rows` x `cols` characters if it has none yet. None while not connected.
+    pub fn terminal(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        settings: &TerminalSettings,
+        rows: u16,
+        cols: u16,
+    ) -> Option<&mut Terminal> {
+        let connection = self.connection.as_ref()?;
+        if !self.terminal.as_ref().is_some_and(|terminal| terminal.belongs_to(connection)) {
+            self.terminal = Some(Terminal::open(&self.runtime, connection, ctx.clone(), settings, rows, cols));
+        }
+        self.terminal.as_mut()
+    }
+
     /// Drops the connection and cancels this session's queued and running transfers.
     pub fn disconnect(&mut self) {
         let cancelled = self.transfers.iter().filter(|item| item.is_pending()).count();
@@ -740,6 +863,11 @@ impl Session {
         self.list_rx = None;
         self.home_fallback = false;
         self.connected_at = None;
+        self.terminal = None;
+        self.incoming.clear();
+        self.scan_rx = None;
+        self.conflict_prompt = None;
+        self.remembered_action = None;
         self.remote_entries.clear();
         self.remote_selected.clear();
         self.status = "Disconnected".into();
@@ -824,9 +952,22 @@ impl Session {
 
     // ----- transfers -----
 
-    pub fn set_concurrency(&mut self, limit: u32) {
+    /// Sets how many files are transferred at the same time.
+    pub fn set_concurrency(&mut self, limit: usize) {
         // Transfers already queued keep the old limit; new ones use the new one.
-        self.transfer_slots = Arc::new(Semaphore::new(limit.max(1) as usize));
+        self.transfer_slots = Arc::new(Semaphore::new(limit.max(1)));
+    }
+
+    /// The transfer row `id`. Rows are kept in id order (ids only grow and
+    /// rows are appended), so this is a binary search.
+    fn transfer_mut(&mut self, id: usize) -> Option<&mut TransferItem> {
+        let index = self.transfers.binary_search_by_key(&id, |item| item.id).ok()?;
+        Some(&mut self.transfers[index])
+    }
+
+    fn transfer(&self, id: usize) -> Option<&TransferItem> {
+        let index = self.transfers.binary_search_by_key(&id, |item| item.id).ok()?;
+        Some(&self.transfers[index])
     }
 
     fn next_id(&mut self) -> usize {
@@ -840,11 +981,14 @@ impl Session {
         self.transfer_records.insert(id, TransferRecord { direction, source, target, started: None });
     }
 
-    /// Runs `work` once a transfer slot is free, forwarding progress to the queue.
+    /// Runs `work`, forwarding progress to the queue. With `needs_slot` it
+    /// first waits for a free file slot; folder transfers take one per file
+    /// themselves.
     fn spawn_transfer<F>(
         &mut self,
         id: usize,
         state: &'static str,
+        needs_slot: bool,
         work: impl FnOnce(mpsc::UnboundedSender<DownloadProgress>, CancelToken) -> F + Send + 'static,
     )
     where
@@ -856,9 +1000,13 @@ impl Session {
         self.operations.insert(id, cancel.clone());
         self.runtime.spawn(async move {
             // A queued transfer can be stopped while it waits for a slot.
-            let permit = tokio::select! {
-                permit = slots.acquire_owned() => permit.map_err(|error| error.to_string()),
-                _ = cancel.cancelled() => Err("cancelled".to_owned()),
+            let permit = if needs_slot {
+                tokio::select! {
+                    permit = slots.acquire_owned() => permit.map(Some).map_err(|error| error.to_string()),
+                    _ = cancel.cancelled() => Err("cancelled".to_owned()),
+                }
+            } else {
+                Ok(None)
             };
             let _permit = match permit {
                 Ok(permit) => permit,
@@ -932,13 +1080,137 @@ impl Session {
         let count = files.len();
         for entry in files {
             let local = self.path.join(&entry.name);
-            self.start_job(Job::DownloadFile { remote: entry.path, local, size: entry.size }, settings);
+            self.request_job(Job::DownloadFile { remote: entry.path, local, size: entry.size }, settings);
         }
-        self.status = format!("Queued {count} download(s) to {}", self.path.display());
+        self.status = format!("Checking {count} download(s) to {} for existing files…", self.path.display());
+    }
+
+    /// Asks for `job`: the transfers asked for in one frame are checked for
+    /// files that exist already (see [`Session::poll_transfer_checks`]) and
+    /// then queued.
+    fn request_job(&mut self, job: Job, settings: TransferSettings) {
+        if !self.is_connected() {
+            self.status = "Connect to the server first".into();
+            return;
+        }
+        self.incoming.push((job, settings));
+    }
+
+    /// Starts checking the transfers asked for, and queues them (or asks the
+    /// user about existing files) once the check is done. Call every frame.
+    pub fn poll_transfer_checks(&mut self) {
+        if let Some(rx) = &self.scan_rx {
+            match rx.try_recv() {
+                Ok(jobs) => {
+                    self.scan_rx = None;
+                    let prompt = ConflictPrompt { jobs, action: ConflictAction::default(), remember: false };
+                    if prompt.conflicts().is_empty() {
+                        self.queue_prepared(prompt.jobs, ConflictAction::Ignore);
+                    } else if let Some(action) = self.remembered_action {
+                        self.queue_prepared(prompt.jobs, action);
+                    } else {
+                        let count = prompt.conflicts().len();
+                        self.status = format!("{count} file(s) exist already: choose what to do");
+                        self.conflict_prompt = Some(prompt);
+                    }
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {}
+                Err(std_mpsc::TryRecvError::Disconnected) => self.scan_rx = None,
+            }
+        }
+        // One batch at a time: the next waits until this one is decided.
+        if self.scan_rx.is_some() || self.conflict_prompt.is_some() || self.incoming.is_empty() {
+            return;
+        }
+        let Some(connection) = self.connection.clone() else {
+            self.incoming.clear();
+            return;
+        };
+        let batch = std::mem::take(&mut self.incoming);
+        let (tx, rx) = std_mpsc::channel();
+        self.scan_rx = Some(rx);
+        self.runtime.spawn(async move {
+            let mut prepared = Vec::with_capacity(batch.len());
+            for (job, settings) in batch {
+                let (plan, targets) = match &job {
+                    Job::DownloadFile { remote, local, .. } | Job::DownloadPath { remote, local, .. } => {
+                        match connection.plan_download(remote, local).await {
+                            Ok(plan) => {
+                                let checked = plan.clone();
+                                let targets = tokio::task::spawn_blocking(move || existing_local_targets(&checked)).await.unwrap_or_default();
+                                (Some(plan), targets)
+                            }
+                            Err(_) => (None, Vec::new()),
+                        }
+                    }
+                    Job::UploadPath { local, remote, .. } => match plan_upload(local, remote).await {
+                        Ok(plan) => {
+                            let targets = connection.existing_remote_targets(&plan).await;
+                            (Some(plan), targets)
+                        }
+                        Err(_) => (None, Vec::new()),
+                    },
+                };
+                prepared.push(PreparedJob { job, settings, plan, targets });
+            }
+            let _ = tx.send(prepared);
+        });
+    }
+
+    /// Queues the transfers of the conflict prompt with `action` for the
+    /// files that exist; `remember` applies it to later conflicts too.
+    pub fn resolve_conflicts(&mut self, action: ConflictAction, remember: bool) {
+        let Some(prompt) = self.conflict_prompt.take() else { return; };
+        if remember {
+            self.remembered_action = Some(action);
+        }
+        self.queue_prepared(prompt.jobs, action);
+    }
+
+    /// Drops the transfers of the conflict prompt.
+    pub fn cancel_conflicts(&mut self) {
+        if self.conflict_prompt.take().is_some() {
+            self.status = "Transfer cancelled".into();
+        }
+    }
+
+    /// Queues checked transfers, leaving out existing files that `action` keeps.
+    fn queue_prepared(&mut self, jobs: Vec<PreparedJob>, action: ConflictAction) {
+        let (mut queued, mut skipped) = (0, 0);
+        for prepared in jobs {
+            let PreparedJob { job, settings, plan, targets } = prepared;
+            let Some(mut plan) = plan else {
+                // Listing failed: the transfer reports why.
+                queued += usize::from(self.start_job_planned(job, settings, None));
+                continue;
+            };
+            let had_files = !plan.files.is_empty();
+            skipped += leave_out_kept_files(&mut plan, &targets, action);
+            // Everything exists and is kept: nothing to do.
+            if had_files && plan.files.is_empty() {
+                continue;
+            }
+            queued += usize::from(self.start_job_planned(job, settings, Some(plan)));
+        }
+        if skipped > 0 {
+            let message = format!("Skipped {skipped} existing file(s) ({})", action.label());
+            self.log_event(Category::Transfer, Severity::Info, "TRANSFER", &message);
+        }
+        self.status = match (queued, skipped) {
+            (0, 0) => "Nothing to transfer".into(),
+            (queued, 0) => format!("Queued {queued} transfer(s)"),
+            (queued, skipped) => format!("Queued {queued} transfer(s); skipped {skipped} existing file(s)"),
+        };
     }
 
     /// Queues `job` as a new transfer. `settings` only matter for downloads.
     fn start_job(&mut self, job: Job, settings: TransferSettings) -> bool {
+        self.start_job_planned(job, settings, None)
+    }
+
+    /// Queues `job`, transferring the files of `plan` (or, without one,
+    /// everything the job covers).
+    fn start_job_planned(&mut self, job: Job, settings: TransferSettings, plan: Option<TransferPlan>) -> bool {
         let Some(connection) = self.connection.clone() else {
             self.status = "Connect to the server first".into();
             return false;
@@ -949,27 +1221,33 @@ impl Session {
             Job::DownloadFile { remote, local, size } => {
                 self.transfers.push(TransferItem::queued(id, name_of(&remote), local.clone(), size, true));
                 self.record(id, "download", remote.clone(), local.display().to_string());
-                self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
+                self.spawn_transfer(id, "Downloading", true, move |progress, cancel| async move {
                     connection.download(&remote, &local, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
                 });
             }
-            Job::DownloadPath { remote, local, .. } => {
-                self.transfers.push(TransferItem::queued(id, name_of(&remote), local.clone(), 0, true));
+            Job::DownloadPath { remote, local, dir } => {
+                let mut item = TransferItem::queued(id, name_of(&remote), local.clone(), 0, true);
+                item.folder = dir;
+                self.transfers.push(item);
                 self.record(id, "download", remote.clone(), local.display().to_string());
-                self.spawn_transfer(id, "Downloading", move |progress, cancel| async move {
-                    connection.download_path(&remote, &local, settings, Some(progress), cancel).await.map_err(|e| e.to_string())
+                let slots = Arc::clone(&self.transfer_slots);
+                self.spawn_transfer(id, "Downloading", false, move |progress, cancel| async move {
+                    connection.download_path(&remote, &local, settings, slots, plan, Some(progress), cancel).await.map_err(|e| e.to_string())
                 });
             }
-            Job::UploadPath { local, remote, .. } => {
+            Job::UploadPath { local, remote, dir } => {
                 let total = fs::metadata(&local).map(|meta| if meta.is_file() { meta.len() } else { 0 }).unwrap_or(0);
-                self.transfers.push(TransferItem::queued(id, name_of(&local.to_string_lossy()), local.clone(), total, false));
+                let mut item = TransferItem::queued(id, name_of(&local.to_string_lossy()), local.clone(), total, false);
+                item.folder = dir;
+                self.transfers.push(item);
                 self.record(id, "upload", local.display().to_string(), remote.clone());
-                self.spawn_transfer(id, "Uploading", move |progress, cancel| async move {
-                    connection.upload_path(&local, &remote, Some(progress), cancel).await.map_err(|e| e.to_string())
+                let slots = Arc::clone(&self.transfer_slots);
+                self.spawn_transfer(id, "Uploading", false, move |progress, cancel| async move {
+                    connection.upload_path(&local, &remote, slots, plan, Some(progress), cancel).await.map_err(|e| e.to_string())
                 });
             }
         }
-        if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+        if let Some(item) = self.transfer_mut(id) {
             item.job = Some(job.clone());
         }
         self.operation_jobs.insert(id, job);
@@ -978,37 +1256,112 @@ impl Session {
 
     /// Whether the transfer row `id` can be retried.
     pub fn can_retry(&self, id: usize) -> bool {
-        self.is_connected() && self.transfers.iter().any(|item| item.id == id && item.is_failed() && item.job.is_some())
+        self.is_connected() && self.transfer(id).is_some_and(|item| item.is_failed() && item.job.is_some())
+    }
+
+    /// Failed or stopped file rows of the folder transfer `id` that can be retried.
+    fn failed_children(&self, id: usize) -> Vec<usize> {
+        self.transfers.iter()
+            .filter(|item| item.operation_id == Some(id) && item.is_failed() && item.job.is_some())
+            .map(|item| item.id)
+            .collect()
     }
 
     /// Runs a failed or stopped transfer row again as a new transfer; the
-    /// failed row is removed. A row of a folder transfer retries just its file.
-    pub fn retry(&mut self, id: usize, settings: TransferSettings) {
-        let Some((name, job)) = self.transfers.iter()
-            .find(|item| item.id == id && item.is_failed())
-            .and_then(|item| Some((item.name.clone(), item.job.clone()?)))
-        else {
-            return;
+    /// failed row is removed. A file row of a folder transfer retries just
+    /// its file; a folder row retries its failed files (or the whole folder
+    /// if it failed before listing any). Returns how many transfers were queued.
+    pub fn retry(&mut self, id: usize, settings: TransferSettings) -> usize {
+        let Some(item) = self.transfer(id).filter(|item| item.is_failed()) else { return 0; };
+        if item.folder {
+            let children = self.failed_children(id);
+            if !children.is_empty() {
+                let count = children.into_iter().map(|child| self.retry(child, settings)).sum();
+                self.status = format!("Retrying {count} file(s) of {}", self.transfer(id).map(|item| item.name.as_str()).unwrap_or("the folder"));
+                return count;
+            }
+        }
+        let Some((name, job, parent)) = self.transfer(id).and_then(|item| Some((item.name.clone(), item.job.clone()?, item.operation_id))) else {
+            return 0;
         };
-        if self.start_job(job, settings) {
-            self.status = format!("Retrying {name}");
-            self.transfers.retain(|item| item.id != id);
-            if self.selected_transfer == Some(id) {
-                self.selected_transfer = None;
+        if !self.start_job(job, settings) {
+            return 0;
+        }
+        self.status = format!("Retrying {name}");
+        self.remove_rows(&HashSet::from([id]));
+        if let Some(parent) = parent {
+            self.refresh_folder_after_retry(parent);
+        }
+        1
+    }
+
+    /// A folder row after one of its files was retried as its own transfer:
+    /// its totals drop that file, and with no failed file left it counts as
+    /// complete (or disappears when it has no files left).
+    fn refresh_folder_after_retry(&mut self, parent: usize) {
+        let (mut transferred, mut total, mut children, mut failed) = (0, 0, 0, 0);
+        for item in self.transfers.iter().filter(|item| item.operation_id == Some(parent)) {
+            transferred += item.transferred;
+            total += item.total;
+            children += 1;
+            failed += usize::from(item.is_failed());
+        }
+        if children == 0 {
+            self.remove_rows(&HashSet::from([parent]));
+            return;
+        }
+        if let Some(folder) = self.transfer_mut(parent) {
+            folder.transferred = transferred;
+            folder.total = total;
+            if failed == 0 {
+                folder.state = "Complete".into();
             }
         }
     }
 
-    /// Retries every failed or stopped row; returns how many were queued.
+    /// Retries every failed or stopped transfer; returns how many were queued.
     pub fn retry_all_failed(&mut self, settings: TransferSettings) -> usize {
-        let ids: Vec<usize> = self.transfers.iter().filter(|item| item.is_failed() && item.job.is_some()).map(|item| item.id).collect();
-        for &id in &ids {
-            self.retry(id, settings);
+        let ids: Vec<usize> = self.transfers.iter()
+            .filter(|item| item.operation_id.is_none() && item.is_failed() && item.job.is_some())
+            .map(|item| item.id)
+            .collect();
+        let count = ids.into_iter().map(|id| self.retry(id, settings)).sum();
+        if count > 0 {
+            self.status = format!("Retrying {count} transfer(s)");
         }
-        if !ids.is_empty() {
-            self.status = format!("Retrying {} transfer(s)", ids.len());
+        count
+    }
+
+    /// Removes the finished transfers listed in `tab` (Complete or Failed),
+    /// with the file rows of folder transfers. Returns how many were removed.
+    pub fn clear_tab(&mut self, tab: QueueTab) -> usize {
+        let cleared: HashSet<usize> = self.transfers.iter()
+            .filter(|item| item.operation_id.is_none() && item.tab() == tab && !item.is_pending() && !self.operations.contains_key(&item.id))
+            .map(|item| item.id)
+            .collect();
+        let (down, up) = self.transfers.iter()
+            .filter(|item| cleared.contains(&item.id))
+            .fold((0, 0), |(down, up), item| if item.download { (down + item.transferred, up) } else { (down, up + item.transferred) });
+        self.cleared_bytes.0 += down;
+        self.cleared_bytes.1 += up;
+        self.remove_rows(&cleared);
+        cleared.len()
+    }
+
+    /// Shows or hides the file rows of the folder transfer `id`.
+    pub fn toggle_expanded(&mut self, id: usize) {
+        if let Some(item) = self.transfer_mut(id).filter(|item| item.folder) {
+            item.expanded = !item.expanded;
         }
-        ids.len()
+    }
+
+    /// Removes the rows `ids` and the file rows of those that are folders.
+    fn remove_rows(&mut self, ids: &HashSet<usize>) {
+        self.transfers.retain(|item| !ids.contains(&item.id) && !item.operation_id.is_some_and(|operation| ids.contains(&operation)));
+        self.folder_rows.retain(|(operation, _), row| !ids.contains(operation) && !ids.contains(row));
+        if self.selected_transfer.is_some_and(|selected| self.transfer(selected).is_none()) {
+            self.selected_transfer = None;
+        }
     }
 
     /// Uploads a local file or folder (recursively) into the current remote folder.
@@ -1025,9 +1378,8 @@ impl Session {
         let dir = local_path.is_dir();
         let job = Job::UploadPath { local: local_path, remote: remote_destination.clone(), dir };
         // Upload jobs do not use transfer settings.
-        if self.start_job(job, TransferSettings::default()) {
-            self.status = format!("Queued recursive upload: {name} → {remote_destination}");
-        }
+        self.request_job(job, TransferSettings::default());
+        self.status = format!("Checking {name} → {remote_destination} for existing files…");
     }
 
     /// Downloads a remote file or folder (recursively) into the local folder.
@@ -1041,25 +1393,29 @@ impl Session {
             .find(|entry| entry.path == remote_path)
             .is_none_or(|entry| entry.dir);
         let job = Job::DownloadPath { remote: remote_path.clone(), local: destination.clone(), dir };
-        if self.start_job(job, settings) {
-            self.status = format!("Queued recursive download: {remote_path} → {}", destination.display());
-        }
+        self.request_job(job, settings);
+        self.status = format!("Checking {remote_path} → {} for existing files…", destination.display());
     }
 
     pub fn speed(&self, state: &str) -> f64 {
-        self.transfers.iter().filter(|item| item.state == state).map(|item| item.speed_mib_s).sum()
+        // Folder rows carry the speed of their files.
+        self.transfers.iter()
+            .filter(|item| item.operation_id.is_none() && item.state == state)
+            .map(|item| item.speed_mib_s)
+            .sum()
     }
 
     pub fn poll_queue(&mut self) {
         while let Ok(event) = self.queue_rx.try_recv() {
             match event {
                 QueueEvent::Started { id, state } => {
-                    if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+                    if let Some(item) = self.transfer_mut(id) {
                         let now = Instant::now();
                         item.started_at = Some(now);
                         item.last_speed_sample_at = Some(now);
                         item.last_speed_sample_bytes = 0;
                         item.speed_mib_s = 0.0;
+                        // Folder transfers start at once; a file waits for a slot.
                         item.state = state;
                     }
                     if let Some(record) = self.transfer_records.get_mut(&id) {
@@ -1075,48 +1431,31 @@ impl Session {
     }
 
     fn apply_progress(&mut self, id: usize, progress: DownloadProgress) {
-        let target_id = if let Some(relative) = progress.file_path.as_ref() {
-            if let Some(existing) = self.transfers.iter().find(|item| item.operation_id == Some(id) && item.name == *relative) {
-                existing.id
-            } else {
-                let parent = self.transfers.iter().find(|item| item.id == id);
-                let child_state = parent.map(|item| item.state.clone()).unwrap_or_else(|| "Downloading".into());
-                let download = parent.is_none_or(|item| item.download);
-                self.transfers.retain(|item| item.id != id);
-                let child_id = self.next_id();
-                let now = Instant::now();
-                let mut child = TransferItem::queued(child_id, relative.clone(), PathBuf::from(relative), progress.total_bytes, download);
-                child.operation_id = Some(id);
-                child.job = self.operation_jobs.get(&id).map(|job| job.child(relative));
-                child.started_at = Some(now);
-                child.last_speed_sample_at = Some(now);
-                child.state = child_state;
-                self.transfers.push(child);
-                child_id
-            }
-        } else {
-            id
+        let now = Instant::now();
+        let folder = self.transfer(id).is_some_and(|item| item.folder);
+        // Progress of a file in a folder transfer goes to that file's row,
+        // which is created on its first report.
+        let target_id = match progress.file_path.as_ref() {
+            Some(relative) if folder => match self.folder_rows.get(&(id, relative.clone())) {
+                Some(&row) => row,
+                None => {
+                    let download = self.transfer(id).is_none_or(|item| item.download);
+                    let child_id = self.next_id();
+                    let mut child = TransferItem::queued(child_id, relative.clone(), PathBuf::from(relative), 0, download);
+                    child.operation_id = Some(id);
+                    child.job = self.operation_jobs.get(&id).map(|job| job.child(relative));
+                    self.transfers.push(child);
+                    self.folder_rows.insert((id, relative.clone()), child_id);
+                    child_id
+                }
+            },
+            _ => id,
         };
         let mut completed_file = None;
-        if let Some(item) = self.transfers.iter_mut().find(|item| item.id == target_id) {
-            let now = Instant::now();
-            if progress.transferred_bytes < item.last_speed_sample_bytes {
-                // A segment retry rolled the aggregate counter back.
-                item.last_speed_sample_bytes = progress.transferred_bytes;
-                item.last_speed_sample_at = Some(now);
-                item.speed_mib_s = 0.0;
-            } else if let Some(sampled_at) = item.last_speed_sample_at {
-                let elapsed = now.saturating_duration_since(sampled_at);
-                if elapsed >= Duration::from_millis(250) {
-                    let delta = progress.transferred_bytes - item.last_speed_sample_bytes;
-                    item.speed_mib_s = delta as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
-                    item.last_speed_sample_bytes = progress.transferred_bytes;
-                    item.last_speed_sample_at = Some(now);
-                }
-            } else {
-                item.last_speed_sample_at = Some(now);
-                item.last_speed_sample_bytes = progress.transferred_bytes;
-            }
+        let mut change = None;
+        if let Some(item) = self.transfer_mut(target_id) {
+            let before = (item.transferred, item.total);
+            item.sample_speed(progress.transferred_bytes, now);
             item.transferred = progress.transferred_bytes;
             item.total = progress.total_bytes;
             // Initial "queued" updates carry no bytes and say nothing about the
@@ -1132,9 +1471,13 @@ impl Session {
             if progress.file_complete && item.state != "Complete" {
                 item.finished_at = Some(now);
                 item.state = "Complete".into();
+                item.speed_mib_s = 0.0;
                 if item.operation_id.is_some() {
                     completed_file = Some((item.name.clone(), item.total));
                 }
+            } else if moving && item.state == "Queued" {
+                item.started_at.get_or_insert(now);
+                item.state = item.active_state().into();
             }
             if let Some(segment) = progress.segment {
                 if let Some(existing) = item.segments.iter_mut().find(|s| s.index == segment.index) {
@@ -1144,8 +1487,21 @@ impl Session {
                     item.segments.sort_by_key(|s| s.index);
                 }
             }
-            if item.state != "Uploading" && item.state != "Complete" {
-                item.state = "Downloading".into();
+            change = Some((before, (item.transferred, item.total), item.protocol));
+        }
+        // The folder row adds up its files.
+        if let (true, Some(((old_done, old_total), (done, total), protocol))) = (target_id != id, change) {
+            if let Some(parent) = self.transfer_mut(id) {
+                let transferred = (parent.transferred + done).saturating_sub(old_done);
+                parent.total = (parent.total + total).saturating_sub(old_total);
+                parent.sample_speed(transferred, now);
+                parent.transferred = transferred;
+                parent.protocol = match (parent.protocol, protocol) {
+                    (current, None) => current,
+                    (None, new) => new,
+                    (Some(current), Some(new)) if current == new => Some(current),
+                    _ => Some("Mixed"),
+                };
             }
         }
         if let (Some((name, bytes)), Some(record)) = (completed_file, self.transfer_records.get(&id)) {
@@ -1158,7 +1514,8 @@ impl Session {
         let now = Instant::now();
         self.operations.remove(&id);
         let cancelled = self.cancelled_operations.remove(&id) && result.is_err();
-        let child_exists = self.transfers.iter().any(|item| item.operation_id == Some(id));
+        let child_exists = self.folder_rows.keys().any(|(operation, _)| *operation == id);
+        self.folder_rows.retain(|(operation, _), _| *operation != id);
         self.operation_jobs.remove(&id);
         if let Some(record) = self.transfer_records.remove(&id) {
             let elapsed = record.started.map(|start| now.saturating_duration_since(start)).unwrap_or_default();
@@ -1188,40 +1545,47 @@ impl Session {
                         if item.state != "Complete" {
                             item.finished_at = Some(now);
                             item.transferred = item.total;
+                            item.speed_mib_s = 0.0;
                             item.state = "Complete".into();
                         }
                     }
-                } else if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
+                }
+                if let Some(item) = self.transfer_mut(id) {
                     item.finished_at = Some(now);
-                    item.transferred = result.bytes;
-                    item.total = result.bytes;
+                    item.speed_mib_s = 0.0;
                     item.state = "Complete".into();
-                    item.protocol = Some(if result.accelerated { "UDP" } else { "SFTP" });
                     item.details = result.details.clone();
+                    if item.folder {
+                        item.transferred = item.total.max(result.bytes);
+                        item.total = item.transferred;
+                        item.protocol.get_or_insert(if result.accelerated { "UDP" } else { "SFTP" });
+                    } else {
+                        item.transferred = result.bytes;
+                        item.total = result.bytes;
+                        item.protocol = Some(if result.accelerated { "UDP" } else { "SFTP" });
+                    }
                 }
             }
             Err(error) => {
                 let state = if cancelled { "Cancelled".to_owned() } else { format!("Failed: {error}") };
-                let mut marked = false;
-                for item in self.transfers.iter_mut().filter(|item| item.operation_id == Some(id)) {
-                    if item.state != "Complete" {
-                        item.finished_at = Some(now);
-                        if !cancelled {
-                            for segment in &mut item.segments {
-                                if !segment.complete { segment.failed = true; }
+                if child_exists {
+                    for item in self.transfers.iter_mut().filter(|item| item.operation_id == Some(id)) {
+                        if item.state != "Complete" {
+                            item.finished_at = Some(now);
+                            if !cancelled {
+                                for segment in &mut item.segments {
+                                    if !segment.complete { segment.failed = true; }
+                                }
                             }
+                            item.speed_mib_s = 0.0;
+                            item.state = state.clone();
                         }
-                        item.speed_mib_s = 0.0;
-                        item.state = state.clone();
                     }
-                    marked = true;
                 }
-                if !marked {
-                    if let Some(item) = self.transfers.iter_mut().find(|item| item.id == id) {
-                        item.finished_at = Some(now);
-                        item.speed_mib_s = 0.0;
-                        item.state = state;
-                    }
+                if let Some(item) = self.transfer_mut(id) {
+                    item.finished_at = Some(now);
+                    item.speed_mib_s = 0.0;
+                    item.state = state;
                 }
                 if cancelled {
                     self.status = "Transfer stopped".into();
@@ -1249,6 +1613,19 @@ impl Session {
     }
 }
 
+
+/// Removes from `plan` the existing files (`targets`, by file index) that
+/// `action` keeps; returns how many were removed.
+fn leave_out_kept_files(plan: &mut TransferPlan, targets: &[Option<TargetFile>], action: ConflictAction) -> usize {
+    let before = plan.files.len();
+    let mut index = 0;
+    plan.files.retain(|file| {
+        let target = targets.get(index).copied().flatten();
+        index += 1;
+        target.is_none_or(|target| action.overwrites(file, &target))
+    });
+    before - plan.files.len()
+}
 
 /// Listing entries of the remote folder `path`, folders first.
 fn remote_entries(path: &str, listed: Vec<crate::connection::DirEntry>) -> Vec<RemoteEntry> {
@@ -1290,6 +1667,125 @@ pub(crate) fn needs_canonical_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session(runtime: &tokio::runtime::Runtime) -> Session {
+        let logger = Arc::new(Logger::new(crate::logging::LoggingSettings::default()));
+        Session::new(1, runtime.handle().clone(), logger, std::env::temp_dir(), 4)
+    }
+
+    /// Adds a running folder transfer row, as `start_job` does.
+    fn folder_transfer(session: &mut Session) -> usize {
+        let id = session.next_id();
+        let mut item = TransferItem::queued(id, "photos".into(), PathBuf::from("photos"), 0, true);
+        item.folder = true;
+        item.state = "Downloading".into();
+        item.job = Some(Job::DownloadPath { remote: "/photos".into(), local: PathBuf::from("photos"), dir: true });
+        session.operation_jobs.insert(id, item.job.clone().unwrap());
+        session.transfers.push(item);
+        id
+    }
+
+    fn file_progress(name: &str, done: u64, total: u64, complete: bool) -> DownloadProgress {
+        DownloadProgress {
+            total_bytes: total,
+            transferred_bytes: done,
+            completed_segments: 0,
+            total_segments: 0,
+            segment: None,
+            file_path: Some(name.into()),
+            file_complete: complete,
+            accelerated: false,
+        }
+    }
+
+    #[test]
+    fn folder_row_sums_up_its_files() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut session = test_session(&runtime);
+        let folder = folder_transfer(&mut session);
+        session.apply_progress(folder, file_progress("a.jpg", 0, 100, false));
+        session.apply_progress(folder, file_progress("b.jpg", 0, 50, false));
+        session.apply_progress(folder, file_progress("a.jpg", 40, 100, false));
+        session.apply_progress(folder, file_progress("b.jpg", 50, 50, true));
+
+        let parent = session.transfer(folder).unwrap();
+        assert_eq!((parent.transferred, parent.total), (90, 150));
+        assert_eq!(parent.state, "Downloading");
+        let files: Vec<&TransferItem> = session.transfers.iter().filter(|item| item.operation_id == Some(folder)).collect();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].state, "Downloading");
+        assert_eq!(files[1].state, "Complete");
+        // Only the folder row is listed (and counted) in the tab.
+        assert_eq!(session.transfers.iter().filter(|item| item.operation_id.is_none()).count(), 1);
+        assert_eq!(session.bytes_transferred(), (90, 0));
+
+        let result = DownloadResult { bytes: 150, segments: 0, segmented: false, accelerated: false, details: None };
+        session.finish_transfer(folder, Ok(result));
+        let parent = session.transfer(folder).unwrap();
+        assert_eq!((parent.transferred, parent.state.as_str()), (150, "Complete"));
+        assert!(session.transfers.iter().all(|item| item.state == "Complete"));
+
+        // Clearing removes the folder with its files but keeps the byte count.
+        assert_eq!(session.clear_tab(QueueTab::Complete), 1);
+        assert!(session.transfers.is_empty());
+        assert_eq!(session.bytes_transferred(), (150, 0));
+    }
+
+    #[test]
+    fn clearing_failed_keeps_completed() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut session = test_session(&runtime);
+        let done = folder_transfer(&mut session);
+        session.finish_transfer(done, Ok(DownloadResult { bytes: 0, segments: 0, segmented: false, accelerated: false, details: None }));
+        let failed = folder_transfer(&mut session);
+        session.apply_progress(failed, file_progress("c.jpg", 10, 20, false));
+        session.finish_transfer(failed, Err("connection lost".into()));
+        assert!(session.transfers.iter().filter(|item| item.operation_id == Some(failed)).all(TransferItem::is_failed));
+
+        assert_eq!(session.clear_tab(QueueTab::Failed), 1);
+        assert_eq!(session.transfers.len(), 1);
+        assert_eq!(session.transfers[0].id, done);
+    }
+
+    #[test]
+    fn retrying_the_last_failed_file_completes_the_folder() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut session = test_session(&runtime);
+        let folder = folder_transfer(&mut session);
+        session.apply_progress(folder, file_progress("a.jpg", 30, 30, true));
+        session.apply_progress(folder, file_progress("b.jpg", 5, 20, false));
+        session.finish_transfer(folder, Err("timeout".into()));
+        let failed_file = session.failed_children(folder);
+        assert_eq!(failed_file.len(), 1);
+
+        // Not connected: retry cannot start a transfer, so nothing changes.
+        assert_eq!(session.retry(folder, TransferSettings::default()), 0);
+        // What happens once the file's own transfer has been queued:
+        session.remove_rows(&HashSet::from([failed_file[0]]));
+        session.refresh_folder_after_retry(folder);
+        let parent = session.transfer(folder).unwrap();
+        assert_eq!((parent.transferred, parent.total, parent.state.as_str()), (30, 30, "Complete"));
+    }
+
+    #[test]
+    fn kept_files_are_left_out_of_the_plan() {
+        use crate::connection::PlannedFile;
+        let file = |name: &str, size: u64| PlannedFile { local: PathBuf::from(name), remote: format!("/{name}"), size, mtime: Some(100) };
+        let plan = TransferPlan { directories: Vec::new(), files: vec![file("new", 1), file("same", 5), file("bigger", 9)] };
+        let targets = [None, Some(TargetFile { size: 5, mtime: Some(100) }), Some(TargetFile { size: 5, mtime: Some(100) })];
+
+        let mut ignore = plan.clone();
+        assert_eq!(leave_out_kept_files(&mut ignore, &targets, ConflictAction::Ignore), 2);
+        assert_eq!(ignore.files.len(), 1);
+        assert_eq!(ignore.files[0].remote, "/new");
+
+        let mut by_size = plan.clone();
+        assert_eq!(leave_out_kept_files(&mut by_size, &targets, ConflictAction::OverwriteIfSizeDiffers), 1);
+        assert_eq!(by_size.files.iter().map(|file| file.remote.as_str()).collect::<Vec<_>>(), ["/new", "/bigger"]);
+
+        let mut all = plan.clone();
+        assert_eq!(leave_out_kept_files(&mut all, &targets, ConflictAction::Overwrite), 0);
+    }
 
     fn local(name: &str, dir: bool, size: u64, modified: &str) -> LocalEntry {
         LocalEntry { name: name.into(), path: PathBuf::from(name), dir, size, modified: modified.into(), hidden: false, folder: String::new() }

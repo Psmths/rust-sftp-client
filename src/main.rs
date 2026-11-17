@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod conflict;
 mod connection;
 mod credentials;
 mod logging;
@@ -11,6 +12,7 @@ mod places;
 mod search;
 mod session;
 mod settings;
+mod terminal;
 mod win32;
 
 use std::{

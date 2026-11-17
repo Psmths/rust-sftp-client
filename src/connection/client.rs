@@ -159,7 +159,6 @@ pub struct SftpConnection {
     /// Every SFTP channel (the primary first); transfers are spread over them.
     channels: Vec<Arc<SftpSession>>,
     next_channel: AtomicUsize,
-    network: NetworkSettings,
     turbo: Mutex<TurboInfo>,
     /// The ticket helper; `None` once it has exited or failed.
     tickets: tokio::sync::Mutex<Option<TicketStream>>,
@@ -317,7 +316,6 @@ impl SftpConnection {
             sftp,
             channels,
             next_channel: AtomicUsize::new(0),
-            network,
             turbo: Mutex::new(TurboInfo { state: turbo_state, last_fallback: None }),
             tickets: tokio::sync::Mutex::new(tickets),
             helper_listing: AtomicU8::new(helper_listing),
@@ -341,6 +339,23 @@ impl SftpConnection {
     /// Number of SFTP channels actually opened.
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Opens an interactive login shell on its own SSH channel, with a
+    /// pseudo-terminal of type `term` and `cols` x `rows` characters.
+    pub async fn open_shell(&self, term: &str, cols: u16, rows: u16) -> Result<russh::Channel<client::Msg>, String> {
+        let channel = self.ssh.channel_open_session().await.map_err(|error| {
+            format!("could not open an SSH channel ({error}); the server's session limit (MaxSessions) may be reached")
+        })?;
+        channel.request_pty(true, term, u32::from(cols), u32::from(rows), 0, 0, &[]).await
+            .map_err(|error| format!("pseudo-terminal request failed: {error}"))?;
+        channel.request_shell(true).await.map_err(|error| format!("shell request failed: {error}"))?;
+        Ok(channel)
+    }
+
+    /// Writes a line to the session's log.
+    pub fn log(&self, severity: crate::logging::Severity, msgid: &str, message: &str) {
+        (self.events)(severity, msgid, message);
     }
 
     pub async fn list_dir(&self, path: &str) -> Result<ReadDir, ConnectError> {
@@ -424,38 +439,23 @@ impl SftpConnection {
 
     /// Recursively upload a local file or directory to a remote destination.
     /// Directory structure is preserved and progress is reported separately for each file.
+    /// Each file waits for one of the session's `file_slots`.
     pub async fn upload_path(
         &self,
         local_path: &Path,
         remote_path: &str,
+        file_slots: Arc<Semaphore>,
+        plan: Option<TransferPlan>,
         progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
         cancel: CancelToken,
     ) -> Result<DownloadResult, crate::transfer::DownloadError> {
-        let mut directories: Vec<(PathBuf, String)> = Vec::new();
-        let mut files: Vec<(PathBuf, String, u64)> = Vec::new();
-        let mut stack = vec![(local_path.to_path_buf(), remote_path.to_owned())];
-        let mut total = 0_u64;
-
-        while let Some((path, remote)) = stack.pop() {
-            let meta = fs::metadata(&path).await
-                .map_err(crate::transfer::DownloadError::Io)?;
-            if meta.is_dir() {
-                directories.push((path.clone(), remote.clone()));
-                let mut entries = fs::read_dir(&path).await
-                    .map_err(crate::transfer::DownloadError::Io)?;
-                while let Some(entry) = entries.next_entry().await
-                    .map_err(crate::transfer::DownloadError::Io)? {
-                    let file_type = entry.file_type().await
-                        .map_err(crate::transfer::DownloadError::Io)?;
-                    if file_type.is_symlink() { continue; }
-                    let child_remote = format!("{}/{}", remote.trim_end_matches('/'), entry.file_name().to_string_lossy());
-                    stack.push((entry.path(), child_remote));
-                }
-            } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
-                files.push((path, remote, meta.len()));
-            }
-        }
+        let TransferPlan { mut directories, files } = match plan {
+            Some(plan) => plan,
+            None => plan_upload(local_path, remote_path).await?,
+        };
+        let files: Vec<(PathBuf, String, u64, Option<u64>)> =
+            files.into_iter().map(|file| (file.local, file.remote, file.size, file.mtime)).collect();
+        let total = files.iter().map(|(_, _, size, _)| size).sum::<u64>();
 
         // Parent directories must exist before their children are uploaded.
         directories.sort_by_key(|(path, _)| path.components().count());
@@ -468,7 +468,7 @@ impl SftpConnection {
         }
 
         if let Some(tx) = &progress {
-            for (local, _, file_size) in &files {
+            for (local, _, file_size, _) in &files {
                 let relative_path = local.strip_prefix(local_path).unwrap_or(local);
                 let relative = if relative_path.as_os_str().is_empty() {
                     local.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
@@ -483,9 +483,9 @@ impl SftpConnection {
             }
         }
         let transferred_total = Arc::new(AtomicU64::new(0));
-        let parallel = Arc::new(Semaphore::new(self.network.file_parallelism()));
+        let parallel = file_slots;
         let mut workers = JoinSet::new();
-        for (local, remote, file_size) in files {
+        for (local, remote, file_size, mtime) in files {
             let relative = relative_name(&local, local_path);
             let Some(sftp) = self.transfer_sessions().into_iter().next() else { break; };
             let parallel = Arc::clone(&parallel);
@@ -526,6 +526,13 @@ impl SftpConnection {
                     }
                 }
                 output.close().await.map_err(|e| DownloadError::Sftp(e.to_string()))?;
+                // Keep the modification time, so later transfers can compare it.
+                if let Some(mtime) = mtime.and_then(|mtime| u32::try_from(mtime).ok()) {
+                    let mut attributes = russh_sftp::protocol::FileAttributes::empty();
+                    attributes.atime = Some(mtime);
+                    attributes.mtime = Some(mtime);
+                    let _ = sftp.set_metadata(remote.clone(), attributes).await;
+                }
                 if let Some(tx) = &progress {
                     let _ = tx.send(DownloadProgress {
                         total_bytes: file_size, transferred_bytes: file_transferred,
@@ -562,39 +569,25 @@ impl SftpConnection {
 
     /// Recursively download a remote file or directory. Each file uses the
     /// existing segmented downloader; progress is reported separately for each file.
+    /// Each file waits for one of the session's `file_slots`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_path(
         self: Arc<Self>,
         remote_path: &str,
         destination: &Path,
         settings: TransferSettings,
+        file_slots: Arc<Semaphore>,
+        plan: Option<TransferPlan>,
         progress: Option<mpsc::UnboundedSender<DownloadProgress>>,
         cancel: CancelToken,
     ) -> Result<DownloadResult, crate::transfer::DownloadError> {
-        let root_meta = self.sftp.metadata(remote_path.to_owned()).await
-            .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
-        let mut directories: Vec<PathBuf> = Vec::new();
-        let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
-        let mut stack = vec![(remote_path.to_owned(), destination.to_path_buf(), root_meta)];
-        let mut total = 0_u64;
-
-        while let Some((remote, local, metadata)) = stack.pop() {
-            if metadata.is_dir() {
-                directories.push(local.clone());
-                let entries = self.sftp.read_dir(remote.clone()).await
-                    .map_err(|e| crate::transfer::DownloadError::Sftp(e.to_string()))?;
-                for entry in entries {
-                    let name = entry.file_name();
-                    if name == "." || name == ".." { continue; }
-                    let attrs = entry.metadata();
-                    let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
-                    stack.push((child_remote, local.join(&name), attrs));
-                }
-            } else {
-                let file_size = metadata.size.unwrap_or(0);
-                total = total.saturating_add(file_size);
-                files.push((remote, local, file_size));
-            }
-        }
+        let plan = match plan {
+            Some(plan) => plan,
+            None => self.plan_download(remote_path, destination).await?,
+        };
+        let directories: Vec<PathBuf> = plan.directories.into_iter().map(|(local, _)| local).collect();
+        let files: Vec<(String, PathBuf, u64)> = plan.files.into_iter().map(|file| (file.remote, file.local, file.size)).collect();
+        let total = files.iter().map(|(_, _, size)| size).sum::<u64>();
 
         for directory in directories {
             fs::create_dir_all(directory).await
@@ -620,7 +613,7 @@ impl SftpConnection {
                 });
             }
         }
-        let parallel = Arc::new(Semaphore::new(self.network.file_parallelism()));
+        let parallel = file_slots;
         let mut workers = JoinSet::new();
         for (remote, local, file_size) in files {
             let relative = relative_name(&local, destination);
@@ -714,6 +707,71 @@ impl SftpConnection {
             _ => Some(details.join("; ")),
         };
         Ok(DownloadResult { bytes: completed, segments: segment_count, segmented, accelerated, details })
+    }
+
+    /// Lists what downloading `remote_path` (a file or a folder, recursively)
+    /// to `destination` transfers.
+    pub async fn plan_download(&self, remote_path: &str, destination: &Path) -> Result<TransferPlan, DownloadError> {
+        let root_meta = self.sftp.metadata(remote_path.to_owned()).await
+            .map_err(|e| DownloadError::Sftp(e.to_string()))?;
+        let mut plan = TransferPlan::default();
+        let mut stack = vec![(remote_path.to_owned(), destination.to_path_buf(), root_meta)];
+        while let Some((remote, local, metadata)) = stack.pop() {
+            if metadata.is_dir() {
+                plan.directories.push((local.clone(), remote.clone()));
+                let entries = self.sftp.read_dir(remote.clone()).await
+                    .map_err(|e| DownloadError::Sftp(e.to_string()))?;
+                for entry in entries {
+                    let name = entry.file_name();
+                    if name == "." || name == ".." { continue; }
+                    let attrs = entry.metadata();
+                    let child_remote = format!("{}/{}", remote.trim_end_matches('/'), name);
+                    stack.push((child_remote, local.join(&name), attrs));
+                }
+            } else {
+                plan.files.push(PlannedFile {
+                    local,
+                    remote,
+                    size: metadata.size.unwrap_or(0),
+                    mtime: metadata.mtime.map(u64::from),
+                });
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Size and modification time of the remote files the upload `plan`
+    /// would write that exist already, by index into `plan.files`. Each
+    /// target folder is listed once.
+    pub async fn existing_remote_targets(&self, plan: &TransferPlan) -> Vec<Option<TargetFile>> {
+        let mut folders: std::collections::HashMap<String, std::collections::HashMap<String, TargetFile>> =
+            std::collections::HashMap::new();
+        let mut found = Vec::with_capacity(plan.files.len());
+        for file in &plan.files {
+            let (folder, name) = match file.remote.rsplit_once('/') {
+                Some(("", name)) => ("/".to_owned(), name.to_owned()),
+                Some((folder, name)) => (folder.to_owned(), name.to_owned()),
+                None => (".".to_owned(), file.remote.clone()),
+            };
+            if !folders.contains_key(&folder) {
+                // A folder that does not exist yet holds nothing to overwrite.
+                let mut listing = std::collections::HashMap::new();
+                if let Ok(entries) = self.sftp.read_dir(folder.clone()).await {
+                    for entry in entries {
+                        let attrs = entry.metadata();
+                        if !attrs.is_dir() {
+                            listing.insert(
+                                entry.file_name(),
+                                TargetFile { size: attrs.size.unwrap_or(0), mtime: attrs.mtime.map(u64::from) },
+                            );
+                        }
+                    }
+                }
+                folders.insert(folder.clone(), listing);
+            }
+            found.push(folders.get(&folder).and_then(|listing| listing.get(&name)).copied());
+        }
+        found
     }
 
     pub async fn create_dir(&self, path: &str) -> Result<(), ConnectError> {
@@ -824,6 +882,10 @@ impl SftpConnection {
             }
         }
         partial.finish(destination).await?;
+        // Keep the modification time, so later transfers can compare it.
+        if let Some(mtime) = mtime {
+            set_local_mtime(destination, mtime);
+        }
         let pieces = partial.pieces_used();
         Ok(DownloadResult { bytes: size, segments: pieces, segmented: pieces > 1, accelerated, details })
     }
@@ -1180,6 +1242,80 @@ async fn open_sftp_channel(
         .map_err(|e| ConnectError::Ssh(e.to_string()))?;
     SftpSession::new_with_config(channel.into_stream(), network.sftp_config()).await
         .map_err(|e| ConnectError::Sftp(e.to_string()))
+}
+
+/// One file of a transfer, with its source's size and modification time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedFile {
+    pub local: PathBuf,
+    pub remote: String,
+    pub size: u64,
+    /// Unix seconds.
+    pub mtime: Option<u64>,
+}
+
+/// Everything a file or folder transfer creates: its folders as (local,
+/// remote) paths and its files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferPlan {
+    pub directories: Vec<(PathBuf, String)>,
+    pub files: Vec<PlannedFile>,
+}
+
+/// A file that exists already where a transfer would write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetFile {
+    pub size: u64,
+    /// Unix seconds.
+    pub mtime: Option<u64>,
+}
+
+/// Lists what uploading `local_path` (a file or a folder, recursively) to
+/// `remote_path` transfers. Symbolic links are skipped.
+pub async fn plan_upload(local_path: &Path, remote_path: &str) -> Result<TransferPlan, DownloadError> {
+    let mut plan = TransferPlan::default();
+    let mut stack = vec![(local_path.to_path_buf(), remote_path.to_owned())];
+    while let Some((path, remote)) = stack.pop() {
+        let meta = fs::metadata(&path).await.map_err(DownloadError::Io)?;
+        if meta.is_dir() {
+            plan.directories.push((path.clone(), remote.clone()));
+            let mut entries = fs::read_dir(&path).await.map_err(DownloadError::Io)?;
+            while let Some(entry) = entries.next_entry().await.map_err(DownloadError::Io)? {
+                let file_type = entry.file_type().await.map_err(DownloadError::Io)?;
+                if file_type.is_symlink() { continue; }
+                let child_remote = format!("{}/{}", remote.trim_end_matches('/'), entry.file_name().to_string_lossy());
+                stack.push((entry.path(), child_remote));
+            }
+        } else if meta.is_file() {
+            plan.files.push(PlannedFile { local: path, remote, size: meta.len(), mtime: unix_mtime(&meta) });
+        }
+    }
+    Ok(plan)
+}
+
+/// Size and modification time of the local files the download `plan`
+/// would write that exist already, by index into `plan.files`.
+pub fn existing_local_targets(plan: &TransferPlan) -> Vec<Option<TargetFile>> {
+    plan.files.iter()
+        .map(|file| {
+            std::fs::metadata(&file.local).ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|meta| TargetFile { size: meta.len(), mtime: unix_mtime(&meta) })
+        })
+        .collect()
+}
+
+/// Modification time in Unix seconds.
+pub fn unix_mtime(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_secs())
+}
+
+/// Sets a local file's modification time (best effort).
+fn set_local_mtime(path: &Path, mtime: u64) {
+    let time = std::time::UNIX_EPOCH + Duration::from_secs(mtime);
+    if let Ok(file) = std::fs::File::options().write(true).open(path) {
+        let _ = file.set_modified(time);
+    }
 }
 
 /// Path of `path` relative to the transfer root, or its file name when the

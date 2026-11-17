@@ -443,6 +443,32 @@ pub fn scroll<R>(
     .inner
 }
 
+/// [`scroll`] for a list of `count` rows of equal height: only the rows in
+/// view are laid out, so long lists stay fast. `add_rows` gets the range of
+/// row indices to draw.
+pub fn scroll_rows<R>(
+    ui: &mut Ui,
+    area: egui::ScrollArea,
+    row_height: f32,
+    count: usize,
+    add_rows: impl FnOnce(&mut Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let normal = ui.visuals().clone();
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        let colors = palette();
+        visuals.extreme_bg_color = colors.scroll_track;
+        visuals.widgets.inactive.bg_fill = colors.scroll_thumb;
+        visuals.widgets.hovered.bg_fill = colors.scroll_thumb_hovered;
+        visuals.widgets.active.bg_fill = colors.scroll_thumb_dragged;
+        area.show_rows(ui, row_height, count, |ui, rows| {
+            *ui.visuals_mut() = normal;
+            add_rows(ui, rows)
+        })
+    })
+    .inner
+}
+
 /// White, sunken "client edge" area — the frame around list views.
 /// `height` is the total outer height, including the 2 px edge.
 pub fn list_view<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
@@ -518,6 +544,20 @@ pub fn status_pane(ui: &mut Ui, width: f32, text: impl Into<WidgetText>) -> Resp
         let text: WidgetText = text.into();
         let galley = text.into_galley(ui, Some(TextWrapMode::Truncate), width - 8.0, TextStyle::Body);
         painter.galley(Pos2::new(rect.left() + 4.0, rect.center().y - galley.size().y / 2.0).round(), galley, text_color());
+    }
+    response
+}
+
+/// Status-bar pane filled with `fill`, holding centred white text.
+pub fn status_badge(ui: &mut Ui, width: f32, text: &str, fill: Color32) -> Response {
+    let height = ui.available_height().max(18.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, fill);
+        thin_sunken(painter, rect);
+        let galley = WidgetText::from(text).into_galley(ui, Some(TextWrapMode::Truncate), width - 8.0, TextStyle::Body);
+        painter.galley((rect.center() - galley.size() / 2.0).round(), galley, Color32::WHITE);
     }
     response
 }

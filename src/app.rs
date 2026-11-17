@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::Read as _,
     path::PathBuf,
@@ -11,14 +12,16 @@ use std::{
 
 use eframe::egui;
 
+use crate::conflict::ConflictAction;
 use crate::connection::{
-    load_trusted_fingerprint, trust_host_key, AuthMethod, CipherPreference, ConnectionProfile, NetworkSettings, TurboState,
+    load_trusted_fingerprint, trust_host_key, AlgorithmKind, AuthMethod, ConnectionProfile, NetworkSettings, SshAlgorithms, TurboState,
 };
 use crate::logging::{default_log_dir, Logger};
 use crate::session::{select_click, sort_rows, ConnectOutcome, LocalEntry, QueueTab, RemoteEntry, Session, SortColumn, SortOrder, SpeedSample};
 use crate::settings::AppSettings;
 use crate::transfer::TransferSettings;
 use crate::places::{self, Drive};
+use crate::terminal::{Terminal, TerminalColors, TerminalSettings, TERMINAL_TYPES};
 use crate::win32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,15 +139,19 @@ enum SettingsPage {
     Transfers,
     Segmentation,
     Network,
+    Algorithms,
+    Terminal,
     Logging,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 5] = [
+    const ALL: [SettingsPage; 7] = [
         SettingsPage::Appearance,
         SettingsPage::Transfers,
         SettingsPage::Segmentation,
         SettingsPage::Network,
+        SettingsPage::Algorithms,
+        SettingsPage::Terminal,
         SettingsPage::Logging,
     ];
 
@@ -154,6 +161,8 @@ impl SettingsPage {
             SettingsPage::Transfers => "Transfers",
             SettingsPage::Segmentation => "Segmented downloads",
             SettingsPage::Network => "Network Settings",
+            SettingsPage::Algorithms => "SSH Algorithms",
+            SettingsPage::Terminal => "SSH Terminal",
             SettingsPage::Logging => "Logging",
         }
     }
@@ -162,7 +171,6 @@ impl SettingsPage {
 /// Contents of the settings window, validated on OK/Apply.
 #[derive(Default)]
 struct SettingsDraft {
-    concurrent: String,
     threshold_mib: String,
     segment_mib: String,
     workers: String,
@@ -170,7 +178,10 @@ struct SettingsDraft {
     pipelined_requests: String,
     sftp_packet_kib: String,
     ssh_window_mib: String,
-    cipher: Option<CipherPreference>,
+    algorithms: SshAlgorithms,
+    /// List shown on the SSH Algorithms page and its selected row.
+    algorithm_kind: AlgorithmKind,
+    algorithm_row: Option<usize>,
     compression: bool,
     keepalive_secs: String,
     request_timeout_secs: String,
@@ -183,6 +194,13 @@ struct SettingsDraft {
     split_sessions: bool,
     theme: win32::Theme,
     units: crate::units::SizeUnits,
+    terminal_font_size: String,
+    terminal_colors: TerminalColors,
+    terminal_type: String,
+    terminal_scrollback: String,
+    terminal_wheel_lines: String,
+    terminal_copy_on_select: bool,
+    terminal_ctrl_c_copies: bool,
 }
 
 impl SettingsDraft {
@@ -191,7 +209,6 @@ impl SettingsDraft {
         let network = &settings.network;
         let logging = &settings.logging;
         Self {
-            concurrent: transfer.max_concurrent_transfers.to_string(),
             threshold_mib: (transfer.segmentation_threshold_bytes / MIB).to_string(),
             segment_mib: (transfer.target_segment_size_bytes / MIB).to_string(),
             workers: transfer.max_segments_per_file.to_string(),
@@ -199,7 +216,9 @@ impl SettingsDraft {
             pipelined_requests: network.pipelined_requests.to_string(),
             sftp_packet_kib: network.sftp_packet_kib.to_string(),
             ssh_window_mib: network.ssh_window_mib.to_string(),
-            cipher: Some(network.cipher),
+            algorithms: network.algorithms(),
+            algorithm_kind: AlgorithmKind::default(),
+            algorithm_row: None,
             compression: network.compression,
             keepalive_secs: network.keepalive_secs.to_string(),
             request_timeout_secs: network.request_timeout_secs.to_string(),
@@ -212,12 +231,18 @@ impl SettingsDraft {
             split_sessions: logging.split_sessions,
             theme: settings.theme,
             units: settings.units,
+            terminal_font_size: format!("{}", settings.terminal.font_size),
+            terminal_colors: settings.terminal.colors,
+            terminal_type: settings.terminal.terminal_type.clone(),
+            terminal_scrollback: settings.terminal.scrollback_lines.to_string(),
+            terminal_wheel_lines: settings.terminal.wheel_lines.to_string(),
+            terminal_copy_on_select: settings.terminal.copy_on_select,
+            terminal_ctrl_c_copies: settings.terminal.ctrl_c_copies,
         }
     }
 
     fn parse(&self) -> Result<AppSettings, String> {
         let transfer = TransferSettings {
-            max_concurrent_transfers: parse_setting(&self.concurrent, "Concurrent transfers", 1, 16)? as u32,
             segmentation_threshold_bytes: parse_setting(&self.threshold_mib, "Segmentation threshold", 1, 1024 * 1024)? * MIB,
             target_segment_size_bytes: parse_setting(&self.segment_mib, "Segment size", 1, 4096)? * MIB,
             max_segments_per_file: parse_setting(&self.workers, "Workers per file", 1, 32)? as u32,
@@ -227,13 +252,18 @@ impl SettingsDraft {
             pipelined_requests: parse_setting(&self.pipelined_requests, "Requests in flight", 1, 256)? as u32,
             sftp_packet_kib: parse_setting(&self.sftp_packet_kib, "SFTP packet size", 32, 256)? as u32,
             ssh_window_mib: parse_setting(&self.ssh_window_mib, "SSH window size", 1, 1024)? as u32,
-            cipher: self.cipher.unwrap_or(CipherPreference::AesGcm),
+            algorithms: Some(self.algorithms.clone()),
             compression: self.compression,
             keepalive_secs: parse_setting(&self.keepalive_secs, "Keepalive interval", 0, 3600)? as u32,
             request_timeout_secs: parse_setting(&self.request_timeout_secs, "Request timeout", 5, 3600)? as u32,
-            parallel_files: parse_setting(&self.parallel_files, "Parallel files", 1, 32)? as u32,
+            parallel_files: parse_setting(&self.parallel_files, "Files transferred at once", 1, 32)? as u32,
             turbo: self.turbo,
+            // The legacy cipher choice is superseded by `algorithms`.
+            ..NetworkSettings::default()
         };
+        if let Some(kind) = self.algorithms.empty_kind() {
+            return Err(format!("Turn on at least one algorithm under SSH Algorithms → {}.", kind.label()));
+        }
         let directory = self.log_directory.trim();
         if self.logging_enabled && directory.is_empty() {
             return Err("Choose a log directory.".into());
@@ -245,8 +275,33 @@ impl SettingsDraft {
             directory: if directory.is_empty() { default_log_dir() } else { PathBuf::from(directory) },
             split_sessions: self.split_sessions,
         };
+        let font_size = self.terminal_font_size.trim().parse::<f32>().ok()
+            .filter(|size| (6.0..=32.0).contains(size))
+            .ok_or_else(|| "Terminal font size must be a number from 6 to 32.".to_owned())?;
+        let terminal_type = self.terminal_type.trim();
+        if terminal_type.is_empty() || !terminal_type.chars().all(|c| c.is_ascii_graphic()) {
+            return Err("Terminal type must be a name such as xterm-256color.".into());
+        }
+        let terminal = TerminalSettings {
+            font_size,
+            colors: self.terminal_colors,
+            terminal_type: terminal_type.to_owned(),
+            scrollback_lines: parse_setting(&self.terminal_scrollback, "Scrollback", 0, 100_000)? as u32,
+            wheel_lines: parse_setting(&self.terminal_wheel_lines, "Mouse wheel lines", 1, 20)? as u32,
+            copy_on_select: self.terminal_copy_on_select,
+            ctrl_c_copies: self.terminal_ctrl_c_copies,
+        };
         // Settings not edited in this window are carried over when applying.
-        Ok(AppSettings { transfer, network, logging, theme: self.theme, units: self.units, hide_hidden_items: false, last_local_dir: None })
+        Ok(AppSettings {
+            transfer,
+            network,
+            logging,
+            terminal,
+            theme: self.theme,
+            units: self.units,
+            hide_hidden_items: false,
+            last_local_dir: None,
+        })
     }
 }
 
@@ -263,10 +318,11 @@ segments and the files of folder transfers are spread across them, and every cha
 window, so more channels keep more data moving at once.\n\nServers limit how many channels a connection may open \
 (OpenSSH: MaxSessions, 10 by default); channels beyond the limit are skipped without an error.\n\nDefault: 4.";
 
-const NETWORK_TIP_PARALLEL_FILES: &str = "How many files of one folder upload or download are transferred at \
-the same time.\n\nRaising this speeds up folders with many small files, where opening and closing each file \
-(several network round trips) costs more than moving the data. Large single files are not affected; they are \
-sped up by segmented downloads instead.\n\nDefault: 4.";
+const TRANSFER_TIP_PARALLEL_FILES: &str = "How many files are transferred at the same time on one \
+connection: the files of folder uploads and downloads and individually queued files share this limit. \
+Further files wait in the queue.\n\nRaising this speeds up many small files, where opening and closing \
+each file (several network round trips) costs more than moving the data. Large single files are not \
+affected; they are sped up by segmented downloads instead.\n\nDefault: 4.";
 
 const NETWORK_TIP_PIPELINE: &str = "Number of SFTP read or write requests sent ahead for each open file \
 without waiting for the server's replies.\n\nEvery request waits a full network round trip, so on high-latency \
@@ -288,10 +344,18 @@ const NETWORK_TIP_TIMEOUT: &str = "How long to wait for the server to answer a s
 treating it as failed. A failed download segment is retried; other operations report an error.\n\nRaise this \
 for slow or heavily loaded servers. Default: 30 s.";
 
-const NETWORK_TIP_CIPHER: &str = "The encryption algorithm offered to the server first; the other one is still \
-offered as a fallback. Both are secure.\n\nAES-GCM is fastest on processors with AES instructions (practically \
-all modern x86-64 and ARM CPUs). ChaCha20-Poly1305 is faster on older or low-power processors without \
-them.\n\nDefault: AES-GCM.";
+const ALGORITHMS_HELP_KEX: &str = "How the client and server agree on session keys. mlkem768x25519 adds \
+post-quantum protection; curve25519 is the common choice. SHA-1 methods are only for very old servers.";
+
+const ALGORITHMS_HELP_CIPHERS: &str = "Encrypts the connection. AES-GCM is fastest on CPUs with AES \
+instructions (practically all x86-64 and ARM CPUs); ChaCha20-Poly1305 on CPUs without them. CBC modes are \
+only for very old servers.";
+
+const ALGORITHMS_HELP_MACS: &str = "Protects the data against tampering when a CTR or CBC cipher is used. \
+AES-GCM and ChaCha20-Poly1305 have this built in and ignore this list.";
+
+const ALGORITHMS_HELP_HOST_KEYS: &str = "Key types accepted to identify the server. If a change makes the \
+server show a different key than the one you trusted, connecting reports a changed host key.";
 
 const NETWORK_TIP_TURBO: &str = "Downloads files over rsftp-turbo, a UDP transfer protocol, when the server \
 has its helper installed (rsftp-turbo service on UDP port 6767). Browsing, uploads and logins keep using \
@@ -400,7 +464,7 @@ impl SftpApp {
             .enable_all()
             .build()
             .expect("Tokio runtime initialization failed");
-        let first_session = Session::new(1, runtime.handle().clone(), logger.clone(), path, &settings.transfer);
+        let first_session = Session::new(1, runtime.handle().clone(), logger.clone(), path, settings.network.file_parallelism());
         let (op_tx, op_rx) = std_mpsc::channel();
         let (credential_tx, credential_rx) = std_mpsc::channel();
         Self {
@@ -466,7 +530,7 @@ impl SftpApp {
             self.runtime.handle().clone(),
             self.logger.clone(),
             path,
-            &self.settings.transfer,
+            self.settings.network.file_parallelism(),
         );
         self.sessions.push(session);
         self.sessions.len() - 1
@@ -967,6 +1031,147 @@ impl SftpApp {
         }
     }
 
+    /// "Target files already exist" dialog for the first session that has
+    /// transfers waiting for that decision: a side-by-side listing of the
+    /// files, coloured by what the selected action does with each.
+    fn conflict_window(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.sessions.iter().position(|session| session.conflict_prompt.is_some()) else { return; };
+        let title = self.sessions[index].title();
+        let other_session = index != self.active;
+        let id = egui::ViewportId::from_hash_of("rust-sftp-client-conflicts");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Target files already exist")
+            .with_inner_size([860.0, 540.0])
+            .with_min_inner_size([620.0, 380.0]);
+        let mut decision: Option<bool> = None;
+        let Some(prompt) = self.sessions[index].conflict_prompt.as_mut() else { return; };
+        let conflicts = prompt.conflicts();
+        ctx.show_viewport_immediate(id, builder, |window_ctx, _| {
+            egui::CentralPanel::default().show(window_ctx, |ui| {
+                let total: usize = prompt.jobs.iter().map(|job| job.targets.len()).sum();
+                let heading = format!("{} of {total} file(s) already exist at the destination.", conflicts.len());
+                ui.strong(heading);
+                if other_session {
+                    ui.weak(format!("Session: {title}"));
+                }
+                ui.add_space(4.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("What should happen to them?");
+                        for action in ConflictAction::ALL {
+                            ui.radio_value(&mut prompt.action, action, action.label());
+                        }
+                    });
+                });
+                let action = prompt.action;
+                let overwritten = conflicts.iter()
+                    .filter(|&&(job, file)| {
+                        let prepared = &prompt.jobs[job];
+                        let plan = prepared.plan.as_ref().expect("conflicts come from a plan");
+                        prepared.targets[file].is_some_and(|target| action.overwrites(&plan.files[file], &target))
+                    })
+                    .count();
+                let colors = ConflictColors::new(ui.visuals().dark_mode);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.colored_label(colors.replaced_text, format!("■ {overwritten} overwritten"));
+                    ui.label("·");
+                    ui.colored_label(win32::gray_text(), format!("■ {} kept", conflicts.len() - overwritten));
+                    ui.label("·");
+                    ui.colored_label(colors.new_text, format!("■ {} new file(s) transferred", prompt.new_files()));
+                    ui.label("·");
+                    ui.colored_label(win32::warn_amber(), "values that differ");
+                });
+                ui.add_space(4.0);
+
+                let footer = 64.0;
+                let list_height = (ui.available_height() - footer).max(120.0);
+                win32::list_view(ui, list_height, |ui| {
+                    let header_height = 19.0;
+                    let row_height = 18.0;
+                    let direction_width = 22.0;
+                    let size_width = 90.0;
+                    let time_width = 140.0;
+                    let result_width = 100.0;
+                    let fixed = direction_width + 2.0 * (size_width + time_width) + result_width;
+                    let name_width = (ui.available_width() - fixed - ui.spacing().scroll.bar_width).max(160.0);
+                    ui.horizontal(|ui| {
+                        win32::header_cell(ui, direction_width, header_height, "");
+                        win32::header_cell(ui, name_width, header_height, "Name");
+                        win32::header_cell(ui, size_width, header_height, "Local size");
+                        win32::header_cell(ui, time_width, header_height, "Local modified");
+                        win32::header_cell(ui, size_width, header_height, "Remote size");
+                        win32::header_cell(ui, time_width, header_height, "Remote modified");
+                        win32::header_cell(ui, result_width, header_height, "Result");
+                        let rest = ui.available_width();
+                        if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
+                    });
+                    let area = egui::ScrollArea::vertical().id_salt("conflict_list").auto_shrink([false, false]);
+                    win32::scroll_rows(ui, area, row_height, conflicts.len(), |ui, range| {
+                        for &(job, file) in &conflicts[range] {
+                            let prepared = &prompt.jobs[job];
+                            let plan = prepared.plan.as_ref().expect("conflicts come from a plan");
+                            let source = &plan.files[file];
+                            let Some(target) = prepared.targets[file] else { continue; };
+                            let overwrite = action.overwrites(source, &target);
+                            let download = prepared.download();
+                            // Local and remote side: (size, mtime) of each.
+                            let source_side = (source.size, source.mtime);
+                            let target_side = (target.size, target.mtime);
+                            let (local, remote) = if download { (target_side, source_side) } else { (source_side, target_side) };
+                            let size_differs = crate::conflict::sizes_differ(source, &target);
+                            let time_differs = crate::conflict::times_differ(source.mtime, target.mtime);
+                            let (row_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), egui::Sense::hover());
+                            let row = egui::UiBuilder::new().max_rect(row_rect).layout(egui::Layout::left_to_right(egui::Align::Center));
+                            ui.scope_builder(row, |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                // Like a diff: the side being replaced in red, the side replacing it in green.
+                                let (local_fill, remote_fill) = match (overwrite, download) {
+                                    (false, _) => (None, None),
+                                    (true, true) => (Some(colors.replaced), Some(colors.new)),
+                                    (true, false) => (Some(colors.new), Some(colors.replaced)),
+                                };
+                                let text = if overwrite { win32::text_color() } else { win32::gray_text() };
+                                let differs = |differ: bool| if differ { win32::warn_amber() } else { text };
+                                conflict_cell(ui, direction_width, row_height, if download { "↓" } else { "↑" }, None, text, false);
+                                conflict_cell(ui, name_width, row_height, &conflict_name(prepared, &source.local), None, text, false);
+                                let sides = [(local, local_fill), (remote, remote_fill)];
+                                for ((size, mtime), fill) in sides {
+                                    conflict_cell(ui, size_width, row_height, &size_text(size), fill, differs(size_differs), true);
+                                    conflict_cell(ui, time_width, row_height, &mtime_text(mtime), fill, differs(time_differs), false);
+                                }
+                                let (result, color) = if overwrite {
+                                    (if download { "Overwrite local" } else { "Overwrite remote" }, colors.replaced_text)
+                                } else {
+                                    ("Keep", win32::gray_text())
+                                };
+                                conflict_cell(ui, result_width, row_height, result, None, color, false);
+                            });
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.checkbox(&mut prompt.remember, "Apply this decision to all further conflicts in this session");
+                dialog_buttons(ui, |ui| {
+                    if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { decision = Some(false); }
+                    if win32::button_sized(ui, true, "OK", 75.0).clicked() { decision = Some(true); }
+                });
+            });
+            if window_ctx.input(|input| input.viewport().close_requested()) {
+                decision = Some(false);
+            }
+        });
+        let session = &mut self.sessions[index];
+        match decision {
+            Some(true) => {
+                let (action, remember) = session.conflict_prompt.as_ref().map(|prompt| (prompt.action, prompt.remember)).unwrap_or_default();
+                session.resolve_conflicts(action, remember);
+            }
+            Some(false) => session.cancel_conflicts(),
+            None => {}
+        }
+    }
+
     fn hash_windows(&mut self, ctx: &egui::Context) {
         let mut closed = Vec::new();
         for job in &mut self.hash_jobs {
@@ -1114,7 +1319,7 @@ impl SftpApp {
         };
         self.active = index;
         let trusted = load_trusted_fingerprint(&profile.host, profile.port);
-        let network = self.settings.network;
+        let network = self.settings.network.clone();
         self.sessions[index].start_connect(profile, password, trusted, network);
     }
 
@@ -1132,7 +1337,7 @@ impl SftpApp {
         }
         session.log_host_key_decision(&fingerprint, true);
         let password = session.pending_password.clone();
-        session.start_connect(profile, password, Some(fingerprint), self.settings.network);
+        session.start_connect(profile, password, Some(fingerprint), self.settings.network.clone());
     }
 
     fn reject_host_key(&mut self) {
@@ -1514,8 +1719,53 @@ impl SftpApp {
                 let rest = ui.available_width();
                 if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
             });
-            win32::scroll(ui, egui::ScrollArea::vertical().id_salt(("queue_list", self.sessions[a].id)).auto_shrink([false, false]), |ui| {
-                if !self.sessions[a].transfers.iter().any(|item| item.tab() == tab) {
+            // Rows of this tab in display order, with their depth: transfers,
+            // each expanded folder followed by its files. Only the rows in
+            // view are drawn.
+            let visible = queue_rows(&self.sessions[a].transfers, tab);
+            let area = egui::ScrollArea::vertical().id_salt(("queue_list", self.sessions[a].id)).auto_shrink([false, false]);
+            let mut toggle = None;
+            let mut clear = false;
+            let mut select = None;
+            let mut stop = None;
+            // Some(Some(id)): retry that row; Some(None): retry every failed row.
+            let mut retry = None;
+            win32::scroll_rows(ui, area, row_height, visible.len().max(1), |ui, range| {
+                let session = &self.sessions[a];
+                let any_active = session.has_active_operations();
+                let failed_count = session.transfers.iter()
+                    .filter(|item| item.operation_id.is_none() && item.is_failed() && item.job.is_some())
+                    .count();
+                let tab_count = session.transfers.iter()
+                    .filter(|item| item.operation_id.is_none() && item.tab() == tab)
+                    .count();
+                // Menu items for the whole tab (also on the empty space below
+                // the rows). Returns the chosen one.
+                let tab_menu = |ui: &mut egui::Ui| -> Option<TabAction> {
+                    let mut chosen = None;
+                    if tab == QueueTab::Pending {
+                        if ui.add_enabled(any_active, egui::Button::new("Stop all transfers")).clicked() {
+                            chosen = Some(TabAction::StopAll);
+                        }
+                    } else {
+                        if tab == QueueTab::Failed {
+                            let label = format!("Retry all failed ({failed_count})");
+                            if ui.add_enabled(session.is_connected() && failed_count > 0, egui::Button::new(label)).clicked() {
+                                chosen = Some(TabAction::RetryAll);
+                            }
+                        }
+                        let label = if tab == QueueTab::Failed { "Clear failed" } else { "Clear completed" };
+                        if ui.add_enabled(tab_count > 0, egui::Button::new(format!("{label} ({tab_count})"))).clicked() {
+                            chosen = Some(TabAction::Clear);
+                        }
+                    }
+                    if chosen.is_some() {
+                        ui.close();
+                    }
+                    chosen
+                };
+                let mut tab_action = None;
+                if visible.is_empty() {
                     let empty = match tab {
                         QueueTab::Pending => "There are no pending transfers.",
                         QueueTab::Failed => "No transfers have failed or been stopped.",
@@ -1523,16 +1773,9 @@ impl SftpApp {
                     };
                     ui.add_space(6.0);
                     ui.horizontal(|ui| { ui.add_space(6.0); ui.weak(empty); });
-                    return;
                 }
-                let session = &self.sessions[a];
-                let any_active = session.has_active_operations();
-                let mut select = None;
-                let mut stop = None;
-                // Some(Some(id)): retry that row; Some(None): retry every failed row.
-                let mut retry = None;
-                let failed_count = session.transfers.iter().filter(|item| item.is_failed() && item.job.is_some()).count();
-                for item in session.transfers.iter().filter(|item| item.tab() == tab) {
+                for &(index, depth) in &visible[range.start.min(visible.len())..range.end.min(visible.len())] {
+                    let item = &session.transfers[index];
                     // The whole row is one click target; the cells are drawn on top of it.
                     let (row_rect, row_response) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), row_height), egui::Sense::click()
@@ -1543,30 +1786,35 @@ impl SftpApp {
                     if row_response.clicked() || row_response.secondary_clicked() {
                         select = Some(item.id);
                     }
+                    if item.folder && row_response.double_clicked() {
+                        toggle = Some(item.id);
+                    }
                     // Rows of a folder transfer stop the whole folder transfer.
                     let operation = item.operation_id.unwrap_or(item.id);
                     row_response.context_menu(|ui| {
                         win32::menu_item_style(ui.style_mut());
+                        if item.folder {
+                            if ui.button(if item.expanded { "Collapse" } else { "Expand" }).clicked() {
+                                toggle = Some(item.id);
+                                ui.close();
+                            }
+                            ui.separator();
+                        }
                         if item.is_failed() {
-                            if ui.add_enabled(session.can_retry(item.id), egui::Button::new("Retry")).clicked() {
+                            let label = if item.folder { "Retry failed files" } else { "Retry" };
+                            if ui.add_enabled(session.can_retry(item.id), egui::Button::new(label)).clicked() {
                                 retry = Some(Some(item.id));
                                 ui.close();
                             }
-                            let label = format!("Retry all failed ({failed_count})");
-                            if ui.add_enabled(session.is_connected() && failed_count > 0, egui::Button::new(label)).clicked() {
-                                retry = Some(None);
+                        } else if tab == QueueTab::Pending {
+                            let label = if item.operation_id.is_some() || item.folder { "Stop folder transfer" } else { "Stop transfer" };
+                            if ui.add_enabled(session.is_operation_active(operation), egui::Button::new(label)).clicked() {
+                                stop = Some(Some(operation));
                                 ui.close();
                             }
-                            return;
                         }
-                        let label = if item.operation_id.is_some() { "Stop folder transfer" } else { "Stop transfer" };
-                        if ui.add_enabled(session.is_operation_active(operation), egui::Button::new(label)).clicked() {
-                            stop = Some(Some(operation));
-                            ui.close();
-                        }
-                        if ui.add_enabled(any_active, egui::Button::new("Stop all transfers")).clicked() {
-                            stop = Some(None);
-                            ui.close();
+                        if let Some(action) = tab_menu(ui) {
+                            tab_action = Some(action);
                         }
                     });
                     let row_layout = egui::UiBuilder::new()
@@ -1574,7 +1822,18 @@ impl SftpApp {
                         .layout(egui::Layout::left_to_right(egui::Align::Center));
                     ui.scope_builder(row_layout, |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
-                        file_text_cell(ui, file_width, row_height, &item.name, false);
+                        // Expander column; the files of a folder are indented below it.
+                        let indent = EXPANDER_WIDTH * f32::from(depth);
+                        ui.add_space(indent);
+                        let (expander, expander_response) =
+                            ui.allocate_exact_size(egui::vec2(EXPANDER_WIDTH, row_height), egui::Sense::click());
+                        if item.folder {
+                            paint_expander(ui.painter(), expander, item.expanded);
+                            if expander_response.clicked() {
+                                toggle = Some(item.id);
+                            }
+                        }
+                        file_text_cell(ui, (file_width - EXPANDER_WIDTH - indent).max(40.0), row_height, &item.name, false);
                         file_text_cell(ui, protocol_width, row_height, item.protocol.unwrap_or("—"), false);
                         let (cell_rect, response) = ui.allocate_exact_size(
                             egui::vec2(progress_width, row_height), egui::Sense::hover()
@@ -1644,21 +1903,47 @@ impl SftpApp {
                         file_text_cell(ui, remaining_width, row_height, &remaining, false);
                     });
                 }
-                if let Some(id) = select {
-                    self.sessions[a].selected_transfer = Some(id);
+                // Right-click on the empty space below the rows.
+                let clip = ui.clip_rect();
+                let top = ui.cursor().min.y;
+                if top < clip.bottom() - 1.0 {
+                    let filler = egui::Rect::from_min_max(egui::pos2(clip.left(), top), egui::pos2(clip.right(), clip.bottom() - 1.0));
+                    ui.allocate_rect(filler, egui::Sense::click()).context_menu(|ui| {
+                        win32::menu_item_style(ui.style_mut());
+                        if let Some(action) = tab_menu(ui) {
+                            tab_action = Some(action);
+                        }
+                    });
                 }
-                match stop {
-                    Some(Some(operation)) => self.sessions[a].cancel_operation(operation),
-                    Some(None) => self.sessions[a].cancel_all(),
-                    None => {}
-                }
-                let settings = self.settings.transfer;
-                match retry {
-                    Some(Some(id)) => self.sessions[a].retry(id, settings),
-                    Some(None) => { self.sessions[a].retry_all_failed(settings); }
+                match tab_action {
+                    Some(TabAction::StopAll) => stop = Some(None),
+                    Some(TabAction::RetryAll) => retry = Some(None),
+                    Some(TabAction::Clear) => clear = true,
                     None => {}
                 }
             });
+            let session = &mut self.sessions[a];
+            if let Some(id) = toggle {
+                session.toggle_expanded(id);
+            }
+            if let Some(id) = select {
+                session.selected_transfer = Some(id);
+            }
+            match stop {
+                Some(Some(operation)) => session.cancel_operation(operation),
+                Some(None) => session.cancel_all(),
+                None => {}
+            }
+            let settings = self.settings.transfer;
+            match retry {
+                Some(Some(id)) => { session.retry(id, settings); }
+                Some(None) => { session.retry_all_failed(settings); }
+                None => {}
+            }
+            if clear {
+                let count = session.clear_tab(tab);
+                session.status = format!("Cleared {count} transfer(s) from the queue");
+            }
         });
     }
 
@@ -1736,7 +2021,7 @@ impl SftpApp {
         let average_down = average(|sample| sample.downloading.then_some(sample.down));
         let average_up = average(|sample| sample.uploading.then_some(sample.up));
         let (bytes_down, bytes_up) = session.bytes_transferred();
-        let count = |tab: QueueTab| session.transfers.iter().filter(|item| item.tab() == tab).count();
+        let count = |tab: QueueTab| session.transfers.iter().filter(|item| item.operation_id.is_none() && item.tab() == tab).count();
         let connected_for = session.connected_at.map(|since| duration_text(now.saturating_duration_since(since)));
         let rows: Vec<(&str, String)> = vec![
             ("Downloading now:", speed_text(session.speed("Downloading"))),
@@ -1750,6 +2035,7 @@ impl SftpApp {
             ("Transfers:", format!("{} active, {} complete, {} failed", count(QueueTab::Pending), count(QueueTab::Complete), count(QueueTab::Failed))),
             ("Connected for:", connected_for.unwrap_or_else(|| "—".into())),
         ];
+        debug_assert_eq!(rows.len(), STATS_ROWS);
         let height = ui.available_height().max(60.0);
         ui.horizontal_top(|ui| {
             let stats_width = 300.0;
@@ -1759,15 +2045,39 @@ impl SftpApp {
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.set_width(stats_width);
-                egui::Grid::new("stats_grid").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
-                    for (label, value) in &rows {
-                        ui.label(*label);
-                        ui.label(value);
-                        ui.end_row();
-                    }
+                // Scrolls when the panel is made smaller than the table,
+                // instead of forcing the panel taller.
+                egui::ScrollArea::vertical().id_salt("stats_scroll").max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+                    egui::Grid::new("stats_grid").num_columns(2).spacing([12.0, STATS_ROW_GAP]).show(ui, |ui| {
+                        for (label, value) in &rows {
+                            ui.label(*label);
+                            ui.label(value);
+                            ui.end_row();
+                        }
+                    });
                 });
             });
         });
+    }
+
+    /// Interactive shell on the selected session's SSH connection.
+    fn terminal_tab(&mut self, ui: &mut egui::Ui) {
+        let session = &mut self.sessions[self.active];
+        if !session.is_connected() {
+            session.terminal = None;
+            ui.add_space(4.0);
+            ui.weak("Connect to a server to open an SSH terminal.");
+            return;
+        }
+        let settings = &self.settings.terminal;
+        let (rows, cols) = Terminal::grid_size(ui, settings, ui.available_size());
+        let ctx = ui.ctx().clone();
+        let restart = session.terminal(&ctx, settings, rows, cols).is_some_and(|terminal| terminal.show(ui, settings));
+        if restart {
+            // Opened again on the next frame.
+            session.terminal = None;
+            ctx.request_repaint();
+        }
     }
 
     fn dialog_window(&mut self, ctx: &egui::Context) {
@@ -2083,11 +2393,15 @@ impl SftpApp {
                         };
                         match self.settings_page {
                             SettingsPage::Transfers => {
-                                egui::Grid::new("settings_transfers").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
-                                    row(ui, "Concurrent transfers:", &mut draft.concurrent, "1–16");
+                                egui::Grid::new("settings_transfers").num_columns(4).spacing([8.0, 8.0]).show(ui, |ui| {
+                                    ui.label("Files transferred at once:");
+                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut draft.parallel_files).desired_width(70.0));
+                                    ui.weak("per connection (1–32)");
+                                    win32::info_tip(ui, TRANSFER_TIP_PARALLEL_FILES);
+                                    ui.end_row();
                                 });
                                 ui.add_space(6.0);
-                                ui.weak("Maximum number of files transferred at the same time, per session.");
+                                ui.weak("Applies to single files and to the files of folder transfers alike; the rest wait in the queue.");
                             }
                             SettingsPage::Segmentation => {
                                 egui::Grid::new("settings_segmentation").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
@@ -2108,28 +2422,11 @@ impl SftpApp {
                                 };
                                 egui::Grid::new("settings_network").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
                                     info_row(ui, "SFTP channels per connection:", &mut draft.sftp_channels, "1–16", NETWORK_TIP_CHANNELS);
-                                    info_row(ui, "Parallel files per folder transfer:", &mut draft.parallel_files, "1–32", NETWORK_TIP_PARALLEL_FILES);
                                     info_row(ui, "Requests in flight per file:", &mut draft.pipelined_requests, "1–256", NETWORK_TIP_PIPELINE);
                                     info_row(ui, "SFTP packet size:", &mut draft.sftp_packet_kib, "KiB (32–256)", NETWORK_TIP_PACKET);
                                     info_row(ui, "SSH window size:", &mut draft.ssh_window_mib, "MiB (1–1024)", NETWORK_TIP_WINDOW);
                                     info_row(ui, "Keepalive interval:", &mut draft.keepalive_secs, "s (0 = off)", NETWORK_TIP_KEEPALIVE);
                                     info_row(ui, "Request timeout:", &mut draft.request_timeout_secs, "s (5–3600)", NETWORK_TIP_TIMEOUT);
-
-                                    ui.label("Preferred cipher:");
-                                    let selected = match draft.cipher {
-                                        Some(CipherPreference::ChaCha20) => "ChaCha20-Poly1305",
-                                        _ => "AES-GCM",
-                                    };
-                                    egui::ComboBox::from_id_salt("network_cipher")
-                                        .width(150.0)
-                                        .selected_text(selected)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut draft.cipher, Some(CipherPreference::AesGcm), "AES-GCM");
-                                            ui.selectable_value(&mut draft.cipher, Some(CipherPreference::ChaCha20), "ChaCha20-Poly1305");
-                                        });
-                                    ui.label("");
-                                    win32::info_tip(ui, NETWORK_TIP_CIPHER);
-                                    ui.end_row();
 
                                     ui.label("SSH compression:");
                                     ui.checkbox(&mut draft.compression, "Enable (zlib)");
@@ -2174,6 +2471,123 @@ impl SftpApp {
                                 ui.add_space(6.0);
                                 ui.weak("Units apply to file sizes, transfer speeds, the transfer queue and the statistics.");
                                 ui.weak("Both apply to every window as soon as you click OK or Apply.");
+                            }
+                            SettingsPage::Algorithms => {
+                                let tabs = AlgorithmKind::ALL.map(|kind| (kind, kind.label().to_owned()));
+                                if win32::tab_strip(ui, &mut draft.algorithm_kind, &tabs) {
+                                    draft.algorithm_row = None;
+                                }
+                                ui.add_space(6.0);
+                                let kind = draft.algorithm_kind;
+                                let list_height = (body_height - 170.0).max(110.0);
+                                let mut clicked = None;
+                                let mut action = None;
+                                ui.horizontal_top(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width((ui.available_width() - 96.0).max(220.0));
+                                        win32::list_view(ui, list_height, |ui| {
+                                            let area = egui::ScrollArea::vertical().id_salt(("algorithms", kind.label())).auto_shrink([false, false]);
+                                            win32::scroll(ui, area, |ui| {
+                                                for (index, choice) in draft.algorithms.list_mut(kind).iter_mut().enumerate() {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_space(3.0);
+                                                        ui.checkbox(&mut choice.enabled, "");
+                                                        let label = if kind.is_weak(&choice.name) {
+                                                            format!("{}  (weak)", choice.name)
+                                                        } else {
+                                                            choice.name.clone()
+                                                        };
+                                                        if win32::list_item(ui, &label, draft.algorithm_row == Some(index)).clicked() {
+                                                            clicked = Some(index);
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        });
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 6.0;
+                                        let count = draft.algorithms.list(kind).len();
+                                        let row = draft.algorithm_row;
+                                        if win32::button_sized(ui, row.is_some_and(|row| row > 0), "Move Up", 86.0).clicked() {
+                                            action = Some(-1);
+                                        }
+                                        if win32::button_sized(ui, row.is_some_and(|row| row + 1 < count), "Move Down", 86.0).clicked() {
+                                            action = Some(1);
+                                        }
+                                        if win32::button_sized(ui, true, "Defaults", 86.0).clicked() {
+                                            action = Some(0);
+                                        }
+                                    });
+                                });
+                                if clicked.is_some() {
+                                    draft.algorithm_row = clicked;
+                                }
+                                match (action, draft.algorithm_row) {
+                                    (Some(0), _) => {
+                                        *draft.algorithms.list_mut(kind) = kind.defaults();
+                                        draft.algorithm_row = None;
+                                    }
+                                    (Some(step), Some(row)) => {
+                                        let target = row as isize + step;
+                                        let list = draft.algorithms.list_mut(kind);
+                                        if target >= 0 && (target as usize) < list.len() {
+                                            list.swap(row, target as usize);
+                                            draft.algorithm_row = Some(target as usize);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                ui.add_space(6.0);
+                                ui.weak(match kind {
+                                    AlgorithmKind::KeyExchange => ALGORITHMS_HELP_KEX,
+                                    AlgorithmKind::Cipher => ALGORITHMS_HELP_CIPHERS,
+                                    AlgorithmKind::Mac => ALGORITHMS_HELP_MACS,
+                                    AlgorithmKind::HostKey => ALGORITHMS_HELP_HOST_KEYS,
+                                });
+                                ui.add_space(4.0);
+                                ui.colored_label(win32::warn_amber(), "The server uses the first ticked algorithm it supports. Applies to new connections.");
+                            }
+                            SettingsPage::Terminal => {
+                                egui::Grid::new("settings_terminal").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
+                                    row(ui, "Font size:", &mut draft.terminal_font_size, "pt (6–32)");
+
+                                    ui.label("Colours:");
+                                    egui::ComboBox::from_id_salt("terminal_colors")
+                                        .width(150.0)
+                                        .selected_text(draft.terminal_colors.label())
+                                        .show_ui(ui, |ui| {
+                                            for colors in TerminalColors::ALL {
+                                                ui.selectable_value(&mut draft.terminal_colors, colors, colors.label());
+                                            }
+                                        });
+                                    ui.label("");
+                                    ui.end_row();
+
+                                    ui.label("Terminal type:");
+                                    egui::ComboBox::from_id_salt("terminal_type")
+                                        .width(150.0)
+                                        .selected_text(draft.terminal_type.as_str())
+                                        .show_ui(ui, |ui| {
+                                            for term in TERMINAL_TYPES {
+                                                ui.selectable_value(&mut draft.terminal_type, term.to_owned(), term);
+                                            }
+                                        });
+                                    ui.weak("TERM");
+                                    ui.end_row();
+
+                                    row(ui, "Scrollback:", &mut draft.terminal_scrollback, "lines (0–100000)");
+                                    row(ui, "Mouse wheel scrolls:", &mut draft.terminal_wheel_lines, "lines per notch (1–20)");
+                                });
+                                ui.add_space(6.0);
+                                ui.checkbox(&mut draft.terminal_copy_on_select, "Copy text to the clipboard when it is selected");
+                                ui.checkbox(&mut draft.terminal_ctrl_c_copies, "Ctrl+C copies the selection (and interrupts without one)");
+                                ui.indent("terminal_ctrl_c_help", |ui| {
+                                    ui.weak("When off, Ctrl+C always interrupts. Ctrl+Shift+C copies in either case.");
+                                });
+                                ui.add_space(6.0);
+                                ui.colored_label(win32::warn_amber(), "Terminal type and scrollback apply to new shells.");
                             }
                             SettingsPage::Logging => {
                                 ui.checkbox(&mut draft.logging_enabled, "Enable logging");
@@ -2232,9 +2646,9 @@ impl SftpApp {
                         win32::apply(ctx, settings.theme);
                     }
                     crate::units::set(settings.units);
-                    if settings.transfer.max_concurrent_transfers != self.settings.transfer.max_concurrent_transfers {
+                    if settings.network.parallel_files != self.settings.network.parallel_files {
                         for session in &mut self.sessions {
-                            session.set_concurrency(settings.transfer.max_concurrent_transfers);
+                            session.set_concurrency(settings.network.file_parallelism());
                         }
                     }
                     self.logger.set_settings(settings.logging.clone());
@@ -2262,6 +2676,7 @@ impl eframe::App for SftpApp {
         for session in &mut self.sessions {
             session.show_hidden = show_hidden;
             session.sample_speeds();
+            session.poll_transfer_checks();
             session.update_searches();
         }
         // Remember the folder being browsed, so the next run opens there.
@@ -2346,7 +2761,7 @@ impl eframe::App for SftpApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let active = self.sessions.iter()
-                    .map(|session| session.transfers.iter().filter(|item| item.is_pending()).count())
+                    .map(|session| session.transfers.iter().filter(|item| item.is_pending() && !item.folder).count())
                     .sum::<usize>();
                 let connection = match &self.session().connection {
                     Some(connection) => format!("Connected to {}:{}", connection.host, connection.port),
@@ -2355,12 +2770,23 @@ impl eframe::App for SftpApp {
                 // Totals over every session, not just the visible one.
                 let speed = |state: &str| -> f64 { self.sessions.iter().map(|session| session.speed(state)).sum() };
                 let speeds = format!("↓ {}   ↑ {}", speed_text(speed("Downloading")), speed_text(speed("Uploading")));
-                let (turbo_text, turbo_details) = turbo_status_text(self.session());
-                let fixed = 200.0 + 220.0 + 180.0 + 130.0 + VERSION_PANE_WIDTH + 5.0 * ui.spacing().item_spacing.x;
+                let turbo = turbo_badge(self.session());
+                let turbo_width = if turbo.is_some() { TURBO_PANE_WIDTH + ui.spacing().item_spacing.x } else { 0.0 };
+                let fixed = 200.0 + turbo_width + 180.0 + 130.0 + VERSION_PANE_WIDTH + 4.0 * ui.spacing().item_spacing.x;
                 let message_width = (ui.available_width() - fixed).max(120.0);
                 win32::status_pane(ui, message_width, self.session().status.as_str());
                 win32::status_pane(ui, 200.0, connection);
-                win32::status_pane(ui, 220.0, turbo_text).on_hover_text(turbo_details);
+                match turbo {
+                    Some(true) => {
+                        win32::status_badge(ui, TURBO_PANE_WIDTH, "Turbo Active", TURBO_ACTIVE)
+                            .on_hover_text("Downloads from this server use rsftp-turbo over UDP.");
+                    }
+                    Some(false) => {
+                        win32::status_badge(ui, TURBO_PANE_WIDTH, "Turbo Unavailable", TURBO_UNAVAILABLE)
+                            .on_hover_text("Downloads from this server use SFTP. The Log tab says why rsftp-turbo is unavailable.");
+                    }
+                    None => {}
+                }
                 win32::status_pane(ui, 180.0, speeds);
                 win32::status_pane(ui, 130.0, format!("{active} active transfer{}", if active == 1 { "" } else { "s" }))
                     .on_hover_text("Across all sessions");
@@ -2370,26 +2796,35 @@ impl eframe::App for SftpApp {
         });
         egui::TopBottomPanel::bottom("queue")
             .resizable(true)
-            .default_height(200.0)
+            .default_height(queue_panel_height(&ctx.style()))
             .min_height(100.0)
             .max_height(600.0)
-            .frame(win32::panel_frame(6))
+            .frame(win32::panel_frame(QUEUE_PANEL_MARGIN))
             .show(ctx, |ui| {
             let a = self.active;
-            let count = |tab: QueueTab| self.sessions[a].transfers.iter().filter(|item| item.tab() == tab).count();
+            let count = |tab: QueueTab| self.sessions[a].transfers.iter().filter(|item| item.operation_id.is_none() && item.tab() == tab).count();
             let tabs = [
                 (QueueTab::Pending, format!("Pending ({})", count(QueueTab::Pending))),
                 (QueueTab::Complete, format!("Complete ({})", count(QueueTab::Complete))),
                 (QueueTab::Failed, format!("Failed ({})", count(QueueTab::Failed))),
                 (QueueTab::Log, "Log".to_owned()),
                 (QueueTab::Statistics, "Statistics".to_owned()),
+                (QueueTab::Terminal, "SSH Terminal".to_owned()),
             ];
             win32::tab_strip(ui, &mut self.sessions[a].queue_tab, &tabs);
+            // Each tab gets exactly the space left in the panel, so switching
+            // tabs never resizes the panel (it would otherwise grow or shrink
+            // to whatever the tab's contents need).
+            let page = ui.available_rect_before_wrap();
+            let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page).layout(egui::Layout::top_down(egui::Align::Min)));
+            page_ui.set_clip_rect(page.intersect(ui.clip_rect()));
             match self.sessions[a].queue_tab {
-                QueueTab::Log => self.log_tab(ui),
-                QueueTab::Statistics => self.statistics_tab(ui),
-                tab => self.transfer_list_tab(ui, tab),
+                QueueTab::Log => self.log_tab(&mut page_ui),
+                QueueTab::Statistics => self.statistics_tab(&mut page_ui),
+                QueueTab::Terminal => self.terminal_tab(&mut page_ui),
+                tab => self.transfer_list_tab(&mut page_ui, tab),
             }
+            ui.advance_cursor_after_rect(page);
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |columns| {
@@ -2401,6 +2836,7 @@ impl eframe::App for SftpApp {
         self.dialog_window(ctx);
         self.settings_window(ctx);
         self.hash_windows(ctx);
+        self.conflict_window(ctx);
         if self.ops_pending > 0 || self.hash_jobs.iter().any(|job| job.result.is_none()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -2412,6 +2848,28 @@ impl eframe::App for SftpApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
+}
+
+/// Status-bar rsftp-turbo badge: width and background colours.
+const TURBO_PANE_WIDTH: f32 = 120.0;
+const TURBO_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0, 128, 0);
+const TURBO_UNAVAILABLE: egui::Color32 = egui::Color32::from_rgb(170, 0, 0);
+
+/// Rows in the statistics table and the gap between them.
+const STATS_ROWS: usize = 10;
+const STATS_ROW_GAP: f32 = 3.0;
+/// Inner margin of the transfer queue panel.
+const QUEUE_PANEL_MARGIN: i8 = 6;
+
+/// Height of the transfer queue panel that shows the whole statistics tab
+/// without growing: tab strip, timespan row (each followed by a 2 px space)
+/// and the table, whose rows are `interact_size.y` tall (the grid default).
+fn queue_panel_height(style: &egui::Style) -> f32 {
+    let row = style.spacing.interact_size.y;
+    let gap = style.spacing.item_spacing.y;
+    let rows = STATS_ROWS as f32;
+    let table = rows * row + (rows - 1.0) * STATS_ROW_GAP;
+    2.0 * f32::from(QUEUE_PANEL_MARGIN) + (row + gap + 2.0) * 2.0 + table
 }
 
 /// Win32 dialog button row: right-aligned, pinned to the bottom of the dialog.
@@ -2502,52 +2960,15 @@ fn version_text() -> String {
     }
 }
 
-/// Short status-bar text and a longer tooltip for the session's rsftp-turbo state.
-fn turbo_status_text(session: &Session) -> (String, String) {
-    let Some(connection) = &session.connection else {
-        return ("Turbo: —".into(), "Not connected.".into());
-    };
-    let info = connection.turbo_info();
-    let (short, mut details) = match &info.state {
-        TurboState::Disabled => (
-            "Turbo: off".to_owned(),
-            "UDP downloads are turned off (Settings → Network Settings → UDP downloads).".to_owned(),
-        ),
-        TurboState::Untested => (
-            "Turbo: not tried yet".to_owned(),
-            "rsftp-turbo is tried on the next download from this server.".to_owned(),
-        ),
-        TurboState::Testing => (
-            "Turbo: checking…".to_owned(),
-            "Checking whether the server's rsftp-turbo service answers over UDP.".to_owned(),
-        ),
-        TurboState::Ready => (
-            "Turbo: ready (UDP)".to_owned(),
-            "rsftp-turbo answered over UDP; downloads from this server will use it.".to_owned(),
-        ),
-        TurboState::Active => (
-            "Turbo: active (UDP)".to_owned(),
-            "Downloads from this server use rsftp-turbo over UDP.".to_owned(),
-        ),
-        TurboState::Unavailable(reason) => (
-            format!("Turbo: unavailable — {reason}"),
-            format!(
-                "Downloads from this server use SFTP.\n\nReason: {reason}\n\nAfter fixing the server, disconnect and \
-                 reconnect to try rsftp-turbo again."
-            ),
-        ),
-    };
-    if let Some(fallback) = &info.last_fallback {
-        details.push_str(&format!("\n\nLast file that fell back to SFTP: {fallback}"));
+/// rsftp-turbo badge for the status bar: Some(true) "Turbo Active",
+/// Some(false) "Turbo Unavailable" (the reason is in the session log), None
+/// to hide it (turned off, not connected, or not known yet).
+fn turbo_badge(session: &Session) -> Option<bool> {
+    match session.connection.as_ref()?.turbo_info().state {
+        TurboState::Ready | TurboState::Active => Some(true),
+        TurboState::Unavailable(_) => Some(false),
+        TurboState::Disabled | TurboState::Untested | TurboState::Testing => None,
     }
-    match connection.listing_via_helper() {
-        Some(true) => details.push_str("\n\nDirectory listings: rsftp-turbo helper over SSH (one round trip each)."),
-        Some(false) => details.push_str(
-            "\n\nDirectory listings: SFTP (the server's rsftp-turbo helper is not running or too old to list directories).",
-        ),
-        None => {}
-    }
-    (short, details)
 }
 
 /// A speed in MiB/s, written in the chosen units.
@@ -2818,6 +3239,127 @@ fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, dir: bool) {
         let corner = egui::Rect::from_min_max(egui::pos2(page.right() - 4.0, page.top()), egui::pos2(page.right(), page.top() + 4.0));
         painter.rect(corner, 0.0, egui::Color32::from_rgb(223, 223, 223), outline, egui::StrokeKind::Inside);
     }
+}
+
+/// Background and text colours of the conflict listing.
+struct ConflictColors {
+    /// Cells of the file that will be overwritten.
+    replaced: egui::Color32,
+    replaced_text: egui::Color32,
+    /// Cells of the file that replaces it.
+    new: egui::Color32,
+    new_text: egui::Color32,
+}
+
+impl ConflictColors {
+    fn new(dark: bool) -> Self {
+        if dark {
+            Self {
+                replaced: egui::Color32::from_rgb(90, 36, 36),
+                replaced_text: egui::Color32::from_rgb(240, 120, 120),
+                new: egui::Color32::from_rgb(30, 74, 40),
+                new_text: egui::Color32::from_rgb(120, 210, 130),
+            }
+        } else {
+            Self {
+                replaced: egui::Color32::from_rgb(255, 220, 220),
+                replaced_text: egui::Color32::from_rgb(180, 0, 0),
+                new: egui::Color32::from_rgb(214, 245, 214),
+                new_text: egui::Color32::from_rgb(0, 120, 0),
+            }
+        }
+    }
+}
+
+/// One cell of the conflict listing, optionally filled.
+fn conflict_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, fill: Option<egui::Color32>, color: egui::Color32, right_align: bool) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) { return; }
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(rect.shrink2(egui::vec2(0.0, 1.0)), 0.0, fill);
+    }
+    let painter = ui.painter().with_clip_rect(rect.shrink2(egui::vec2(4.0, 0.0)).intersect(ui.clip_rect()));
+    let (anchor, pos) = if right_align {
+        (egui::Align2::RIGHT_CENTER, rect.right_center() - egui::vec2(6.0, 0.0))
+    } else {
+        (egui::Align2::LEFT_CENTER, rect.left_center() + egui::vec2(5.0, 0.0))
+    };
+    let galley = painter.layout_no_wrap(text.to_owned(), egui::TextStyle::Body.resolve(ui.style()), color);
+    if galley.size().x > rect.width() - 10.0 {
+        response.on_hover_text(text);
+    }
+    painter.text(pos, anchor, text, egui::TextStyle::Body.resolve(ui.style()), color);
+}
+
+/// Name of a conflicting file: its path below the folder the transfer was
+/// started from (so it includes the transferred folder's name).
+fn conflict_name(prepared: &crate::session::PreparedJob, local: &std::path::Path) -> String {
+    let root = match &prepared.job {
+        crate::session::Job::DownloadFile { local, .. }
+        | crate::session::Job::DownloadPath { local, .. }
+        | crate::session::Job::UploadPath { local, .. } => local,
+    };
+    let base = root.parent().unwrap_or(root);
+    local.strip_prefix(base).unwrap_or(local).display().to_string()
+}
+
+/// A Unix modification time as the file panes show it.
+fn mtime_text(mtime: Option<u64>) -> String {
+    match mtime {
+        Some(seconds) => format_unix_utc(seconds as i64).replace('T', " ").trim_end_matches('Z').to_owned(),
+        None => "—".into(),
+    }
+}
+
+/// A queue context-menu action that applies to the whole tab.
+enum TabAction {
+    StopAll,
+    RetryAll,
+    Clear,
+}
+
+/// Width of the expand/collapse column of the transfer queue, and the
+/// indentation of a folder's files.
+const EXPANDER_WIDTH: f32 = 16.0;
+
+/// Rows the queue tab `tab` shows, as (index into `transfers`, depth):
+/// each transfer, and below an expanded folder transfer its files. A
+/// folder's files are listed with it, whatever their own state.
+fn queue_rows(transfers: &[crate::session::TransferItem], tab: QueueTab) -> Vec<(usize, u8)> {
+    let expanded: HashSet<usize> = transfers.iter()
+        .filter(|item| item.folder && item.expanded && item.operation_id.is_none() && item.tab() == tab)
+        .map(|item| item.id)
+        .collect();
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    if !expanded.is_empty() {
+        for (index, item) in transfers.iter().enumerate() {
+            if let Some(operation) = item.operation_id.filter(|operation| expanded.contains(operation)) {
+                children.entry(operation).or_default().push(index);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for (index, item) in transfers.iter().enumerate() {
+        if item.operation_id.is_some() || item.tab() != tab {
+            continue;
+        }
+        rows.push((index, 0));
+        if let Some(files) = children.get(&item.id) {
+            rows.extend(files.iter().map(|&file| (file, 1)));
+        }
+    }
+    rows
+}
+
+/// Win32 tree-view style expander: a triangle pointing right (collapsed) or down.
+fn paint_expander(painter: &egui::Painter, rect: egui::Rect, expanded: bool) {
+    let c = rect.center();
+    let points = if expanded {
+        vec![c + egui::vec2(-4.0, -2.0), c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 3.0)]
+    } else {
+        vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(3.0, 0.0), c + egui::vec2(-2.0, 4.0)]
+    };
+    painter.add(egui::Shape::convex_polygon(points, win32::text_color(), egui::Stroke::NONE));
 }
 
 fn file_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, right_align: bool) {

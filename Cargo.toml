@@ -31,3 +31,4 @@ sha2 = { version = "0.11", default-features = false }
 keyring = "4"
 # UDP download accelerator (client side and wire protocol).
 rsftp-turbo-proto = { path = "crates/turbo-proto" }
+vt100 = "0.18"

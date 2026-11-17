@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{connection::NetworkSettings, logging::LoggingSettings, transfer::TransferSettings};
+use crate::{connection::NetworkSettings, logging::LoggingSettings, terminal::TerminalSettings, transfer::TransferSettings};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -12,6 +12,7 @@ pub struct AppSettings {
     pub transfer: TransferSettings,
     pub network: NetworkSettings,
     pub logging: LoggingSettings,
+    pub terminal: TerminalSettings,
     pub theme: crate::win32::Theme,
     /// How sizes and speeds are written.
     pub units: crate::units::SizeUnits,
@@ -60,6 +61,7 @@ mod tests {
         assert!(parsed.logging.log_connections);
         assert_eq!(parsed.transfer, TransferSettings::default());
         assert_eq!(parsed.network, NetworkSettings::default());
+        assert_eq!(parsed.terminal, TerminalSettings::default());
         assert_eq!(parsed.last_local_dir, None);
     }
 }

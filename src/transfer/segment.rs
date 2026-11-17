@@ -8,7 +8,6 @@ pub struct TransferSettings {
     pub segmentation_threshold_bytes: u64,
     pub target_segment_size_bytes: u64,
     pub max_segments_per_file: u32,
-    pub max_concurrent_transfers: u32,
 }
 
 impl Default for TransferSettings {
@@ -17,7 +16,6 @@ impl Default for TransferSettings {
             segmentation_threshold_bytes: 64 * 1024 * 1024,
             target_segment_size_bytes: 8 * 1024 * 1024,
             max_segments_per_file: 8,
-            max_concurrent_transfers: 4,
         }
     }
 }
@@ -104,7 +102,6 @@ mod tests {
             segmentation_threshold_bytes: 64,
             target_segment_size_bytes: 16,
             max_segments_per_file: 4,
-            max_concurrent_transfers: 4,
         }
     }
 
