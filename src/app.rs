@@ -1402,9 +1402,7 @@ impl SftpApp {
 
     fn local_pane(&mut self, ui: &mut egui::Ui) {
         let a = self.active;
-        let (_, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
-            self.local_pane_contents(ui);
-        });
+        let dropped = pane_drop_zone(ui, |ui| self.local_pane_contents(ui));
         if let Some(payload) = dropped {
             if let DragPayload::Remote(paths) = payload.as_ref() {
                 for path in paths {
@@ -1417,183 +1415,207 @@ impl SftpApp {
     fn local_pane_contents(&mut self, ui: &mut egui::Ui) {
         let a = self.active;
         let connected = self.sessions[a].connection.is_some();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if win32::icon_button(ui, self.sessions[a].path.parent().is_some(), win32::Icon::Up, "Up one level").clicked() {
-                if let Some(parent) = self.sessions[a].path.parent().map(PathBuf::from) { self.sessions[a].open_local_dir(parent); }
-            }
-            if win32::icon_button(ui, true, win32::Icon::Refresh, "Refresh").clicked() {
-                self.drives = places::list();
-                self.sessions[a].refresh_local();
-            }
-            if win32::icon_button(ui, true, win32::Icon::NewFolder, "New folder").clicked() {
-                self.begin_new_folder(false);
-            }
-            let bookmarked = self.settings.bookmarks.is_local(&self.sessions[a].path);
-            if bookmark_button(ui, true, bookmarked).clicked() {
-                let path = self.sessions[a].path.clone();
-                self.settings.bookmarks.toggle_local(&path);
-                self.save_bookmarks();
-            }
-            ui.add_space(6.0);
-            ui.label("Filter:");
-            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].local_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
-            ui.checkbox(&mut self.sessions[a].local_recursive, "Recursive").on_hover_text(RECURSIVE_TIP);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Address:");
-            let current = places::containing(&self.drives, &self.sessions[a].path);
-            let current_text = current.map(|index| self.drives[index].path.display().to_string()).unwrap_or_default();
-            let mut chosen = None;
-            egui::ComboBox::from_id_salt("local_drive")
-                .width(if cfg!(windows) { 60.0 } else { 130.0 })
-                .selected_text(current_text)
-                .show_ui(ui, |ui| {
-                    for (index, drive) in self.drives.iter().enumerate() {
-                        if ui.add(egui::Button::selectable(current == Some(index), drive.label.as_str()).wrap_mode(egui::TextWrapMode::Extend)).clicked() {
-                            chosen = Some(drive.path.clone());
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Drive");
-            if let Some(path) = chosen { self.sessions[a].open_local_dir(path); }
-            let current_path = self.sessions[a].path.clone();
-            win32::field_sized(ui, &current_path.display().to_string(), ui.available_width() - BOOKMARK_MENU_RESERVE);
-            let labels: Vec<String> = self.settings.bookmarks.local.iter().map(|path| path.display().to_string()).collect();
-            let current = self.settings.bookmarks.local.iter().position(|path| *path == current_path);
-            if let Some(index) = bookmark_menu(ui, "local_bookmarks", true, &labels, current) {
-                let path = self.settings.bookmarks.local[index].clone();
-                self.sessions[a].open_local_dir(path);
-            }
-        });
-        ui.add_space(2.0);
-
-        let filter = self.sessions[a].local_filter.trim().to_lowercase();
-        let searching = self.sessions[a].searching_local();
-        let show_hidden = self.sessions[a].show_hidden;
-        let mut rows: Vec<LocalEntry> = if searching {
-            self.sessions[a].local_search.as_ref().map(|search| search.results.clone()).unwrap_or_default()
-        } else {
-            self.sessions[a].local_entries.iter()
-                .filter(|entry| (show_hidden || !entry.hidden) && entry.name.to_lowercase().contains(&filter))
-                .cloned().collect()
-        };
-        sort_rows(&mut rows, self.sessions[a].local_sort);
-        let footer = list_footer(rows.len(), self.sessions[a].uploadable_selection().len(), searching,
-            self.sessions[a].local_search.as_ref().map(|search| (search.done, search.truncated)));
-        // Rows the context menu can act on (".." excluded).
-        let listed = rows.clone();
-        if let (Some(parent), false) = (self.sessions[a].path.parent(), searching) {
-            rows.insert(0, LocalEntry {
-                name: "..".into(), path: parent.to_path_buf(), dir: true,
-                size: 0, modified: "—".into(), hidden: false, folder: String::new(),
-            });
-        }
-        let mut open_dir = None;
-        // Row order for Shift-click ranges (".." is never part of a range).
-        let order: Vec<PathBuf> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
-        let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
-        let mut sort_click = None;
-        let mut background_new_folder = false;
-        win32::list_view(ui, list_height, |ui| {
-            let (name_width, header) = reserve_list_header(ui);
-            win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
-                for entry in rows {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let selected = self.sessions[a].local_selected.contains(&entry.path);
-                        let response = file_row(ui, name_width, &entry.label(), entry.dir, entry.size, &entry.modified, selected);
-                        // Dragging a selected item drags the whole selection; dragging
-                        // any other item selects just it first, as Explorer does.
-                        if response.dragged() && entry.name != ".." {
-                            let session = &mut self.sessions[a];
-                            if response.drag_started() && !selected {
-                                session.local_selected = vec![entry.path.clone()];
-                                session.local_anchor = Some(entry.path.clone());
-                            }
-                            let paths = if session.local_selected.contains(&entry.path) {
-                                order.iter().filter(|path| session.local_selected.contains(path)).cloned().collect()
-                            } else {
-                                vec![entry.path.clone()]
-                            };
-                            response.dnd_set_drag_payload(DragPayload::Local(paths));
-                        }
-                        if response.clicked() {
-                            let (ctrl, shift) = click_modifiers(&response);
-                            let session = &mut self.sessions[a];
-                            if entry.name == ".." {
-                                session.local_selected = vec![entry.path.clone()];
-                                session.local_anchor = None;
-                            } else {
-                                select_click(&mut session.local_selected, &mut session.local_anchor, &order, &entry.path, ctrl, shift);
-                            }
-                        }
-                        if response.secondary_clicked() && !selected {
-                            self.sessions[a].local_selected = vec![entry.path.clone()];
-                            self.sessions[a].local_anchor = Some(entry.path.clone());
-                        }
-                        let in_selection = self.sessions[a].local_selected.contains(&entry.path);
-                        let count = if in_selection { self.sessions[a].uploadable_selection().len().max(1) } else { 1 };
-                        let mut action = None;
-                        if entry.name != ".." {
-                            response.context_menu(|ui| {
-                                let label = match (connected, count > 1) {
-                                    (true, true) => format!("Upload {count} items to remote"),
-                                    (true, false) => "Upload to remote".to_owned(),
-                                    (false, _) => "Upload to remote (not connected)".to_owned(),
-                                };
-                                action = row_context_menu(ui, entry.dir, &label, connected, count == 1, count == 1);
-                            });
-                        }
-                        let targets = || -> Vec<LocalEntry> {
-                            if in_selection {
-                                let selected = &self.sessions[a].local_selected;
-                                listed.iter().filter(|e| selected.contains(&e.path)).cloned().collect()
-                            } else {
-                                vec![entry.clone()]
-                            }
-                        };
-                        match action {
-                            Some(RowAction::Open) => open_dir = Some(entry.path.clone()),
-                            Some(RowAction::Transfer) => {
-                                for target in targets() { self.sessions[a].queue_upload(target.path); }
-                            }
-                            Some(RowAction::Hash(algorithm)) => self.start_local_hash(&entry, algorithm),
-                            Some(RowAction::NewFolder) => self.begin_new_folder(false),
-                            Some(RowAction::Rename) => self.begin_rename(FileTarget::Local(vec![entry.clone()])),
-                            Some(RowAction::Delete) => {
-                                let targets = targets();
-                                self.begin_delete(FileTarget::Local(targets));
-                            }
-                            None => {}
-                        }
-                        if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
-                    });
+        // Toolbar band: folder buttons, filter and Recursive.
+        let mut band = win32::begin_band(ui);
+        {
+            let ui = &mut band.content_ui;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if win32::icon_button(ui, self.sessions[a].path.parent().is_some(), win32::Icon::Up, "Up one level").clicked() {
+                    if let Some(parent) = self.sessions[a].path.parent().map(PathBuf::from) { self.sessions[a].open_local_dir(parent); }
                 }
-                let session = &mut self.sessions[a];
-                background_new_folder = list_background(ui, &mut || {
-                    session.local_selected.clear();
-                    session.local_anchor = None;
+                if win32::icon_button(ui, true, win32::Icon::Refresh, "Refresh").clicked() {
+                    self.drives = places::list();
+                    self.sessions[a].refresh_local();
+                }
+                if win32::icon_button(ui, true, win32::Icon::NewFolder, "New folder").clicked() {
+                    self.begin_new_folder(false);
+                }
+                let bookmarked = self.settings.bookmarks.is_local(&self.sessions[a].path);
+                if bookmark_button(ui, true, bookmarked).clicked() {
+                    let path = self.sessions[a].path.clone();
+                    self.settings.bookmarks.toggle_local(&path);
+                    self.save_bookmarks();
+                }
+                win32::toolbar_separator(ui);
+                ui.label("Filter:");
+                // The toolbar packs its buttons 2 points apart; give the label the Path row's gap.
+                ui.add_space(2.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pane_header_slot(ui, |ui| {
+                        ui.checkbox(&mut self.sessions[a].local_recursive, "Recursive").on_hover_text(RECURSIVE_TIP);
+                    });
+                    ui.add_space(PANE_HEADER_GAP);
+                    pane_filter_edit(ui, &mut self.sessions[a].local_filter);
                 });
             });
-            sort_click = paint_list_header(ui, header, name_width, self.sessions[a].local_sort);
-        });
-        if background_new_folder { self.begin_new_folder(false); }
-        if let Some(column) = sort_click { self.sessions[a].local_sort.toggle(column); }
-        if let Some(path) = open_dir {
-            // Opening a folder found by a search shows that folder, not more results.
-            if searching { self.sessions[a].local_filter.clear(); }
-            self.sessions[a].open_local_dir(path);
         }
-        ui.label(footer);
+        win32::end_band(ui, band);
+        ui.add_space(PANE_SECTION_GAP);
+
+        // Browser group: path, bookmarks, the file list and its status line.
+        let mut group = win32::begin_group(ui);
+        {
+            let ui = &mut group.content_ui;
+            ui.horizontal(|ui| {
+                ui.label("Path:");
+                let current = places::containing(&self.drives, &self.sessions[a].path);
+                let current_text = current.map(|index| self.drives[index].path.display().to_string()).unwrap_or_default();
+                let mut chosen = None;
+                egui::ComboBox::from_id_salt("local_drive")
+                    .width(if cfg!(windows) { 60.0 } else { 130.0 })
+                    .selected_text(current_text)
+                    .show_ui(ui, |ui| {
+                        for (index, drive) in self.drives.iter().enumerate() {
+                            if ui.add(egui::Button::selectable(current == Some(index), drive.label.as_str()).wrap_mode(egui::TextWrapMode::Extend)).clicked() {
+                                chosen = Some(drive.path.clone());
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Drive");
+                if let Some(path) = chosen { self.sessions[a].open_local_dir(path); }
+                let current_path = self.sessions[a].path.clone();
+                let labels: Vec<String> = self.settings.bookmarks.local.iter().map(|path| path.display().to_string()).collect();
+                let current = self.settings.bookmarks.local.iter().position(|path| *path == current_path);
+                let picked = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let picked = pane_header_slot(ui, |ui| bookmark_menu(ui, "local_bookmarks", true, &labels, current));
+                    ui.add_space(PANE_HEADER_GAP);
+                    win32::field_sized(ui, &current_path.display().to_string(), ui.available_width());
+                    picked
+                }).inner;
+                if let Some(index) = picked {
+                    let path = self.settings.bookmarks.local[index].clone();
+                    self.sessions[a].open_local_dir(path);
+                }
+            });
+            ui.add_space(PANE_HEADER_BOTTOM_GAP);
+
+            let filter = self.sessions[a].local_filter.trim().to_lowercase();
+            let searching = self.sessions[a].searching_local();
+            let show_hidden = self.sessions[a].show_hidden;
+            let mut rows: Vec<LocalEntry> = if searching {
+                self.sessions[a].local_search.as_ref().map(|search| search.results.clone()).unwrap_or_default()
+            } else {
+                self.sessions[a].local_entries.iter()
+                    .filter(|entry| (show_hidden || !entry.hidden) && entry.name.to_lowercase().contains(&filter))
+                    .cloned().collect()
+            };
+            sort_rows(&mut rows, self.sessions[a].local_sort);
+            let footer = list_footer(rows.len(), self.sessions[a].uploadable_selection().len(), searching,
+                self.sessions[a].local_search.as_ref().map(|search| (search.done, search.truncated)));
+            // Rows the context menu can act on (".." excluded).
+            let listed = rows.clone();
+            if let (Some(parent), false) = (self.sessions[a].path.parent(), searching) {
+                rows.insert(0, LocalEntry {
+                    name: "..".into(), path: parent.to_path_buf(), dir: true,
+                    size: 0, modified: "—".into(), hidden: false, folder: String::new(),
+                });
+            }
+            let mut open_dir = None;
+            // Row order for Shift-click ranges (".." is never part of a range).
+            let order: Vec<PathBuf> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
+            let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
+            let mut sort_click = None;
+            let mut background_new_folder = false;
+            win32::list_view(ui, list_height, |ui| {
+                let (name_width, header) = reserve_list_header(ui);
+                win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
+                    for entry in rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let selected = self.sessions[a].local_selected.contains(&entry.path);
+                            let response = file_row(ui, name_width, &entry.label(), entry.dir, entry.size, &entry.modified, selected);
+                            // Dragging a selected item drags the whole selection; dragging
+                            // any other item selects just it first, as Explorer does.
+                            if response.dragged() && entry.name != ".." {
+                                let session = &mut self.sessions[a];
+                                if response.drag_started() && !selected {
+                                    session.local_selected = vec![entry.path.clone()];
+                                    session.local_anchor = Some(entry.path.clone());
+                                }
+                                let paths = if session.local_selected.contains(&entry.path) {
+                                    order.iter().filter(|path| session.local_selected.contains(path)).cloned().collect()
+                                } else {
+                                    vec![entry.path.clone()]
+                                };
+                                response.dnd_set_drag_payload(DragPayload::Local(paths));
+                            }
+                            if response.clicked() {
+                                let (ctrl, shift) = click_modifiers(&response);
+                                let session = &mut self.sessions[a];
+                                if entry.name == ".." {
+                                    session.local_selected = vec![entry.path.clone()];
+                                    session.local_anchor = None;
+                                } else {
+                                    select_click(&mut session.local_selected, &mut session.local_anchor, &order, &entry.path, ctrl, shift);
+                                }
+                            }
+                            if response.secondary_clicked() && !selected {
+                                self.sessions[a].local_selected = vec![entry.path.clone()];
+                                self.sessions[a].local_anchor = Some(entry.path.clone());
+                            }
+                            let in_selection = self.sessions[a].local_selected.contains(&entry.path);
+                            let count = if in_selection { self.sessions[a].uploadable_selection().len().max(1) } else { 1 };
+                            let mut action = None;
+                            if entry.name != ".." {
+                                response.context_menu(|ui| {
+                                    let label = match (connected, count > 1) {
+                                        (true, true) => format!("Upload {count} items to remote"),
+                                        (true, false) => "Upload to remote".to_owned(),
+                                        (false, _) => "Upload to remote (not connected)".to_owned(),
+                                    };
+                                    action = row_context_menu(ui, entry.dir, &label, connected, count == 1, count == 1);
+                                });
+                            }
+                            let targets = || -> Vec<LocalEntry> {
+                                if in_selection {
+                                    let selected = &self.sessions[a].local_selected;
+                                    listed.iter().filter(|e| selected.contains(&e.path)).cloned().collect()
+                                } else {
+                                    vec![entry.clone()]
+                                }
+                            };
+                            match action {
+                                Some(RowAction::Open) => open_dir = Some(entry.path.clone()),
+                                Some(RowAction::Transfer) => {
+                                    for target in targets() { self.sessions[a].queue_upload(target.path); }
+                                }
+                                Some(RowAction::Hash(algorithm)) => self.start_local_hash(&entry, algorithm),
+                                Some(RowAction::NewFolder) => self.begin_new_folder(false),
+                                Some(RowAction::Rename) => self.begin_rename(FileTarget::Local(vec![entry.clone()])),
+                                Some(RowAction::Delete) => {
+                                    let targets = targets();
+                                    self.begin_delete(FileTarget::Local(targets));
+                                }
+                                None => {}
+                            }
+                            if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
+                        });
+                    }
+                    let session = &mut self.sessions[a];
+                    background_new_folder = list_background(ui, &mut || {
+                        session.local_selected.clear();
+                        session.local_anchor = None;
+                    });
+                });
+                sort_click = paint_list_header(ui, header, name_width, self.sessions[a].local_sort);
+            });
+            if background_new_folder { self.begin_new_folder(false); }
+            if let Some(column) = sort_click { self.sessions[a].local_sort.toggle(column); }
+            if let Some(path) = open_dir {
+                // Opening a folder found by a search shows that folder, not more results.
+                if searching { self.sessions[a].local_filter.clear(); }
+                self.sessions[a].open_local_dir(path);
+            }
+            ui.label(footer);
+        }
+        win32::end_group(ui, group);
     }
 
     fn remote_pane(&mut self, ui: &mut egui::Ui) {
         let a = self.active;
-        let (_, dropped) = ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
-            self.remote_pane_contents(ui);
-        });
+        let dropped = pane_drop_zone(ui, |ui| self.remote_pane_contents(ui));
         if let Some(payload) = dropped {
             if let DragPayload::Local(paths) = payload.as_ref() {
                 for path in paths {
@@ -1606,168 +1628,195 @@ impl SftpApp {
     fn remote_pane_contents(&mut self, ui: &mut egui::Ui) {
         let a = self.active;
         let connected = self.sessions[a].connection.is_some();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if win32::icon_button(ui, connected, win32::Icon::Up, "Up one level").clicked() {
-                let parent = remote_parent(&self.sessions[a].remote_path);
-                self.sessions[a].navigate_remote(parent);
-            }
-            if win32::icon_button(ui, connected, win32::Icon::Refresh, "Refresh").clicked() {
-                let path = self.sessions[a].remote_path.clone();
-                self.sessions[a].load_remote(&path);
-            }
-            if win32::icon_button(ui, connected, win32::Icon::NewFolder, "New folder").clicked() {
-                self.begin_new_folder(true);
-            }
-            let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
-            let bookmarked = login.as_ref().is_some_and(|login| self.settings.bookmarks.is_remote(login, &self.sessions[a].remote_path));
-            if bookmark_button(ui, login.is_some(), bookmarked).clicked() {
-                if let Some(login) = login {
+        // Toolbar band: folder buttons, filter and Recursive.
+        let mut band = win32::begin_band(ui);
+        {
+            let ui = &mut band.content_ui;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if win32::icon_button(ui, connected, win32::Icon::Up, "Up one level").clicked() {
+                    let parent = remote_parent(&self.sessions[a].remote_path);
+                    self.sessions[a].navigate_remote(parent);
+                }
+                if win32::icon_button(ui, connected, win32::Icon::Refresh, "Refresh").clicked() {
                     let path = self.sessions[a].remote_path.clone();
-                    self.settings.bookmarks.toggle_remote(&login, &path);
-                    self.save_bookmarks();
+                    self.sessions[a].load_remote(&path);
                 }
-            }
-            ui.add_space(6.0);
-            ui.label("Filter:");
-            win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].remote_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
-            ui.add_enabled(connected, egui::Checkbox::new(&mut self.sessions[a].remote_recursive, "Recursive")).on_hover_text(RECURSIVE_TIP);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Address:");
-            win32::field_sized(ui, if connected { self.sessions[a].remote_path.as_str() } else { "" }, ui.available_width() - BOOKMARK_MENU_RESERVE);
-            let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
-            let labels: Vec<String> = login.as_ref().map(|login| self.settings.bookmarks.remote_for(login).to_vec()).unwrap_or_default();
-            let showing = self.sessions[a].remote_path.trim_end_matches('/');
-            let current = labels.iter().position(|label| label.trim_end_matches('/') == showing);
-            if let Some(index) = bookmark_menu(ui, "remote_bookmarks", login.is_some(), &labels, current) {
-                self.sessions[a].navigate_remote(labels[index].clone());
-            }
-        });
-        ui.add_space(2.0);
-
-        let filter = self.sessions[a].remote_filter.trim().to_lowercase();
-        let searching = self.sessions[a].searching_remote();
-        let show_hidden = self.sessions[a].show_hidden;
-        let mut rows: Vec<RemoteEntry> = if searching {
-            self.sessions[a].remote_search.as_ref().map(|search| search.results.clone()).unwrap_or_default()
-        } else {
-            self.sessions[a].remote_entries.iter()
-                .filter(|entry| (show_hidden || !entry.hidden()) && entry.name.to_lowercase().contains(&filter))
-                .cloned().collect()
-        };
-        sort_rows(&mut rows, self.sessions[a].remote_sort);
-        let footer = list_footer(rows.len(), self.sessions[a].remote_selected.len(), searching,
-            self.sessions[a].remote_search.as_ref().map(|search| (search.done, search.truncated)));
-        let listed = rows.clone();
-        let remote_path_trimmed = self.sessions[a].remote_path.trim_end_matches('/');
-        if !searching && !remote_path_trimmed.is_empty() && remote_path_trimmed != "/" {
-            rows.insert(0, RemoteEntry {
-                name: "..".into(), path: remote_parent(&self.sessions[a].remote_path), dir: true,
-                size: 0, modified: "—".into(), folder: String::new(),
-            });
-        }
-        let mut open_dir = None;
-        let order: Vec<String> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
-        let mut open_profiles = false;
-        let mut sort_click = None;
-        let mut background_new_folder = false;
-        let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
-        win32::list_view(ui, list_height, |ui| {
-            let (name_width, header) = reserve_list_header(ui);
-            if !connected {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(60.0);
-                    ui.label("Not connected to a server.");
-                    ui.weak("Connect to an SSH server to browse remote files.");
-                    ui.add_space(8.0);
-                    if win32::button_sized(ui, true, "Connect…", 75.0).clicked() { open_profiles = true; }
-                });
-                paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
-                return;
-            }
-            win32::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
-                for entry in rows {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        let selected = self.sessions[a].remote_selected.contains(&entry.path);
-                        let response = file_row(ui, name_width, &entry.label(), entry.dir, entry.size, &entry.modified, selected);
-                        if response.dragged() && entry.name != ".." {
-                            let session = &mut self.sessions[a];
-                            if response.drag_started() && !selected {
-                                session.remote_selected = vec![entry.path.clone()];
-                                session.remote_anchor = Some(entry.path.clone());
-                            }
-                            let paths = if session.remote_selected.contains(&entry.path) {
-                                order.iter().filter(|path| session.remote_selected.contains(path)).cloned().collect()
-                            } else {
-                                vec![entry.path.clone()]
-                            };
-                            response.dnd_set_drag_payload(DragPayload::Remote(paths));
-                        }
-                        if response.clicked() {
-                            let (ctrl, shift) = click_modifiers(&response);
-                            let session = &mut self.sessions[a];
-                            if entry.name == ".." {
-                                session.remote_selected = vec![entry.path.clone()];
-                                session.remote_anchor = None;
-                            } else {
-                                select_click(&mut session.remote_selected, &mut session.remote_anchor, &order, &entry.path, ctrl, shift);
-                            }
-                        }
-                        if response.secondary_clicked() && !selected {
-                            self.sessions[a].remote_selected = vec![entry.path.clone()];
-                            self.sessions[a].remote_anchor = Some(entry.path.clone());
-                        }
-                        let in_selection = self.sessions[a].remote_selected.contains(&entry.path);
-                        let count = if in_selection { self.sessions[a].remote_selected.len() } else { 1 };
-                        let mut action = None;
-                        if entry.name != ".." {
-                            response.context_menu(|ui| {
-                                let label = if count > 1 { format!("Download {count} items") } else { "Download".to_owned() };
-                                // Hashing is local-only: a remote hash would have to download the file.
-                                action = row_context_menu(ui, entry.dir, &label, true, count == 1, false);
-                            });
-                        }
-                        let targets = || -> Vec<RemoteEntry> {
-                            if in_selection {
-                                listed.iter().filter(|e| self.sessions[a].remote_selected.contains(&e.path)).cloned().collect()
-                            } else {
-                                vec![entry.clone()]
-                            }
-                        };
-                        match action {
-                            Some(RowAction::Open) => open_dir = Some(entry.path.clone()),
-                            Some(RowAction::Transfer) => {
-                                for target in targets() { self.sessions[a].queue_download(target.path, self.settings.transfer); }
-                            }
-                            Some(RowAction::Rename) => self.begin_rename(FileTarget::Remote(vec![entry.clone()])),
-                            Some(RowAction::Delete) => {
-                                let targets = targets();
-                                self.begin_delete(FileTarget::Remote(targets));
-                            }
-                            Some(RowAction::NewFolder) => self.begin_new_folder(true),
-                            Some(RowAction::Hash(_)) | None => {}
-                        }
-                        if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
+                if win32::icon_button(ui, connected, win32::Icon::NewFolder, "New folder").clicked() {
+                    self.begin_new_folder(true);
+                }
+                let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
+                let bookmarked = login.as_ref().is_some_and(|login| self.settings.bookmarks.is_remote(login, &self.sessions[a].remote_path));
+                if bookmark_button(ui, login.is_some(), bookmarked).clicked() {
+                    if let Some(login) = login {
+                        let path = self.sessions[a].remote_path.clone();
+                        self.settings.bookmarks.toggle_remote(&login, &path);
+                        self.save_bookmarks();
+                    }
+                }
+                win32::toolbar_separator(ui);
+                ui.label("Filter:");
+                // The toolbar packs its buttons 2 points apart; give the label the Path row's gap.
+                ui.add_space(2.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pane_header_slot(ui, |ui| {
+                        ui.add_enabled(connected, egui::Checkbox::new(&mut self.sessions[a].remote_recursive, "Recursive")).on_hover_text(RECURSIVE_TIP);
                     });
-                }
-                let session = &mut self.sessions[a];
-                background_new_folder = list_background(ui, &mut || {
-                    session.remote_selected.clear();
-                    session.remote_anchor = None;
+                    ui.add_space(PANE_HEADER_GAP);
+                    pane_filter_edit(ui, &mut self.sessions[a].remote_filter);
                 });
             });
-            sort_click = paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
-        });
-        if background_new_folder { self.begin_new_folder(true); }
-        if let Some(column) = sort_click { self.sessions[a].remote_sort.toggle(column); }
-        if let Some(path) = open_dir {
-            if searching { self.sessions[a].remote_filter.clear(); }
-            self.sessions[a].navigate_remote(path);
         }
-        if open_profiles { self.dialog = Some(Dialog::Profiles); }
-        ui.label(footer);
+        win32::end_band(ui, band);
+        ui.add_space(PANE_SECTION_GAP);
+
+        // Browser group: path, bookmarks, the file list and its status line.
+        let mut group = win32::begin_group(ui);
+        {
+            let ui = &mut group.content_ui;
+            ui.horizontal(|ui| {
+                ui.label("Path:");
+                let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
+                let labels: Vec<String> = login.as_ref().map(|login| self.settings.bookmarks.remote_for(login).to_vec()).unwrap_or_default();
+                let showing = self.sessions[a].remote_path.trim_end_matches('/');
+                let current = labels.iter().position(|label| label.trim_end_matches('/') == showing);
+                let path_text = if connected { self.sessions[a].remote_path.clone() } else { String::new() };
+                let picked = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let picked = pane_header_slot(ui, |ui| bookmark_menu(ui, "remote_bookmarks", login.is_some(), &labels, current));
+                    ui.add_space(PANE_HEADER_GAP);
+                    win32::field_sized(ui, &path_text, ui.available_width());
+                    picked
+                }).inner;
+                if let Some(index) = picked {
+                    self.sessions[a].navigate_remote(labels[index].clone());
+                }
+            });
+            ui.add_space(PANE_HEADER_BOTTOM_GAP);
+
+            let filter = self.sessions[a].remote_filter.trim().to_lowercase();
+            let searching = self.sessions[a].searching_remote();
+            let show_hidden = self.sessions[a].show_hidden;
+            let mut rows: Vec<RemoteEntry> = if searching {
+                self.sessions[a].remote_search.as_ref().map(|search| search.results.clone()).unwrap_or_default()
+            } else {
+                self.sessions[a].remote_entries.iter()
+                    .filter(|entry| (show_hidden || !entry.hidden()) && entry.name.to_lowercase().contains(&filter))
+                    .cloned().collect()
+            };
+            sort_rows(&mut rows, self.sessions[a].remote_sort);
+            let footer = list_footer(rows.len(), self.sessions[a].remote_selected.len(), searching,
+                self.sessions[a].remote_search.as_ref().map(|search| (search.done, search.truncated)));
+            let listed = rows.clone();
+            let remote_path_trimmed = self.sessions[a].remote_path.trim_end_matches('/');
+            if !searching && !remote_path_trimmed.is_empty() && remote_path_trimmed != "/" {
+                rows.insert(0, RemoteEntry {
+                    name: "..".into(), path: remote_parent(&self.sessions[a].remote_path), dir: true,
+                    size: 0, modified: "—".into(), folder: String::new(),
+                });
+            }
+            let mut open_dir = None;
+            let order: Vec<String> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
+            let mut open_profiles = false;
+            let mut sort_click = None;
+            let mut background_new_folder = false;
+            let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
+            win32::list_view(ui, list_height, |ui| {
+                let (name_width, header) = reserve_list_header(ui);
+                if !connected {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.label("Not connected to a server.");
+                        ui.weak("Connect to an SSH server to browse remote files.");
+                        ui.add_space(8.0);
+                        if win32::button_sized(ui, true, "Connect…", 75.0).clicked() { open_profiles = true; }
+                    });
+                    paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
+                    return;
+                }
+                win32::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
+                    for entry in rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let selected = self.sessions[a].remote_selected.contains(&entry.path);
+                            let response = file_row(ui, name_width, &entry.label(), entry.dir, entry.size, &entry.modified, selected);
+                            if response.dragged() && entry.name != ".." {
+                                let session = &mut self.sessions[a];
+                                if response.drag_started() && !selected {
+                                    session.remote_selected = vec![entry.path.clone()];
+                                    session.remote_anchor = Some(entry.path.clone());
+                                }
+                                let paths = if session.remote_selected.contains(&entry.path) {
+                                    order.iter().filter(|path| session.remote_selected.contains(path)).cloned().collect()
+                                } else {
+                                    vec![entry.path.clone()]
+                                };
+                                response.dnd_set_drag_payload(DragPayload::Remote(paths));
+                            }
+                            if response.clicked() {
+                                let (ctrl, shift) = click_modifiers(&response);
+                                let session = &mut self.sessions[a];
+                                if entry.name == ".." {
+                                    session.remote_selected = vec![entry.path.clone()];
+                                    session.remote_anchor = None;
+                                } else {
+                                    select_click(&mut session.remote_selected, &mut session.remote_anchor, &order, &entry.path, ctrl, shift);
+                                }
+                            }
+                            if response.secondary_clicked() && !selected {
+                                self.sessions[a].remote_selected = vec![entry.path.clone()];
+                                self.sessions[a].remote_anchor = Some(entry.path.clone());
+                            }
+                            let in_selection = self.sessions[a].remote_selected.contains(&entry.path);
+                            let count = if in_selection { self.sessions[a].remote_selected.len() } else { 1 };
+                            let mut action = None;
+                            if entry.name != ".." {
+                                response.context_menu(|ui| {
+                                    let label = if count > 1 { format!("Download {count} items") } else { "Download".to_owned() };
+                                    // Hashing is local-only: a remote hash would have to download the file.
+                                    action = row_context_menu(ui, entry.dir, &label, true, count == 1, false);
+                                });
+                            }
+                            let targets = || -> Vec<RemoteEntry> {
+                                if in_selection {
+                                    listed.iter().filter(|e| self.sessions[a].remote_selected.contains(&e.path)).cloned().collect()
+                                } else {
+                                    vec![entry.clone()]
+                                }
+                            };
+                            match action {
+                                Some(RowAction::Open) => open_dir = Some(entry.path.clone()),
+                                Some(RowAction::Transfer) => {
+                                    for target in targets() { self.sessions[a].queue_download(target.path, self.settings.transfer); }
+                                }
+                                Some(RowAction::Rename) => self.begin_rename(FileTarget::Remote(vec![entry.clone()])),
+                                Some(RowAction::Delete) => {
+                                    let targets = targets();
+                                    self.begin_delete(FileTarget::Remote(targets));
+                                }
+                                Some(RowAction::NewFolder) => self.begin_new_folder(true),
+                                Some(RowAction::Hash(_)) | None => {}
+                            }
+                            if response.double_clicked() && entry.dir { open_dir = Some(entry.path.clone()); }
+                        });
+                    }
+                    let session = &mut self.sessions[a];
+                    background_new_folder = list_background(ui, &mut || {
+                        session.remote_selected.clear();
+                        session.remote_anchor = None;
+                    });
+                });
+                sort_click = paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
+            });
+            if background_new_folder { self.begin_new_folder(true); }
+            if let Some(column) = sort_click { self.sessions[a].remote_sort.toggle(column); }
+            if let Some(path) = open_dir {
+                if searching { self.sessions[a].remote_filter.clear(); }
+                self.sessions[a].navigate_remote(path);
+            }
+            if open_profiles { self.dialog = Some(Dialog::Profiles); }
+            ui.label(footer);
+        }
+        win32::end_group(ui, group);
     }
 
     /// Transfer rows of one queue tab (pending, complete or failed).
@@ -2572,7 +2621,11 @@ impl SftpApp {
                                 ui.weak("Both apply to every window as soon as you click OK or Apply.");
                             }
                             SettingsPage::About => {
-                                restart_for_update = about_page(ui, draft, &mut self.updater, &self.settings);
+                                // The page scrolls within the height of the page list, so the
+                                // OK / Cancel / Apply row stays where the other pages have it.
+                                let used = ui.cursor().top() - ui.min_rect().top();
+                                let height = (body_height - used).max(40.0);
+                                restart_for_update = about_page(ui, height, draft, &mut self.updater, &self.settings);
                             }
                             SettingsPage::Algorithms => {
                                 let tabs = AlgorithmKind::ALL.map(|kind| (kind, kind.label().to_owned()));
@@ -2982,11 +3035,12 @@ fn queue_panel_height(style: &egui::Style) -> f32 {
 /// Win32 dialog button row: right-aligned, pinned to the bottom of the dialog.
 /// Add buttons right-to-left (the default/cancel button first).
 /// Settings › About: the program, where it keeps its files, and updates.
+/// `height` is the most it may take; it scrolls beyond that.
 /// Returns true when "Restart now" was clicked.
-fn about_page(ui: &mut egui::Ui, draft: &mut SettingsDraft, updater: &mut crate::update::Updater, settings: &AppSettings) -> bool {
+fn about_page(ui: &mut egui::Ui, height: f32, draft: &mut SettingsDraft, updater: &mut crate::update::Updater, settings: &AppSettings) -> bool {
     use crate::update::{self, Status};
     let mut restart = false;
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
         ui.add_space(2.0);
         ui.label(egui::RichText::new("Rust SFTP Client").strong().size(16.0));
         ui.label("A dual-pane SFTP client for Windows and Linux, with an SSH terminal and optional UDP-accelerated downloads through the rsftp-turbo server helper.");
@@ -2998,9 +3052,6 @@ fn about_page(ui: &mut egui::Ui, draft: &mut SettingsDraft, updater: &mut crate:
             ui.end_row();
             ui.label("Platform:");
             ui.label(format!("{} {}", std::env::consts::OS, std::env::consts::ARCH));
-            ui.end_row();
-            ui.label("Program file:");
-            ui.label(folder(update::program_path().map(std::path::Path::to_path_buf)));
             ui.end_row();
             ui.label("Settings folder:");
             ui.label(folder(crate::settings::config_dir().ok()))
@@ -3073,22 +3124,61 @@ fn about_page(ui: &mut egui::Ui, draft: &mut SettingsDraft, updater: &mut crate:
             let time = format_iso8601(checked).replace('T', " ").replace('Z', " UTC");
             ui.weak(format!("Last checked: {time}"));
         }
-        ui.add_space(6.0);
-        ui.weak("Updates come from the project's GitHub releases and are installed only if they carry the project's release signature. \
-            Profiles, saved passwords, bookmarks and settings are kept.");
         if !update::supported() {
+            ui.add_space(6.0);
             ui.weak("There are no release builds for this platform, so updates cannot be installed here.");
-        } else if update::build_number().is_none() {
-            ui.weak("This is a local build: it reports new versions but never replaces itself automatically.");
         }
     });
     restart
 }
 
-/// Width of a pane's Bookmarks drop-down.
-const BOOKMARK_MENU_WIDTH: f32 = 100.0;
-/// Room the address field leaves for the Bookmarks drop-down and the gap before it.
-const BOOKMARK_MENU_RESERVE: f32 = BOOKMARK_MENU_WIDTH + 12.0;
+/// Pane layout: a toolbar band (folder buttons, Filter, Recursive) above a
+/// browser group (Path, Bookmarks, the file list and its status line).
+/// The right end of both rows is a slot of the same width (Recursive /
+/// Bookmarks), so the Filter and Path boxes end at the same point.
+const PANE_HEADER_SLOT: f32 = 104.0;
+/// Space between a box and the slot to its right.
+const PANE_HEADER_GAP: f32 = 6.0;
+/// Space between a pane's toolbar band and its browser group.
+const PANE_SECTION_GAP: f32 = 6.0;
+const PANE_HEADER_BOTTOM_GAP: f32 = 5.0;
+
+/// A file pane that accepts dropped files. Unlike egui's plain drop zone it
+/// draws no outline at rest (the pane's band and group frame are its borders),
+/// only while something that can be dropped here is dragged over it.
+fn pane_drop_zone(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) -> Option<Arc<DragPayload>> {
+    let style = ui.style().clone();
+    ui.scope(|ui| {
+        // The drop zone takes its resting look from the "inactive" widget style.
+        let inactive = &mut ui.visuals_mut().widgets.inactive;
+        inactive.bg_stroke = egui::Stroke::NONE;
+        inactive.bg_fill = egui::Color32::TRANSPARENT;
+        ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::default(), |ui| {
+            // The pane's own controls keep the normal style.
+            ui.set_style(style);
+            add_contents(ui);
+        })
+        .1
+    })
+    .inner
+}
+
+/// Fixed-width slot at the right end of a pane header row (in a right-to-left layout).
+fn pane_header_slot<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let size = egui::vec2(PANE_HEADER_SLOT, ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_width(PANE_HEADER_SLOT);
+        add(ui)
+    })
+    .inner
+}
+
+/// The Filter box, filling the rest of its row (in a right-to-left layout).
+fn pane_filter_edit(ui: &mut egui::Ui, filter: &mut String) {
+    // The sunken frame adds 3 points on each side.
+    let width = (ui.available_width() - 6.0).max(20.0);
+    win32::text_edit(ui, egui::TextEdit::singleline(filter).desired_width(width));
+}
 
 /// The star button: bookmarks the pane's folder, or removes its bookmark.
 fn bookmark_button(ui: &mut egui::Ui, enabled: bool, bookmarked: bool) -> egui::Response {
@@ -3099,13 +3189,13 @@ fn bookmark_button(ui: &mut egui::Ui, enabled: bool, bookmarked: bool) -> egui::
     }
 }
 
-/// Bookmarks drop-down to the right of an address field. `current` is the
+/// Bookmarks drop-down to the right of a path field. `current` is the
 /// bookmark of the folder being shown; returns the bookmark that was picked.
 fn bookmark_menu(ui: &mut egui::Ui, id: &str, enabled: bool, labels: &[String], current: Option<usize>) -> Option<usize> {
     let mut chosen = None;
     ui.add_enabled_ui(enabled, |ui| {
         egui::ComboBox::from_id_salt(id)
-            .width(BOOKMARK_MENU_WIDTH)
+            .width(ui.available_width())
             .selected_text("Bookmarks")
             .show_ui(ui, |ui| {
                 if labels.is_empty() {
@@ -3273,9 +3363,6 @@ fn paint_list_header(ui: &mut egui::Ui, rect: egui::Rect, name_width: f32, order
     if rest > 0.0 { win32::header_cell(&mut header, rest, HEADER_HEIGHT, ""); }
     clicked
 }
-
-/// Room left next to a filter box for its "Recursive" check box.
-const RECURSIVE_WIDTH: f32 = 82.0;
 
 const RECURSIVE_TIP: &str = "Search every folder below this one for names containing the filter text, \
 instead of filtering only this folder. Results show their folder relative to this one; double-click a folder to \

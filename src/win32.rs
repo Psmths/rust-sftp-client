@@ -586,6 +586,41 @@ pub fn etched_hline(ui: &mut Ui) {
     painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), y), Pos2::new(rect.right(), y + px)), 0.0, highlight());
 }
 
+/// Inner margin of a toolbar band and of a group frame, so controls in both
+/// line up when the two are stacked.
+pub const GROUP_MARGIN: i8 = 4;
+
+/// Starts a toolbar band: a strip with a thin raised edge (like a rebar band)
+/// around a row of toolbar controls. Add to `content_ui`, then `end_band`.
+pub fn begin_band(ui: &mut Ui) -> egui::frame::Prepared {
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: GROUP_MARGIN, right: GROUP_MARGIN, top: 2, bottom: 2 })
+        .begin(ui)
+}
+
+pub fn end_band(ui: &mut Ui, band: egui::frame::Prepared) -> Response {
+    let response = band.end(ui);
+    let rect = ui.painter().round_rect_to_pixels(response.rect);
+    edge(ui.painter(), rect, highlight(), shadow());
+    response
+}
+
+/// Starts a group frame: an etched border (EDGE_ETCHED, as Win32 group boxes
+/// use) around related controls. Add to `content_ui`, then `end_group`.
+pub fn begin_group(ui: &mut Ui) -> egui::frame::Prepared {
+    egui::Frame::new().inner_margin(egui::Margin::same(GROUP_MARGIN)).begin(ui)
+}
+
+pub fn end_group(ui: &mut Ui, group: egui::frame::Prepared) -> Response {
+    let response = group.end(ui);
+    let painter = ui.painter();
+    let rect = painter.round_rect_to_pixels(response.rect);
+    let px = pixel(painter);
+    edge(painter, rect, shadow(), highlight());
+    edge(painter, rect.shrink(px), highlight(), shadow());
+    response
+}
+
 /// Panel frame with no inner stroke and the 3D face colour.
 pub fn panel_frame(margin: i8) -> egui::Frame {
     egui::Frame::new().fill(face()).inner_margin(egui::Margin::same(margin))
@@ -603,7 +638,7 @@ pub fn menu_item_style(style: &mut egui::Style) {
     }
 }
 
-/// Read-only sunken white field (e.g. an address box).
+/// Read-only sunken white field (e.g. a path box).
 pub fn field(ui: &mut Ui, text: &str) {
     field_sized(ui, text, ui.available_width());
 }
