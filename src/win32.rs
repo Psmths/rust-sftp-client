@@ -56,6 +56,7 @@ struct Palette {
     ok_green: Color32,
     error_red: Color32,
     warn_amber: Color32,
+    notice_blue: Color32,
     /// COLOR_SCROLLBAR: the scroll bar track (classic Windows dithers the
     /// highlight and button face; this is the blend). Also checked toolbar buttons.
     scroll_track: Color32,
@@ -88,6 +89,7 @@ const LIGHT_PALETTE: Palette = Palette {
     ok_green: Color32::from_rgb(0, 128, 0),
     error_red: Color32::from_rgb(170, 0, 0),
     warn_amber: Color32::from_rgb(150, 80, 0),
+    notice_blue: Color32::from_rgb(0, 70, 170),
     scroll_track: Color32::from_rgb(234, 232, 228),
     scroll_thumb: Color32::from_rgb(176, 172, 166),
     scroll_thumb_hovered: Color32::from_rgb(150, 147, 141),
@@ -114,6 +116,7 @@ const DARK_PALETTE: Palette = Palette {
     ok_green: Color32::from_rgb(110, 200, 110),
     error_red: Color32::from_rgb(240, 110, 110),
     warn_amber: Color32::from_rgb(235, 175, 70),
+    notice_blue: Color32::from_rgb(110, 165, 245),
     scroll_track: Color32::from_rgb(40, 40, 44),
     scroll_thumb: Color32::from_rgb(88, 88, 94),
     scroll_thumb_hovered: Color32::from_rgb(110, 110, 116),
@@ -145,6 +148,7 @@ pub fn selection_text() -> Color32 { palette().selection_text }
 pub fn ok_green() -> Color32 { palette().ok_green }
 pub fn error_red() -> Color32 { palette().error_red }
 pub fn warn_amber() -> Color32 { palette().warn_amber }
+pub fn notice_blue() -> Color32 { palette().notice_blue }
 pub fn scroll_track() -> Color32 { palette().scroll_track }
 pub fn queue_selection() -> Color32 { palette().queue_selection }
 pub fn grid() -> Color32 { palette().grid }
@@ -601,8 +605,13 @@ pub fn menu_item_style(style: &mut egui::Style) {
 
 /// Read-only sunken white field (e.g. an address box).
 pub fn field(ui: &mut Ui, text: &str) {
+    field_sized(ui, text, ui.available_width());
+}
+
+/// `field` with a given width.
+pub fn field_sized(ui: &mut Ui, text: &str, width: f32) {
     let height = ui.spacing().interact_size.y;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(0.0), height), Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, window());
@@ -654,6 +663,10 @@ pub enum Icon {
     HiddenItems,
     /// A folder with a green plus.
     NewFolder,
+    /// A gold star: bookmark the current folder.
+    Bookmark,
+    /// A gold star with a red minus: remove the current folder's bookmark.
+    RemoveBookmark,
 }
 
 /// Paint `icon` into `rect` (any square size; drawn on a 16-unit grid).
@@ -784,6 +797,27 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool
             fill_rect(7.5, 2.5, 16.0, 6.5, Color32::WHITE);
             fill_rect(11.0, 1.0, 13.0, 8.0, green);
             fill_rect(8.5, 3.5, 15.5, 5.5, green);
+        }
+        Icon::Bookmark | Icon::RemoveBookmark => {
+            // Five-pointed star, drawn as a fan of convex triangles around its centre.
+            let center = (8.0, 8.5);
+            let point = |k: usize| {
+                let radius = if k % 2 == 0 { 7.5 } else { 3.1 };
+                let angle = (-90.0 + 36.0 * k as f32).to_radians();
+                p(center.0 + radius * angle.cos(), center.1 + radius * angle.sin())
+            };
+            let gold = Color32::from_rgb(255, 200, 30);
+            let edge = Stroke::new(scale.max(1.0), c(Color32::from_rgb(150, 100, 0)));
+            let outline: Vec<Pos2> = (0..10).map(point).collect();
+            for k in 0..10 {
+                painter.add(egui::Shape::convex_polygon(vec![p(center.0, center.1), outline[k], outline[(k + 1) % 10]], c(gold), Stroke::NONE));
+            }
+            painter.add(egui::Shape::closed_line(outline, edge));
+            if icon == Icon::RemoveBookmark {
+                // A red minus with a white outline, like New folder's plus.
+                fill_rect(7.5, 10.0, 16.0, 15.0, Color32::WHITE);
+                fill_rect(8.5, 11.5, 15.0, 13.5, Color32::from_rgb(200, 0, 0));
+            }
         }
         Icon::HiddenItems => {
             // Almond-shaped eye with an iris and pupil.

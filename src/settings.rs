@@ -20,7 +20,8 @@ pub struct AppSettings {
     pub hide_hidden_items: bool,
     /// Local folder shown when the app starts: the one last browsed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_local_dir: Option<PathBuf>,
+    pub last_local_dir: Option<PathBuf>,    /// Bookmarked local and remote folders.
+    pub bookmarks: crate::bookmarks::Bookmarks,
 }
 
 pub fn config_dir() -> Result<PathBuf, String> {
@@ -63,5 +64,6 @@ mod tests {
         assert_eq!(parsed.network, NetworkSettings::default());
         assert_eq!(parsed.terminal, TerminalSettings::default());
         assert_eq!(parsed.last_local_dir, None);
+        assert_eq!(parsed.bookmarks, crate::bookmarks::Bookmarks::default());
     }
 }

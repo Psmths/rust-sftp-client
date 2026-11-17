@@ -9,7 +9,9 @@ Windows Classic–style interface (light or dark).
   in the system credential store, SSH host keys pinned by SHA-256 fingerprint, one tab per connection,
   and a quick-connect menu next to the Connect button.
 - **Browsing:** local and remote panes with sorting, Ctrl/Shift multi-select, filtering, recursive
-  search, show/hide hidden items, new folder, rename and delete. The local pane reopens where you left off.
+  search, show/hide hidden items, new folder, rename and delete. Bookmark folders with the star button and
+  jump back to them from the Bookmarks drop-down (remote bookmarks are kept per server login). The local
+  pane reopens where you left off.
 - **Transfers:** drag and drop or right-click to upload and download files and folders; large downloads
   are split into parallel segments and resume after interruptions. Failed transfers can be retried.
   When files exist already, a dialog lists them side by side and previews what Ignore / Overwrite /

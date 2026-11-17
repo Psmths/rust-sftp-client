@@ -301,6 +301,7 @@ impl SettingsDraft {
             units: self.units,
             hide_hidden_items: false,
             last_local_dir: None,
+            bookmarks: Default::default(),
         })
     }
 }
@@ -1296,6 +1297,13 @@ impl SftpApp {
         }
     }
 
+    /// Saves the settings after a bookmark was added or removed.
+    fn save_bookmarks(&mut self) {
+        if let Err(error) = crate::settings::save(&self.settings) {
+            self.session_mut().status = format!("Could not save bookmarks: {error}");
+        }
+    }
+
     fn show_error(&mut self, message: String) {
         self.error_message = message;
         self.dialog = Some(Dialog::Error);
@@ -1381,6 +1389,12 @@ impl SftpApp {
             if win32::icon_button(ui, true, win32::Icon::NewFolder, "New folder").clicked() {
                 self.begin_new_folder(false);
             }
+            let bookmarked = self.settings.bookmarks.is_local(&self.sessions[a].path);
+            if bookmark_button(ui, true, bookmarked).clicked() {
+                let path = self.sessions[a].path.clone();
+                self.settings.bookmarks.toggle_local(&path);
+                self.save_bookmarks();
+            }
             ui.add_space(6.0);
             ui.label("Filter:");
             win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].local_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
@@ -1404,7 +1418,14 @@ impl SftpApp {
                 .response
                 .on_hover_text("Drive");
             if let Some(path) = chosen { self.sessions[a].open_local_dir(path); }
-            win32::field(ui, &self.sessions[a].path.display().to_string());
+            let current_path = self.sessions[a].path.clone();
+            win32::field_sized(ui, &current_path.display().to_string(), ui.available_width() - BOOKMARK_MENU_RESERVE);
+            let labels: Vec<String> = self.settings.bookmarks.local.iter().map(|path| path.display().to_string()).collect();
+            let current = self.settings.bookmarks.local.iter().position(|path| *path == current_path);
+            if let Some(index) = bookmark_menu(ui, "local_bookmarks", true, &labels, current) {
+                let path = self.settings.bookmarks.local[index].clone();
+                self.sessions[a].open_local_dir(path);
+            }
         });
         ui.add_space(2.0);
 
@@ -1558,6 +1579,15 @@ impl SftpApp {
             if win32::icon_button(ui, connected, win32::Icon::NewFolder, "New folder").clicked() {
                 self.begin_new_folder(true);
             }
+            let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
+            let bookmarked = login.as_ref().is_some_and(|login| self.settings.bookmarks.is_remote(login, &self.sessions[a].remote_path));
+            if bookmark_button(ui, login.is_some(), bookmarked).clicked() {
+                if let Some(login) = login {
+                    let path = self.sessions[a].remote_path.clone();
+                    self.settings.bookmarks.toggle_remote(&login, &path);
+                    self.save_bookmarks();
+                }
+            }
             ui.add_space(6.0);
             ui.label("Filter:");
             win32::text_edit(ui, egui::TextEdit::singleline(&mut self.sessions[a].remote_filter).desired_width(ui.available_width() - RECURSIVE_WIDTH));
@@ -1565,7 +1595,14 @@ impl SftpApp {
         });
         ui.horizontal(|ui| {
             ui.label("Address:");
-            win32::field(ui, if connected { self.sessions[a].remote_path.as_str() } else { "" });
+            win32::field_sized(ui, if connected { self.sessions[a].remote_path.as_str() } else { "" }, ui.available_width() - BOOKMARK_MENU_RESERVE);
+            let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
+            let labels: Vec<String> = login.as_ref().map(|login| self.settings.bookmarks.remote_for(login).to_vec()).unwrap_or_default();
+            let showing = self.sessions[a].remote_path.trim_end_matches('/');
+            let current = labels.iter().position(|label| label.trim_end_matches('/') == showing);
+            if let Some(index) = bookmark_menu(ui, "remote_bookmarks", login.is_some(), &labels, current) {
+                self.sessions[a].navigate_remote(labels[index].clone());
+            }
         });
         ui.add_space(2.0);
 
@@ -1969,7 +2006,8 @@ impl SftpApp {
                     let color = match entry.severity {
                         crate::logging::Severity::Error => win32::error_red(),
                         crate::logging::Severity::Warning => win32::warn_amber(),
-                        _ => win32::text_color(),
+                        crate::logging::Severity::Notice => win32::notice_blue(),
+                        crate::logging::Severity::Info => win32::text_color(),
                     };
                     let time = crate::logging::iso8601_utc(entry.time);
                     let line = format!(
@@ -2632,7 +2670,8 @@ impl SftpApp {
         if apply {
             let last_local_dir = self.settings.last_local_dir.clone();
             let hide_hidden_items = self.settings.hide_hidden_items;
-            let result = self.settings_draft.parse().map(|settings| AppSettings { last_local_dir, hide_hidden_items, ..settings }).and_then(|settings| {
+            let bookmarks = self.settings.bookmarks.clone();
+            let result = self.settings_draft.parse().map(|settings| AppSettings { last_local_dir, hide_hidden_items, bookmarks, ..settings }).and_then(|settings| {
                 if settings.logging.enabled {
                     fs::create_dir_all(&settings.logging.directory)
                         .map_err(|error| format!("Cannot create log directory {}: {error}", settings.logging.directory.display()))?;
@@ -2874,6 +2913,44 @@ fn queue_panel_height(style: &egui::Style) -> f32 {
 
 /// Win32 dialog button row: right-aligned, pinned to the bottom of the dialog.
 /// Add buttons right-to-left (the default/cancel button first).
+/// Width of a pane's Bookmarks drop-down.
+const BOOKMARK_MENU_WIDTH: f32 = 100.0;
+/// Room the address field leaves for the Bookmarks drop-down and the gap before it.
+const BOOKMARK_MENU_RESERVE: f32 = BOOKMARK_MENU_WIDTH + 12.0;
+
+/// The star button: bookmarks the pane's folder, or removes its bookmark.
+fn bookmark_button(ui: &mut egui::Ui, enabled: bool, bookmarked: bool) -> egui::Response {
+    if bookmarked {
+        win32::icon_button(ui, enabled, win32::Icon::RemoveBookmark, "Remove bookmark")
+    } else {
+        win32::icon_button(ui, enabled, win32::Icon::Bookmark, "Bookmark this folder")
+    }
+}
+
+/// Bookmarks drop-down to the right of an address field. `current` is the
+/// bookmark of the folder being shown; returns the bookmark that was picked.
+fn bookmark_menu(ui: &mut egui::Ui, id: &str, enabled: bool, labels: &[String], current: Option<usize>) -> Option<usize> {
+    let mut chosen = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt(id)
+            .width(BOOKMARK_MENU_WIDTH)
+            .selected_text("Bookmarks")
+            .show_ui(ui, |ui| {
+                if labels.is_empty() {
+                    ui.weak("No bookmarks yet. Use the star button to bookmark the current folder.");
+                }
+                for (index, label) in labels.iter().enumerate() {
+                    if ui.add(egui::Button::selectable(current == Some(index), label.as_str()).wrap_mode(egui::TextWrapMode::Extend)).clicked() {
+                        chosen = Some(index);
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Go to a bookmarked folder");
+    });
+    chosen
+}
+
 fn dialog_buttons(ui: &mut egui::Ui, add_buttons: impl FnOnce(&mut egui::Ui)) {
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
