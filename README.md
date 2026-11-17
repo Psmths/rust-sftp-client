@@ -40,7 +40,7 @@ cargo build --release          # target/release/rust-sftp-client
 ```
 
 Every push to `main` is built and tested on Linux and Windows by GitHub Actions, and a release
-`v<version>-build.<run>` (e.g. `v0.4.5-build.42`) is published with both clients, the rsftp-turbo
+`v<version>-build.<run>` (e.g. `v0.5.0-build.42`) is published with both clients, the rsftp-turbo
 package and `SHA256SUMS.txt`.
 
 ## Troubleshooting

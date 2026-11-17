@@ -1,6 +1,6 @@
 [package]
 name = "rust-sftp-client"
-version = "0.4.5"
+version = "0.5.0"
 description = "A native Rust desktop SFTP client with resumable segmented downloads"
 authors = ["Psmths"]
 edition = "2021"
