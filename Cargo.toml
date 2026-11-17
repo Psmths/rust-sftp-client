@@ -1,6 +1,6 @@
 [package]
 name = "rust-sftp-client"
-version = "0.5.2"
+version = "0.5.3"
 description = "A native Rust desktop SFTP client with resumable segmented downloads"
 authors = ["Psmths"]
 edition = "2021"
@@ -32,3 +32,10 @@ keyring = "4"
 # UDP download accelerator (client side and wire protocol).
 rsftp-turbo-proto = { path = "crates/turbo-proto" }
 vt100 = "0.18"
+# Updates: GitHub release check and download, signature check (ed25519, already
+# used by russh), unpacking the Linux .tar.gz, and replacing the running program.
+ureq = "3"
+ed25519-dalek = { version = "3", default-features = false }
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+self-replace = "1"

@@ -22,6 +22,8 @@ pub struct AppSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_local_dir: Option<PathBuf>,    /// Bookmarked local and remote folders.
     pub bookmarks: crate::bookmarks::Bookmarks,
+    /// Automatic updates (on unless turned off).
+    pub updates: crate::update::UpdateSettings,
 }
 
 pub fn config_dir() -> Result<PathBuf, String> {
@@ -65,5 +67,6 @@ mod tests {
         assert_eq!(parsed.terminal, TerminalSettings::default());
         assert_eq!(parsed.last_local_dir, None);
         assert_eq!(parsed.bookmarks, crate::bookmarks::Bookmarks::default());
+        assert!(parsed.updates.automatic, "automatic updates are on by default");
     }
 }

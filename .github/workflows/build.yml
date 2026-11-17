@@ -159,11 +159,28 @@ jobs:
           sha256sum rust-sftp-client-* rsftp-turbo-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Sign checksums
+        working-directory: dist
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        # The client's updater installs a release only if SHA256SUMS.txt.sig is a
+        # valid ed25519 signature by this key (its public half is in src/update.rs).
+        run: |
+          test -n "$UPDATE_SIGNING_KEY" || { echo "::error::the UPDATE_SIGNING_KEY secret is not set"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/update-signing-key.pem"
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in SHA256SUMS.txt -out SHA256SUMS.txt.sig
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/update-signing-key.pub"
+          rm -f "$key"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/update-signing-key.pub" \
+            -in SHA256SUMS.txt -sigfile SHA256SUMS.txt.sig
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        # One release per push, e.g. tag v0.5.2-build.42 for Cargo.toml version
-        # 0.5.2 and workflow run 42. Notes list the changes since the previous
+        # One release per push, e.g. tag v0.5.3-build.42 for Cargo.toml version
+        # 0.5.3 and workflow run 42. Notes list the changes since the previous
         # release. gh uploads the assets before publishing the release.
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)

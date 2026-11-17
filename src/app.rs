@@ -142,10 +142,11 @@ enum SettingsPage {
     Algorithms,
     Terminal,
     Logging,
+    About,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 7] = [
+    const ALL: [SettingsPage; 8] = [
         SettingsPage::Appearance,
         SettingsPage::Transfers,
         SettingsPage::Segmentation,
@@ -153,6 +154,7 @@ impl SettingsPage {
         SettingsPage::Algorithms,
         SettingsPage::Terminal,
         SettingsPage::Logging,
+        SettingsPage::About,
     ];
 
     fn title(self) -> &'static str {
@@ -164,6 +166,7 @@ impl SettingsPage {
             SettingsPage::Algorithms => "SSH Algorithms",
             SettingsPage::Terminal => "SSH Terminal",
             SettingsPage::Logging => "Logging",
+            SettingsPage::About => "About",
         }
     }
 }
@@ -194,6 +197,7 @@ struct SettingsDraft {
     split_sessions: bool,
     theme: win32::Theme,
     units: crate::units::SizeUnits,
+    auto_update: bool,
     terminal_font_size: String,
     terminal_colors: TerminalColors,
     terminal_type: String,
@@ -231,6 +235,7 @@ impl SettingsDraft {
             split_sessions: logging.split_sessions,
             theme: settings.theme,
             units: settings.units,
+            auto_update: settings.updates.automatic,
             terminal_font_size: format!("{}", settings.terminal.font_size),
             terminal_colors: settings.terminal.colors,
             terminal_type: settings.terminal.terminal_type.clone(),
@@ -302,6 +307,7 @@ impl SettingsDraft {
             hide_hidden_items: false,
             last_local_dir: None,
             bookmarks: Default::default(),
+            updates: crate::update::UpdateSettings { automatic: self.auto_update },
         })
     }
 }
@@ -386,6 +392,8 @@ enum Dialog {
     ConfirmDelete,
     Rename,
     NewFolder,
+    /// An automatic update was installed; offers to restart.
+    UpdateInstalled(crate::update::Release),
 }
 
 #[derive(Clone, Debug)]
@@ -423,6 +431,9 @@ pub struct SftpApp {
     credential_tx: std_mpsc::Sender<Result<String, String>>,
     credential_rx: std_mpsc::Receiver<Result<String, String>>,
     dialog: Option<Dialog>,
+    updater: crate::update::Updater,
+    /// Installed update to announce once no other dialog is open.
+    update_notice: Option<crate::update::Release>,
     /// Session the host-key dialog belongs to.
     dialog_session: Option<u64>,
     error_message: String,
@@ -491,6 +502,8 @@ impl SftpApp {
             credential_tx,
             credential_rx,
             dialog: None,
+            updater: crate::update::Updater::default(),
+            update_notice: None,
             dialog_session: None,
             error_message: String::new(),
             settings_open: false,
@@ -1294,6 +1307,33 @@ impl SftpApp {
             self.remote_folder = profile.default_remote_path.clone().unwrap_or_default();
             self.password.clear();
             self.selected_profile = Some(index);
+        }
+    }
+
+    /// Runs the automatic update check when due, and reports what it did.
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        if self.settings.updates.automatic && crate::update::supported() && self.updater.check_due() {
+            self.updater.check(ctx, true);
+        }
+        match self.updater.poll() {
+            Some(crate::update::Notice::Installed(release)) => self.update_notice = Some(release),
+            Some(crate::update::Notice::AvailableNotInstalled(release, error)) => {
+                self.session_mut().status = format!("Version {} is available but was not installed: {error}. See Settings › About.", release.label());
+            }
+            None => {}
+        }
+        if self.dialog.is_none() {
+            if let Some(release) = self.update_notice.take() {
+                self.dialog = Some(Dialog::UpdateInstalled(release));
+            }
+        }
+    }
+
+    /// Starts the updated program and closes this one.
+    fn restart_for_update(&mut self, ctx: &egui::Context) {
+        match crate::update::restart() {
+            Ok(()) => ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close),
+            Err(error) => self.show_error(format!("Could not restart: {error}")),
         }
     }
 
@@ -2129,6 +2169,7 @@ impl SftpApp {
             Dialog::ConfirmDelete => "Confirm Delete",
             Dialog::Rename => "Rename",
             Dialog::NewFolder => "New Folder",
+            Dialog::UpdateInstalled(_) => "Update installed",
         };
         let size = match &dialog {
             // Fits the tallest form (password logon: eight rows) with 240 px fields.
@@ -2154,6 +2195,7 @@ impl SftpApp {
         let mut confirm_delete = false;
         let mut confirm_rename = false;
         let mut confirm_new_folder = false;
+        let mut restart_for_update = false;
         let mut repaint = false;
         ctx.show_viewport_immediate(id, builder, |window_ctx, _class| {
             egui::CentralPanel::default().show(window_ctx, |ui| {
@@ -2294,6 +2336,21 @@ impl SftpApp {
                             if win32::button_sized(ui, true, "Trust and continue", 75.0).clicked() { accept_trust = true; }
                         });
                     }
+                    Dialog::UpdateInstalled(release) => {
+                        ui.add_space(4.0);
+                        ui.horizontal_top(|ui| {
+                            win32::message_icon(ui, win32::Icon::Information);
+                            ui.add_space(10.0);
+                            ui.add(egui::Label::new(format!(
+                                "Rust SFTP Client {} has been installed.\n\nRestart now to use it, or it starts the next time you open the program. Restarting closes all connections and stops transfers in progress.",
+                                release.label()
+                            )).wrap());
+                        });
+                        dialog_buttons(ui, |ui| {
+                            if win32::button_sized(ui, true, "Restart now", 90.0).clicked() { restart_for_update = true; close = true; }
+                            if win32::button_sized(ui, true, "Later", 75.0).clicked() { close = true; }
+                        });
+                    }
                     Dialog::Error => {
                         ui.label(&self.error_message);
                         dialog_buttons(ui, |ui| {
@@ -2375,6 +2432,9 @@ impl SftpApp {
         if confirm_new_folder && self.perform_new_folder() {
             self.dialog = None;
         }
+        if restart_for_update {
+            self.restart_for_update(ctx);
+        }
         if save { self.save_profile(); }
         if connect {
             self.connect_with_form();
@@ -2404,6 +2464,7 @@ impl SftpApp {
             .with_min_inner_size([520.0, 300.0]);
         let mut close = false;
         let mut apply = false;
+        let mut restart_for_update = false;
         ctx.show_viewport_immediate(id, builder, |window_ctx, _| {
             egui::CentralPanel::default().show(window_ctx, |ui| {
                 let body_height = (ui.available_height() - 40.0).max(120.0);
@@ -2509,6 +2570,9 @@ impl SftpApp {
                                 ui.add_space(6.0);
                                 ui.weak("Units apply to file sizes, transfer speeds, the transfer queue and the statistics.");
                                 ui.weak("Both apply to every window as soon as you click OK or Apply.");
+                            }
+                            SettingsPage::About => {
+                                restart_for_update = about_page(ui, draft, &mut self.updater, &self.settings);
                             }
                             SettingsPage::Algorithms => {
                                 let tabs = AlgorithmKind::ALL.map(|kind| (kind, kind.label().to_owned()));
@@ -2667,6 +2731,9 @@ impl SftpApp {
             });
             if window_ctx.input(|input| input.viewport().close_requested()) { close = true; }
         });
+        if restart_for_update {
+            self.restart_for_update(ctx);
+        }
         if apply {
             let last_local_dir = self.settings.last_local_dir.clone();
             let hide_hidden_items = self.settings.hide_hidden_items;
@@ -2711,6 +2778,7 @@ impl eframe::App for SftpApp {
         self.poll_ops();
         self.poll_password_lookup();
         self.poll_credentials();
+        self.poll_updates(ctx);
         let show_hidden = !self.settings.hide_hidden_items;
         for session in &mut self.sessions {
             session.show_hidden = show_hidden;
@@ -2913,6 +2981,110 @@ fn queue_panel_height(style: &egui::Style) -> f32 {
 
 /// Win32 dialog button row: right-aligned, pinned to the bottom of the dialog.
 /// Add buttons right-to-left (the default/cancel button first).
+/// Settings › About: the program, where it keeps its files, and updates.
+/// Returns true when "Restart now" was clicked.
+fn about_page(ui: &mut egui::Ui, draft: &mut SettingsDraft, updater: &mut crate::update::Updater, settings: &AppSettings) -> bool {
+    use crate::update::{self, Status};
+    let mut restart = false;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Rust SFTP Client").strong().size(16.0));
+        ui.label("A dual-pane SFTP client for Windows and Linux, with an SSH terminal and optional UDP-accelerated downloads through the rsftp-turbo server helper.");
+        ui.add_space(6.0);
+        let folder = |path: Option<std::path::PathBuf>| path.map(|path| path.display().to_string()).unwrap_or_else(|| "unknown".into());
+        egui::Grid::new("about_info").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label("Version:");
+            ui.label(version_text());
+            ui.end_row();
+            ui.label("Platform:");
+            ui.label(format!("{} {}", std::env::consts::OS, std::env::consts::ARCH));
+            ui.end_row();
+            ui.label("Program file:");
+            ui.label(folder(update::program_path().map(std::path::Path::to_path_buf)));
+            ui.end_row();
+            ui.label("Settings folder:");
+            ui.label(folder(crate::settings::config_dir().ok()))
+                .on_hover_text("Connection profiles, settings, bookmarks and trusted host keys. Saved passwords are in the system's credential store.");
+            ui.end_row();
+            ui.label("Log folder:");
+            ui.label(settings.logging.directory.display().to_string());
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.hyperlink_to("Project page", update::PROJECT_URL);
+            ui.label("·");
+            ui.hyperlink_to("All releases", update::RELEASES_URL);
+            ui.label("·");
+            ui.hyperlink_to("Report a problem", update::ISSUES_URL);
+        });
+
+        ui.add_space(10.0);
+        ui.strong("Updates");
+        win32::etched_hline(ui);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut draft.auto_update, "Install updates automatically");
+            win32::info_tip(ui, "Checks GitHub for a new version at startup and once a day, and installs it in the background. \
+                The new version starts the next time the program is opened (or right away if you choose to restart). \
+                Takes effect when you click OK or Apply.");
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let ctx = ui.ctx().clone();
+            let enabled = !updater.busy() && !matches!(updater.status, Status::Installed(_));
+            if win32::button_sized(ui, enabled, "Check for updates", 130.0).clicked() {
+                updater.check(&ctx, false);
+            }
+            match &updater.status {
+                Status::Idle => { ui.weak("Not checked yet."); }
+                Status::Checking => { ui.spinner(); ui.label("Checking…"); }
+                Status::UpToDate => { ui.label("You have the latest version."); }
+                Status::Available(release) => { ui.label(format!("Version {} is available.", release.label())); }
+                Status::Installing(release) => { ui.spinner(); ui.label(format!("Downloading and verifying {}…", release.label())); }
+                Status::Installed(release) => { ui.label(format!("Version {} is installed. Restart to use it.", release.label())); }
+                Status::Failed(_) => { ui.colored_label(win32::error_red(), "The last update failed."); }
+            }
+        });
+        match &updater.status {
+            Status::Available(release) => {
+                let release = release.clone();
+                ui.horizontal(|ui| {
+                    if update::supported() && win32::button_sized(ui, true, "Install update", 130.0).clicked() {
+                        updater.install(ui.ctx());
+                    }
+                    ui.hyperlink_to("Release notes", &release.url);
+                });
+            }
+            Status::Installed(release) => {
+                let url = release.url.clone();
+                ui.horizontal(|ui| {
+                    if win32::button_sized(ui, true, "Restart now", 130.0).clicked() {
+                        restart = true;
+                    }
+                    ui.hyperlink_to("Release notes", url);
+                });
+            }
+            Status::Failed(error) => {
+                ui.add(egui::Label::new(egui::RichText::new(error).color(win32::error_red())).wrap());
+            }
+            _ => {}
+        }
+        if let Some(checked) = updater.last_checked {
+            let time = format_iso8601(checked).replace('T', " ").replace('Z', " UTC");
+            ui.weak(format!("Last checked: {time}"));
+        }
+        ui.add_space(6.0);
+        ui.weak("Updates come from the project's GitHub releases and are installed only if they carry the project's release signature. \
+            Profiles, saved passwords, bookmarks and settings are kept.");
+        if !update::supported() {
+            ui.weak("There are no release builds for this platform, so updates cannot be installed here.");
+        } else if update::build_number().is_none() {
+            ui.weak("This is a local build: it reports new versions but never replaces itself automatically.");
+        }
+    });
+    restart
+}
+
 /// Width of a pane's Bookmarks drop-down.
 const BOOKMARK_MENU_WIDTH: f32 = 100.0;
 /// Room the address field leaves for the Bookmarks drop-down and the gap before it.

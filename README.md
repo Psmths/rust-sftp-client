@@ -27,6 +27,11 @@ Windows Classic–style interface (light or dark).
 - **Settings:** transfer and network tuning, SSH algorithms (key exchange, ciphers, MACs, host keys), terminal options, logging to files, theme, and size units (binary, decimal,
   or speeds in bits).
 
+- **Automatic updates:** new versions are downloaded from this project's GitHub releases and installed
+  in the background (the new version starts at the next launch, or right away after a restart). An update
+  is installed only if its checksums carry the project's ed25519 release signature. Turn it off, or check
+  by hand, in Settings › About, which also shows the version and where settings and logs are kept.
+
 ## Faster downloads with rsftp-turbo (optional)
 
 `rsftp-turbo` is a small server helper that downloads files over UDP instead of SFTP and lists folders in
