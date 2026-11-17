@@ -1,6 +1,6 @@
 [package]
 name = "rsftp-turbo"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Server-side UDP download accelerator for Rust SFTP Client"
 publish = false
