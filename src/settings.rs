@@ -13,7 +13,8 @@ pub struct AppSettings {
     pub network: NetworkSettings,
     pub logging: LoggingSettings,
     pub terminal: TerminalSettings,
-    pub theme: crate::win32::Theme,
+    /// Rosé Pine, Rosé Pine Moon or Rosé Pine Dawn.
+    pub theme: crate::theme::Theme,
     /// How sizes and speeds are written.
     pub units: crate::units::SizeUnits,
     /// Hide dot files (and, on Windows, files marked hidden) in both panes.

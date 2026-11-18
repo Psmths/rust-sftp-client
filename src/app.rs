@@ -22,7 +22,7 @@ use crate::settings::AppSettings;
 use crate::transfer::TransferSettings;
 use crate::places::{self, Drive};
 use crate::terminal::{Terminal, TerminalColors, TerminalSettings, TERMINAL_TYPES};
-use crate::win32;
+use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HashAlgorithm {
@@ -195,7 +195,7 @@ struct SettingsDraft {
     log_transfers: bool,
     log_directory: String,
     split_sessions: bool,
-    theme: win32::Theme,
+    theme: theme::Theme,
     units: crate::units::SizeUnits,
     auto_update: bool,
     terminal_font_size: String,
@@ -413,6 +413,10 @@ pub struct SftpApp {
     next_session_id: u64,
     drives: Vec<Drive>,
     saved_profiles: Vec<ConnectionProfile>,
+    /// Sidebar: filter text and which sections are expanded.
+    sidebar_filter: String,
+    sidebar_active_open: bool,
+    sidebar_saved_open: bool,
     selected_profile: Option<usize>,
     host: String,
     port: String,
@@ -462,7 +466,7 @@ pub struct SftpApp {
 impl SftpApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = crate::settings::load();
-        win32::apply(&cc.egui_ctx, settings.theme);
+        theme::apply(&cc.egui_ctx, settings.theme);
         crate::units::set(settings.units);
         // Open where the user left off; the home folder the first time (or if it is gone).
         let path = settings
@@ -488,6 +492,9 @@ impl SftpApp {
             next_session_id: 1,
             drives: places::list(),
             saved_profiles: load_profiles(),
+            sidebar_filter: String::new(),
+            sidebar_active_open: true,
+            sidebar_saved_open: true,
             selected_profile: None,
             host: String::new(),
             port: "22".into(),
@@ -1085,22 +1092,22 @@ impl SftpApp {
                         prepared.targets[file].is_some_and(|target| action.overwrites(&plan.files[file], &target))
                     })
                     .count();
-                let colors = ConflictColors::new(ui.visuals().dark_mode);
+                let colors = ConflictColors::new();
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.colored_label(colors.replaced_text, format!("■ {overwritten} overwritten"));
                     ui.label("·");
-                    ui.colored_label(win32::gray_text(), format!("■ {} kept", conflicts.len() - overwritten));
+                    ui.colored_label(theme::muted(), format!("■ {} kept", conflicts.len() - overwritten));
                     ui.label("·");
                     ui.colored_label(colors.new_text, format!("■ {} new file(s) transferred", prompt.new_files()));
                     ui.label("·");
-                    ui.colored_label(win32::warn_amber(), "values that differ");
+                    ui.colored_label(theme::warn_amber(), "values that differ");
                 });
                 ui.add_space(4.0);
 
                 let footer = 64.0;
                 let list_height = (ui.available_height() - footer).max(120.0);
-                win32::list_view(ui, list_height, |ui| {
+                theme::list_view(ui, list_height, |ui| {
                     let header_height = 19.0;
                     let row_height = 18.0;
                     let direction_width = 22.0;
@@ -1110,18 +1117,18 @@ impl SftpApp {
                     let fixed = direction_width + 2.0 * (size_width + time_width) + result_width;
                     let name_width = (ui.available_width() - fixed - ui.spacing().scroll.bar_width).max(160.0);
                     ui.horizontal(|ui| {
-                        win32::header_cell(ui, direction_width, header_height, "");
-                        win32::header_cell(ui, name_width, header_height, "Name");
-                        win32::header_cell(ui, size_width, header_height, "Local size");
-                        win32::header_cell(ui, time_width, header_height, "Local modified");
-                        win32::header_cell(ui, size_width, header_height, "Remote size");
-                        win32::header_cell(ui, time_width, header_height, "Remote modified");
-                        win32::header_cell(ui, result_width, header_height, "Result");
+                        theme::header_cell(ui, direction_width, header_height, "");
+                        theme::header_cell(ui, name_width, header_height, "Name");
+                        theme::header_cell(ui, size_width, header_height, "Local size");
+                        theme::header_cell(ui, time_width, header_height, "Local modified");
+                        theme::header_cell(ui, size_width, header_height, "Remote size");
+                        theme::header_cell(ui, time_width, header_height, "Remote modified");
+                        theme::header_cell(ui, result_width, header_height, "Result");
                         let rest = ui.available_width();
-                        if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
+                        if rest > 0.0 { theme::header_cell(ui, rest, header_height, ""); }
                     });
                     let area = egui::ScrollArea::vertical().id_salt("conflict_list").auto_shrink([false, false]);
-                    win32::scroll_rows(ui, area, row_height, conflicts.len(), |ui, range| {
+                    theme::scroll_rows(ui, area, row_height, conflicts.len(), |ui, range| {
                         for &(job, file) in &conflicts[range] {
                             let prepared = &prompt.jobs[job];
                             let plan = prepared.plan.as_ref().expect("conflicts come from a plan");
@@ -1145,8 +1152,8 @@ impl SftpApp {
                                     (true, true) => (Some(colors.replaced), Some(colors.new)),
                                     (true, false) => (Some(colors.new), Some(colors.replaced)),
                                 };
-                                let text = if overwrite { win32::text_color() } else { win32::gray_text() };
-                                let differs = |differ: bool| if differ { win32::warn_amber() } else { text };
+                                let text = if overwrite { theme::text_color() } else { theme::muted() };
+                                let differs = |differ: bool| if differ { theme::warn_amber() } else { text };
                                 conflict_cell(ui, direction_width, row_height, if download { "↓" } else { "↑" }, None, text, false);
                                 conflict_cell(ui, name_width, row_height, &conflict_name(prepared, &source.local), None, text, false);
                                 let sides = [(local, local_fill), (remote, remote_fill)];
@@ -1157,7 +1164,7 @@ impl SftpApp {
                                 let (result, color) = if overwrite {
                                     (if download { "Overwrite local" } else { "Overwrite remote" }, colors.replaced_text)
                                 } else {
-                                    ("Keep", win32::gray_text())
+                                    ("Keep", theme::muted())
                                 };
                                 conflict_cell(ui, result_width, row_height, result, None, color, false);
                             });
@@ -1167,8 +1174,8 @@ impl SftpApp {
                 ui.add_space(6.0);
                 ui.checkbox(&mut prompt.remember, "Apply this decision to all further conflicts in this session");
                 dialog_buttons(ui, |ui| {
-                    if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { decision = Some(false); }
-                    if win32::button_sized(ui, true, "OK", 75.0).clicked() { decision = Some(true); }
+                    if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { decision = Some(false); }
+                    if theme::button_sized(ui, true, "OK", 75.0).clicked() { decision = Some(true); }
                 });
             });
             if window_ctx.input(|input| input.viewport().close_requested()) {
@@ -1202,7 +1209,7 @@ impl SftpApp {
                 egui::CentralPanel::default().show(window_ctx, |ui| {
                     egui::Grid::new("hash_fields").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                         ui.label("File:");
-                        win32::field(ui, &job.location);
+                        theme::field(ui, &job.location);
                         ui.end_row();
                         ui.label("Algorithm:");
                         ui.label(job.algorithm.label());
@@ -1213,19 +1220,19 @@ impl SftpApp {
                                 let done = job.done.load(Ordering::Relaxed);
                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
                                 let painter = ui.painter();
-                                painter.rect_filled(rect, 0.0, win32::window());
-                                win32::thin_sunken(painter, rect);
+                                painter.rect_filled(rect, 0.0, theme::ground());
+                                theme::outline(painter, rect);
                                 let total = job.total.max(1);
                                 let piece = Piece { start: 0, end: total, done: done.min(total), failed: false };
-                                paint_piece_bar(painter, rect.shrink(1.0), total, &[piece], PIECE_FILL);
+                                paint_piece_bar(painter, rect.shrink(1.0), total, &[piece], theme::pine());
                             }
                             Some(Ok(hash)) => {
                                 let mut text = hash.as_str();
-                                win32::text_edit(ui, egui::TextEdit::singleline(&mut text)
+                                theme::text_edit(ui, egui::TextEdit::singleline(&mut text)
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(f32::INFINITY));
                             }
-                            Some(Err(error)) => { ui.colored_label(win32::error_red(), error); }
+                            Some(Err(error)) => { ui.colored_label(theme::error_red(), error); }
                         }
                         ui.end_row();
                     });
@@ -1236,12 +1243,12 @@ impl SftpApp {
                     dialog_buttons(ui, |ui| {
                         match &job.result {
                             None => {
-                                if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                                if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
                             }
                             Some(result) => {
-                                if win32::button_sized(ui, true, "Close", 75.0).clicked() { close = true; }
+                                if theme::button_sized(ui, true, "Close", 75.0).clicked() { close = true; }
                                 if let Ok(hash) = result {
-                                    if win32::button_sized(ui, true, "Copy", 75.0).clicked() { ui.ctx().copy_text(hash.clone()); }
+                                    if theme::button_sized(ui, true, "Copy", 75.0).clicked() { ui.ctx().copy_text(hash.clone()); }
                                 }
                             }
                         }
@@ -1416,19 +1423,19 @@ impl SftpApp {
         let a = self.active;
         let connected = self.sessions[a].connection.is_some();
         // Toolbar band: folder buttons, filter and Recursive.
-        let mut band = win32::begin_band(ui);
+        let mut band = theme::begin_band(ui);
         {
             let ui = &mut band.content_ui;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if win32::icon_button(ui, self.sessions[a].path.parent().is_some(), win32::Icon::Up, "Up one level").clicked() {
+                if theme::icon_button(ui, self.sessions[a].path.parent().is_some(), theme::Icon::Up, "Up one level").clicked() {
                     if let Some(parent) = self.sessions[a].path.parent().map(PathBuf::from) { self.sessions[a].open_local_dir(parent); }
                 }
-                if win32::icon_button(ui, true, win32::Icon::Refresh, "Refresh").clicked() {
+                if theme::icon_button(ui, true, theme::Icon::Refresh, "Refresh").clicked() {
                     self.drives = places::list();
                     self.sessions[a].refresh_local();
                 }
-                if win32::icon_button(ui, true, win32::Icon::NewFolder, "New folder").clicked() {
+                if theme::icon_button(ui, true, theme::Icon::NewFolder, "New folder").clicked() {
                     self.begin_new_folder(false);
                 }
                 let bookmarked = self.settings.bookmarks.is_local(&self.sessions[a].path);
@@ -1437,7 +1444,7 @@ impl SftpApp {
                     self.settings.bookmarks.toggle_local(&path);
                     self.save_bookmarks();
                 }
-                win32::toolbar_separator(ui);
+                theme::toolbar_separator(ui);
                 ui.label("Filter:");
                 // The toolbar packs its buttons 2 points apart; give the label the Path row's gap.
                 ui.add_space(2.0);
@@ -1450,11 +1457,11 @@ impl SftpApp {
                 });
             });
         }
-        win32::end_band(ui, band);
+        theme::end_band(ui, band);
         ui.add_space(PANE_SECTION_GAP);
 
         // Browser group: path, bookmarks, the file list and its status line.
-        let mut group = win32::begin_group(ui);
+        let mut group = theme::begin_group(ui);
         {
             let ui = &mut group.content_ui;
             ui.horizontal(|ui| {
@@ -1481,7 +1488,7 @@ impl SftpApp {
                 let picked = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let picked = pane_header_slot(ui, |ui| bookmark_menu(ui, "local_bookmarks", true, &labels, current));
                     ui.add_space(PANE_HEADER_GAP);
-                    win32::field_sized(ui, &current_path.display().to_string(), ui.available_width());
+                    theme::field_sized(ui, &current_path.display().to_string(), ui.available_width());
                     picked
                 }).inner;
                 if let Some(index) = picked {
@@ -1518,9 +1525,9 @@ impl SftpApp {
             let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
             let mut sort_click = None;
             let mut background_new_folder = false;
-            win32::list_view(ui, list_height, |ui| {
+            theme::list_view(ui, list_height, |ui| {
                 let (name_width, header) = reserve_list_header(ui);
-                win32::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
+                theme::scroll(ui, file_list_scroll(("local_list", self.sessions[a].id)), |ui| {
                     for entry in rows {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1565,7 +1572,7 @@ impl SftpApp {
                                         (true, false) => "Upload to remote".to_owned(),
                                         (false, _) => "Upload to remote (not connected)".to_owned(),
                                     };
-                                    action = row_context_menu(ui, entry.dir, &label, connected, count == 1, count == 1);
+                                    action = row_context_menu(ui, entry.dir, &label, connected, true, count == 1, count == 1);
                                 });
                             }
                             let targets = || -> Vec<LocalEntry> {
@@ -1610,7 +1617,7 @@ impl SftpApp {
             }
             ui.label(footer);
         }
-        win32::end_group(ui, group);
+        theme::end_group(ui, group);
     }
 
     fn remote_pane(&mut self, ui: &mut egui::Ui) {
@@ -1629,20 +1636,20 @@ impl SftpApp {
         let a = self.active;
         let connected = self.sessions[a].connection.is_some();
         // Toolbar band: folder buttons, filter and Recursive.
-        let mut band = win32::begin_band(ui);
+        let mut band = theme::begin_band(ui);
         {
             let ui = &mut band.content_ui;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if win32::icon_button(ui, connected, win32::Icon::Up, "Up one level").clicked() {
+                if theme::icon_button(ui, connected, theme::Icon::Up, "Up one level").clicked() {
                     let parent = remote_parent(&self.sessions[a].remote_path);
                     self.sessions[a].navigate_remote(parent);
                 }
-                if win32::icon_button(ui, connected, win32::Icon::Refresh, "Refresh").clicked() {
+                if theme::icon_button(ui, connected, theme::Icon::Refresh, "Refresh").clicked() {
                     let path = self.sessions[a].remote_path.clone();
                     self.sessions[a].load_remote(&path);
                 }
-                if win32::icon_button(ui, connected, win32::Icon::NewFolder, "New folder").clicked() {
+                if theme::icon_button(ui, connected, theme::Icon::NewFolder, "New folder").clicked() {
                     self.begin_new_folder(true);
                 }
                 let login = self.sessions[a].profile.as_ref().filter(|_| connected).map(crate::credentials::key);
@@ -1654,7 +1661,7 @@ impl SftpApp {
                         self.save_bookmarks();
                     }
                 }
-                win32::toolbar_separator(ui);
+                theme::toolbar_separator(ui);
                 ui.label("Filter:");
                 // The toolbar packs its buttons 2 points apart; give the label the Path row's gap.
                 ui.add_space(2.0);
@@ -1667,11 +1674,11 @@ impl SftpApp {
                 });
             });
         }
-        win32::end_band(ui, band);
+        theme::end_band(ui, band);
         ui.add_space(PANE_SECTION_GAP);
 
         // Browser group: path, bookmarks, the file list and its status line.
-        let mut group = win32::begin_group(ui);
+        let mut group = theme::begin_group(ui);
         {
             let ui = &mut group.content_ui;
             ui.horizontal(|ui| {
@@ -1684,7 +1691,7 @@ impl SftpApp {
                 let picked = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let picked = pane_header_slot(ui, |ui| bookmark_menu(ui, "remote_bookmarks", login.is_some(), &labels, current));
                     ui.add_space(PANE_HEADER_GAP);
-                    win32::field_sized(ui, &path_text, ui.available_width());
+                    theme::field_sized(ui, &path_text, ui.available_width());
                     picked
                 }).inner;
                 if let Some(index) = picked {
@@ -1716,24 +1723,21 @@ impl SftpApp {
             }
             let mut open_dir = None;
             let order: Vec<String> = rows.iter().filter(|entry| entry.name != "..").map(|entry| entry.path.clone()).collect();
-            let mut open_profiles = false;
             let mut sort_click = None;
             let mut background_new_folder = false;
             let list_height = (ui.available_height() - FOOTER_HEIGHT).max(60.0);
-            win32::list_view(ui, list_height, |ui| {
+            theme::list_view(ui, list_height, |ui| {
                 let (name_width, header) = reserve_list_header(ui);
                 if !connected {
                     ui.vertical_centered(|ui| {
                         ui.add_space(60.0);
                         ui.label("Not connected to a server.");
-                        ui.weak("Connect to an SSH server to browse remote files.");
-                        ui.add_space(8.0);
-                        if win32::button_sized(ui, true, "Connect…", 75.0).clicked() { open_profiles = true; }
+                        ui.weak("Choose a saved session in the sidebar to browse remote files.");
                     });
                     paint_list_header(ui, header, name_width, self.sessions[a].remote_sort);
                     return;
                 }
-                win32::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
+                theme::scroll(ui, file_list_scroll(("remote_list", self.sessions[a].id)), |ui| {
                     for entry in rows {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
@@ -1773,7 +1777,7 @@ impl SftpApp {
                                 response.context_menu(|ui| {
                                     let label = if count > 1 { format!("Download {count} items") } else { "Download".to_owned() };
                                     // Hashing is local-only: a remote hash would have to download the file.
-                                    action = row_context_menu(ui, entry.dir, &label, true, count == 1, false);
+                                    action = row_context_menu(ui, entry.dir, &label, true, false, count == 1, false);
                                 });
                             }
                             let targets = || -> Vec<RemoteEntry> {
@@ -1813,17 +1817,16 @@ impl SftpApp {
                 if searching { self.sessions[a].remote_filter.clear(); }
                 self.sessions[a].navigate_remote(path);
             }
-            if open_profiles { self.dialog = Some(Dialog::Profiles); }
             ui.label(footer);
         }
-        win32::end_group(ui, group);
+        theme::end_group(ui, group);
     }
 
     /// Transfer rows of one queue tab (pending, complete or failed).
     fn transfer_list_tab(&mut self, ui: &mut egui::Ui, tab: QueueTab) {
         let a = self.active;
         let list_height = ui.available_height().max(40.0);
-        win32::list_view(ui, list_height, |ui| {
+        theme::list_view(ui, list_height, |ui| {
             let file_width = 220.0;
             let protocol_width = 70.0;
             let percent_width = 80.0;
@@ -1835,15 +1838,15 @@ impl SftpApp {
             let fixed = file_width + protocol_width + percent_width + speed_width + elapsed_width + remaining_width;
             let progress_width = (ui.available_width() - fixed - ui.spacing().scroll.bar_width).max(160.0);
             ui.horizontal(|ui| {
-                win32::header_cell(ui, file_width, header_height, "File");
-                win32::header_cell(ui, protocol_width, header_height, "Protocol");
-                win32::header_cell(ui, progress_width, header_height, "Progress");
-                win32::header_cell(ui, percent_width, header_height, "Complete");
-                win32::header_cell(ui, speed_width, header_height, "Speed");
-                win32::header_cell(ui, elapsed_width, header_height, "Elapsed");
-                win32::header_cell(ui, remaining_width, header_height, "Remaining");
+                theme::header_cell(ui, file_width, header_height, "File");
+                theme::header_cell(ui, protocol_width, header_height, "Protocol");
+                theme::header_cell(ui, progress_width, header_height, "Progress");
+                theme::header_cell(ui, percent_width, header_height, "Complete");
+                theme::header_cell(ui, speed_width, header_height, "Speed");
+                theme::header_cell(ui, elapsed_width, header_height, "Elapsed");
+                theme::header_cell(ui, remaining_width, header_height, "Remaining");
                 let rest = ui.available_width();
-                if rest > 0.0 { win32::header_cell(ui, rest, header_height, ""); }
+                if rest > 0.0 { theme::header_cell(ui, rest, header_height, ""); }
             });
             // Rows of this tab in display order, with their depth: transfers,
             // each expanded folder followed by its files. Only the rows in
@@ -1856,7 +1859,7 @@ impl SftpApp {
             let mut stop = None;
             // Some(Some(id)): retry that row; Some(None): retry every failed row.
             let mut retry = None;
-            win32::scroll_rows(ui, area, row_height, visible.len().max(1), |ui, range| {
+            theme::scroll_rows(ui, area, row_height, visible.len().max(1), |ui, range| {
                 let session = &self.sessions[a];
                 let any_active = session.has_active_operations();
                 let failed_count = session.transfers.iter()
@@ -1907,7 +1910,7 @@ impl SftpApp {
                         egui::vec2(ui.available_width(), row_height), egui::Sense::click()
                     );
                     if session.selected_transfer == Some(item.id) {
-                        ui.painter().rect_filled(row_rect, 0.0, win32::queue_selection());
+                        ui.painter().rect_filled(row_rect, 0.0, theme::queue_selection());
                     }
                     if row_response.clicked() || row_response.secondary_clicked() {
                         select = Some(item.id);
@@ -1918,7 +1921,7 @@ impl SftpApp {
                     // Rows of a folder transfer stop the whole folder transfer.
                     let operation = item.operation_id.unwrap_or(item.id);
                     row_response.context_menu(|ui| {
-                        win32::menu_item_style(ui.style_mut());
+                        theme::menu_item_style(ui.style_mut());
                         if item.folder {
                             if ui.button(if item.expanded { "Collapse" } else { "Expand" }).clicked() {
                                 toggle = Some(item.id);
@@ -1966,8 +1969,8 @@ impl SftpApp {
                         );
                         let bar_rect = cell_rect.shrink2(egui::vec2(4.0, 2.0));
                         let painter = ui.painter();
-                        painter.rect_filled(bar_rect, 0.0, win32::window());
-                        win32::thin_sunken(painter, bar_rect);
+                        painter.rect_filled(bar_rect, 0.0, theme::ground());
+                        theme::outline(painter, bar_rect);
                         let bar_rect = bar_rect.shrink(1.0);
                         let failed = item.state.starts_with("Failed");
                         let complete = item.state == "Complete";
@@ -1988,11 +1991,11 @@ impl SftpApp {
                         };
                         let total = if item.segments.is_empty() || item.total == 0 { item.total.max(1) } else { item.total };
                         let fill = if complete {
-                            win32::ok_green()
+                            theme::ok_green()
                         } else if item.state == "Cancelled" {
-                            win32::shadow()
+                            theme::rule_strong()
                         } else {
-                            PIECE_FILL
+                            theme::pine()
                         };
                         paint_piece_bar(painter, bar_rect, total, &pieces, fill);
                         if response.hovered() {
@@ -2035,7 +2038,7 @@ impl SftpApp {
                 if top < clip.bottom() - 1.0 {
                     let filler = egui::Rect::from_min_max(egui::pos2(clip.left(), top), egui::pos2(clip.right(), clip.bottom() - 1.0));
                     ui.allocate_rect(filler, egui::Sense::click()).context_menu(|ui| {
-                        win32::menu_item_style(ui.style_mut());
+                        theme::menu_item_style(ui.style_mut());
                         if let Some(action) = tab_menu(ui) {
                             tab_action = Some(action);
                         }
@@ -2074,11 +2077,126 @@ impl SftpApp {
     }
 
     /// The selected session's log lines (kept in memory whether or not file logging is on).
+    /// Left sidebar: active sessions (one per connection) and saved sessions
+    /// (connection profiles), with a filter for both.
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        let mut switch_to = None;
+        let mut close = None;
+        let mut connect = None;
+        let mut connect_new = None;
+        let mut edit = None;
+        let mut add_active = false;
+        let mut add_saved = false;
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(SIDEBAR_WIDTH)
+            .width_range(180.0..=420.0)
+            .frame(theme::panel_frame(0).inner_margin(egui::Margin::symmetric(8, 8)))
+            .show(ctx, |ui| {
+                theme::text_edit(ui, egui::TextEdit::singleline(&mut self.sidebar_filter)
+                    .hint_text("Filter sessions")
+                    .desired_width(ui.available_width() - 6.0));
+                ui.add_space(8.0);
+                let filter = self.sidebar_filter.trim().to_lowercase();
+                let matches = |name: &str, detail: &str| {
+                    filter.is_empty() || name.to_lowercase().contains(&filter) || detail.to_lowercase().contains(&filter)
+                };
+                let area = egui::ScrollArea::vertical().id_salt("sidebar_lists").auto_shrink([false, false]);
+                theme::scroll(ui, area, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    if sidebar_section(ui, "Active sessions", &mut self.sidebar_active_open, "Connect to a server", &mut add_active) {
+                        // Only connections (and connections being made) are sessions; the
+                        // tab that just browses local files is not listed.
+                        let live = |session: &&Session| session.is_connected() || session.is_connecting();
+                        if !self.sessions.iter().any(|session| live(&session)) {
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(8.0);
+                                ui.weak("No active sessions.");
+                            });
+                        }
+                        for (index, session) in self.sessions.iter().enumerate().filter(|(_, session)| live(session)) {
+                            let (name, detail) = session_labels(session);
+                            if !matches(&name, &detail) { continue; }
+                            let row = sidebar_row(ui, ("active", session.id), &name, &detail, session_dot(session), index == self.active, true);
+                            if row.close { close = Some(index); } else if row.clicked { switch_to = Some(index); }
+                        }
+                    }
+                    ui.add_space(10.0);
+                    if sidebar_section(ui, "Saved sessions", &mut self.sidebar_saved_open, "New saved session", &mut add_saved) {
+                        if self.saved_profiles.is_empty() {
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(8.0);
+                                ui.weak("No saved sessions yet. Click + to add one.");
+                            });
+                        }
+                        for (index, profile) in self.saved_profiles.iter().enumerate() {
+                            let detail = format!("{}@{}:{}", profile.username, profile.host, profile.port);
+                            if !matches(&profile.name, &detail) { continue; }
+                            // A session already open for this profile, if any.
+                            let open = self.sessions.iter().position(|session| {
+                                (session.is_connected() || session.is_connecting())
+                                    && session.profile.as_ref().is_some_and(|open| open.name == profile.name && open.host == profile.host && open.port == profile.port && open.username == profile.username)
+                            });
+                            let dot = open.map_or(SessionDot::Idle, |index| session_dot(&self.sessions[index]));
+                            let row = sidebar_row(ui, ("saved", index), &profile.name, &detail, dot, false, false);
+                            if row.clicked {
+                                match open {
+                                    Some(index) => switch_to = Some(index),
+                                    None => connect = Some(index),
+                                }
+                            }
+                            row.response.context_menu(|ui| {
+                                theme::menu_item_style(ui.style_mut());
+                                ui.set_min_width(170.0);
+                                if ui.button(if open.is_some() { "Go to session" } else { "Connect" }).clicked() {
+                                    match open {
+                                        Some(index) => switch_to = Some(index),
+                                        None => connect = Some(index),
+                                    }
+                                    ui.close();
+                                }
+                                if ui.button("Connect in a new session").clicked() {
+                                    connect_new = Some(index);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Edit…").clicked() {
+                                    edit = Some(index);
+                                    ui.close();
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        if let Some(index) = close {
+            self.close_session(index);
+        } else if let Some(index) = switch_to {
+            self.active = index;
+        }
+        if let Some(index) = connect.or(connect_new) {
+            self.quick_connect(index);
+        }
+        if let Some(index) = edit {
+            self.apply_profile(index);
+            self.dialog = Some(Dialog::Profiles);
+        }
+        if add_active {
+            self.dialog = Some(Dialog::Profiles);
+        }
+        if add_saved {
+            self.new_profile();
+            self.dialog = Some(Dialog::Profiles);
+        }
+    }
+
     fn log_tab(&mut self, ui: &mut egui::Ui) {
         let a = self.active;
         let entries = self.sessions[a].recent_log();
         let list_height = ui.available_height().max(40.0);
-        win32::list_view(ui, list_height, |ui| {
+        theme::list_view(ui, list_height, |ui| {
             if entries.is_empty() {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| { ui.add_space(6.0); ui.weak("Nothing has been logged for this session yet."); });
@@ -2088,15 +2206,15 @@ impl SftpApp {
                 .id_salt(("session_log", self.sessions[a].id))
                 .auto_shrink([false, false])
                 .stick_to_bottom(true);
-            win32::scroll(ui, area, |ui| {
+            theme::scroll(ui, area, |ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 ui.add_space(2.0);
                 for entry in &entries {
                     let color = match entry.severity {
-                        crate::logging::Severity::Error => win32::error_red(),
-                        crate::logging::Severity::Warning => win32::warn_amber(),
-                        crate::logging::Severity::Notice => win32::notice_blue(),
-                        crate::logging::Severity::Info => win32::text_color(),
+                        crate::logging::Severity::Error => theme::error_red(),
+                        crate::logging::Severity::Warning => theme::warn_amber(),
+                        crate::logging::Severity::Notice => theme::notice_blue(),
+                        crate::logging::Severity::Info => theme::text_color(),
                     };
                     let time = crate::logging::iso8601_utc(entry.time);
                     let line = format!(
@@ -2260,43 +2378,43 @@ impl SftpApp {
                                 ui.set_width(170.0);
                                 ui.label("Saved profiles:");
                                 let list_height = body_height - 50.0;
-                                win32::list_view(ui, list_height, |ui| {
-                                    win32::scroll(ui, egui::ScrollArea::vertical().id_salt("profile_list").auto_shrink([false, false]), |ui| {
+                                theme::list_view(ui, list_height, |ui| {
+                                    theme::scroll(ui, egui::ScrollArea::vertical().id_salt("profile_list").auto_shrink([false, false]), |ui| {
                                         for (index, profile) in self.saved_profiles.iter().enumerate() {
-                                            if win32::list_item(ui, &profile.name, self.selected_profile == Some(index)).clicked() {
+                                            if theme::list_item(ui, &profile.name, self.selected_profile == Some(index)).clicked() {
                                                 apply = Some(index);
                                             }
                                         }
                                         if self.selected_profile.is_none() {
-                                            win32::list_item(ui, "(new, unsaved profile)", true);
+                                            theme::list_item(ui, "(new, unsaved profile)", true);
                                         }
                                     });
                                 });
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
-                                    if win32::button_sized(ui, true, "New Profile", 82.0).clicked() { new_profile = true; }
+                                    if theme::button_sized(ui, true, "New Profile", 82.0).clicked() { new_profile = true; }
                                     let saved = self.selected_profile.is_some_and(|index| index < self.saved_profiles.len());
-                                    if win32::button_sized(ui, saved, "Delete", 82.0).clicked() { delete = true; }
+                                    if theme::button_sized(ui, saved, "Delete", 82.0).clicked() { delete = true; }
                                 });
                             });
                             ui.add_space(8.0);
                             ui.vertical(|ui| {
                                 let heading = if self.selected_profile.is_some() { "Profile settings" } else { "New profile (unsaved)" };
                                 ui.strong(heading);
-                                win32::etched_hline(ui);
+                                theme::separator(ui);
                                 egui::Grid::new("profile_fields").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                                     let field_width = (ui.available_width() - 90.0).max(160.0);
                                     ui.label("Profile name:");
-                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut self.profile_name).desired_width(field_width));
+                                    theme::text_edit(ui, egui::TextEdit::singleline(&mut self.profile_name).desired_width(field_width));
                                     ui.end_row();
                                     ui.label("Host name:");
-                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut self.host).desired_width(field_width));
+                                    theme::text_edit(ui, egui::TextEdit::singleline(&mut self.host).desired_width(field_width));
                                     ui.end_row();
                                     ui.label("Port:");
-                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut self.port).desired_width(55.0));
+                                    theme::text_edit(ui, egui::TextEdit::singleline(&mut self.port).desired_width(55.0));
                                     ui.end_row();
                                     ui.label("User name:");
-                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut self.username).desired_width(field_width));
+                                    theme::text_edit(ui, egui::TextEdit::singleline(&mut self.username).desired_width(field_width));
                                     ui.end_row();
                                     ui.label("Logon type:");
                                     egui::ComboBox::from_id_salt("auth_method")
@@ -2310,13 +2428,13 @@ impl SftpApp {
                                     ui.end_row();
                                     if self.auth == AuthMethod::PrivateKey {
                                         ui.label("Key file:");
-                                        win32::text_edit(ui, egui::TextEdit::singleline(&mut self.key_path).desired_width(field_width));
+                                        theme::text_edit(ui, egui::TextEdit::singleline(&mut self.key_path).desired_width(field_width));
                                         ui.end_row();
                                     }
                                     if self.auth == AuthMethod::Password {
                                         ui.label("Password:");
                                         let hint = if self.save_password { "Leave empty to use the saved password" } else { "Asked for when connecting" };
-                                        win32::text_edit(ui, egui::TextEdit::singleline(&mut self.password)
+                                        theme::text_edit(ui, egui::TextEdit::singleline(&mut self.password)
                                             .password(true)
                                             .hint_text(hint)
                                             .desired_width(field_width));
@@ -2324,12 +2442,12 @@ impl SftpApp {
                                         ui.label("");
                                         ui.horizontal(|ui| {
                                             ui.checkbox(&mut self.save_password, "Save password");
-                                            win32::info_tip(ui, SAVE_PASSWORD_TIP);
+                                            theme::info_tip(ui, SAVE_PASSWORD_TIP);
                                         });
                                         ui.end_row();
                                     }
                                     ui.label("Remote folder:");
-                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut self.remote_folder)
+                                    theme::text_edit(ui, egui::TextEdit::singleline(&mut self.remote_folder)
                                         .hint_text("Home folder")
                                         .desired_width(field_width));
                                     ui.end_row();
@@ -2343,9 +2461,9 @@ impl SftpApp {
                         if delete && can_delete { self.delete_profile(); }
                         repaint |= apply.is_some() || new_profile || delete;
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
-                            if win32::button_sized(ui, true, "Connect", 75.0).clicked() { connect = true; }
-                            if win32::button_sized(ui, true, "Save", 75.0).clicked() { save = true; }
+                            if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "Connect", 75.0).clicked() { connect = true; }
+                            if theme::button_sized(ui, true, "Save", 75.0).clicked() { save = true; }
                         });
                     }
                     Dialog::Password => {
@@ -2353,18 +2471,18 @@ impl SftpApp {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("Password:");
-                            let response = win32::text_edit(ui, egui::TextEdit::singleline(&mut self.password).password(true).desired_width(f32::INFINITY));
+                            let response = theme::text_edit(ui, egui::TextEdit::singleline(&mut self.password).password(true).desired_width(f32::INFINITY));
                             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                                 password_value = Some(self.password.clone());
                             }
                         });
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.save_password, "Save password");
-                            win32::info_tip(ui, SAVE_PASSWORD_TIP);
+                            theme::info_tip(ui, SAVE_PASSWORD_TIP);
                         });
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
-                            if win32::button_sized(ui, true, "OK", 75.0).clicked() { password_value = Some(self.password.clone()); }
+                            if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "OK", 75.0).clicked() { password_value = Some(self.password.clone()); }
                         });
                     }
                     Dialog::TrustHostKey => {
@@ -2379,16 +2497,16 @@ impl SftpApp {
                         ui.label(format!("The server {server} is not trusted yet."));
                         ui.label("Verify this fingerprint using a trusted channel before accepting it.");
                         ui.add_space(6.0);
-                        win32::field(ui, &fingerprint);
+                        theme::field(ui, &fingerprint);
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "Reject", 75.0).clicked() { close = true; }
-                            if win32::button_sized(ui, true, "Trust and continue", 75.0).clicked() { accept_trust = true; }
+                            if theme::button_sized(ui, true, "Reject", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "Trust and continue", 75.0).clicked() { accept_trust = true; }
                         });
                     }
                     Dialog::UpdateInstalled(release) => {
                         ui.add_space(4.0);
                         ui.horizontal_top(|ui| {
-                            win32::message_icon(ui, win32::Icon::Information);
+                            theme::message_icon(ui, theme::Icon::Information);
                             ui.add_space(10.0);
                             ui.add(egui::Label::new(format!(
                                 "Rust SFTP Client {} has been installed.\n\nRestart now to use it, or it starts the next time you open the program. Restarting closes all connections and stops transfers in progress.",
@@ -2396,27 +2514,27 @@ impl SftpApp {
                             )).wrap());
                         });
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "Restart now", 90.0).clicked() { restart_for_update = true; close = true; }
-                            if win32::button_sized(ui, true, "Later", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "Restart now", 90.0).clicked() { restart_for_update = true; close = true; }
+                            if theme::button_sized(ui, true, "Later", 75.0).clicked() { close = true; }
                         });
                     }
                     Dialog::Error => {
                         ui.label(&self.error_message);
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "OK", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "OK", 75.0).clicked() { close = true; }
                         });
                     }
                     Dialog::ConfirmDelete => {
                         let message = self.file_target.as_ref().map(delete_message).unwrap_or_default();
                         ui.add_space(4.0);
                         ui.horizontal_top(|ui| {
-                            win32::message_icon(ui, win32::Icon::Warning);
+                            theme::message_icon(ui, theme::Icon::Warning);
                             ui.add_space(10.0);
                             ui.add(egui::Label::new(message).wrap());
                         });
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "No", 75.0).clicked() { close = true; }
-                            if win32::button_sized(ui, true, "Yes", 75.0).clicked() { confirm_delete = true; }
+                            if theme::button_sized(ui, true, "No", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "Yes", 75.0).clicked() { confirm_delete = true; }
                         });
                     }
                     Dialog::NewFolder => {
@@ -2427,7 +2545,7 @@ impl SftpApp {
                             })
                             .unwrap_or_default();
                         ui.label(format!("Name of the new folder in {location}:"));
-                        let response = win32::text_edit(ui, egui::TextEdit::singleline(&mut self.rename_value).desired_width(f32::INFINITY));
+                        let response = theme::text_edit(ui, egui::TextEdit::singleline(&mut self.rename_value).desired_width(f32::INFINITY));
                         if self.rename_focus {
                             response.request_focus();
                             // Select the suggested name, so typing replaces it.
@@ -2440,11 +2558,11 @@ impl SftpApp {
                         }
                         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) { confirm_new_folder = true; }
                         if !self.rename_error.is_empty() {
-                            ui.colored_label(win32::error_red(), &self.rename_error);
+                            ui.colored_label(theme::error_red(), &self.rename_error);
                         }
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
-                            if win32::button_sized(ui, true, "OK", 75.0).clicked() { confirm_new_folder = true; }
+                            if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "OK", 75.0).clicked() { confirm_new_folder = true; }
                         });
                     }
                     Dialog::Rename => {
@@ -2452,18 +2570,18 @@ impl SftpApp {
                             .and_then(|target| target.items().first().map(|(name, _)| name.to_string()))
                             .unwrap_or_default();
                         ui.label(format!("Rename \"{old_name}\" to:"));
-                        let response = win32::text_edit(ui, egui::TextEdit::singleline(&mut self.rename_value).desired_width(f32::INFINITY));
+                        let response = theme::text_edit(ui, egui::TextEdit::singleline(&mut self.rename_value).desired_width(f32::INFINITY));
                         if self.rename_focus {
                             response.request_focus();
                             self.rename_focus = false;
                         }
                         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) { confirm_rename = true; }
                         if !self.rename_error.is_empty() {
-                            ui.colored_label(win32::error_red(), &self.rename_error);
+                            ui.colored_label(theme::error_red(), &self.rename_error);
                         }
                         dialog_buttons(ui, |ui| {
-                            if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
-                            if win32::button_sized(ui, true, "OK", 75.0).clicked() { confirm_rename = true; }
+                            if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                            if theme::button_sized(ui, true, "OK", 75.0).clicked() { confirm_rename = true; }
                         });
                     }
                 }
@@ -2520,9 +2638,9 @@ impl SftpApp {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
                         ui.set_width(160.0);
-                        win32::list_view(ui, body_height, |ui| {
+                        theme::list_view(ui, body_height, |ui| {
                             for page in SettingsPage::ALL {
-                                if win32::list_item(ui, page.title(), self.settings_page == page).clicked() {
+                                if theme::list_item(ui, page.title(), self.settings_page == page).clicked() {
                                     self.settings_page = page;
                                 }
                             }
@@ -2531,11 +2649,11 @@ impl SftpApp {
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
                         ui.strong(self.settings_page.title());
-                        win32::etched_hline(ui);
+                        theme::separator(ui);
                         let draft = &mut self.settings_draft;
                         let row = |ui: &mut egui::Ui, label: &str, value: &mut String, unit: &str| {
                             ui.label(label);
-                            win32::text_edit(ui, egui::TextEdit::singleline(value).desired_width(70.0));
+                            theme::text_edit(ui, egui::TextEdit::singleline(value).desired_width(70.0));
                             ui.weak(unit);
                             ui.end_row();
                         };
@@ -2543,9 +2661,9 @@ impl SftpApp {
                             SettingsPage::Transfers => {
                                 egui::Grid::new("settings_transfers").num_columns(4).spacing([8.0, 8.0]).show(ui, |ui| {
                                     ui.label("Files transferred at once:");
-                                    win32::text_edit(ui, egui::TextEdit::singleline(&mut draft.parallel_files).desired_width(70.0));
+                                    theme::text_edit(ui, egui::TextEdit::singleline(&mut draft.parallel_files).desired_width(70.0));
                                     ui.weak("per connection (1–32)");
-                                    win32::info_tip(ui, TRANSFER_TIP_PARALLEL_FILES);
+                                    theme::info_tip(ui, TRANSFER_TIP_PARALLEL_FILES);
                                     ui.end_row();
                                 });
                                 ui.add_space(6.0);
@@ -2563,9 +2681,9 @@ impl SftpApp {
                             SettingsPage::Network => {
                                 let info_row = |ui: &mut egui::Ui, label: &str, value: &mut String, unit: &str, tip: &str| {
                                     ui.label(label);
-                                    win32::text_edit(ui, egui::TextEdit::singleline(value).desired_width(70.0));
+                                    theme::text_edit(ui, egui::TextEdit::singleline(value).desired_width(70.0));
                                     ui.weak(unit);
-                                    win32::info_tip(ui, tip);
+                                    theme::info_tip(ui, tip);
                                     ui.end_row();
                                 };
                                 egui::Grid::new("settings_network").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -2579,29 +2697,29 @@ impl SftpApp {
                                     ui.label("SSH compression:");
                                     ui.checkbox(&mut draft.compression, "Enable (zlib)");
                                     ui.label("");
-                                    win32::info_tip(ui, NETWORK_TIP_COMPRESSION);
+                                    theme::info_tip(ui, NETWORK_TIP_COMPRESSION);
                                     ui.end_row();
 
                                     ui.label("UDP downloads:");
                                     ui.checkbox(&mut draft.turbo, "Use rsftp-turbo when available");
                                     ui.label("");
-                                    win32::info_tip(ui, NETWORK_TIP_TURBO);
+                                    theme::info_tip(ui, NETWORK_TIP_TURBO);
                                     ui.end_row();
                                 });
                                 ui.add_space(6.0);
                                 ui.weak("Hover an information icon for details about a setting.");
                                 ui.add_space(4.0);
-                                ui.colored_label(win32::warn_amber(), "Network settings apply to new connections.");
+                                ui.colored_label(theme::warn_amber(), "Network settings apply to new connections.");
                             }
                             SettingsPage::Appearance => {
                                 ui.horizontal(|ui| {
                                     ui.label("Theme:");
                                     egui::ComboBox::from_id_salt("theme")
-                                        .width(180.0)
+                                        .width(260.0)
                                         .selected_text(draft.theme.label())
                                         .show_ui(ui, |ui| {
-                                            for theme in [win32::Theme::Light, win32::Theme::Dark] {
-                                                ui.selectable_value(&mut draft.theme, theme, theme.label());
+                                            for choice in theme::Theme::ALL {
+                                                ui.selectable_value(&mut draft.theme, choice, choice.label());
                                             }
                                         });
                                 });
@@ -2629,7 +2747,7 @@ impl SftpApp {
                             }
                             SettingsPage::Algorithms => {
                                 let tabs = AlgorithmKind::ALL.map(|kind| (kind, kind.label().to_owned()));
-                                if win32::tab_strip(ui, &mut draft.algorithm_kind, &tabs) {
+                                if theme::tab_strip(ui, &mut draft.algorithm_kind, &tabs) {
                                     draft.algorithm_row = None;
                                 }
                                 ui.add_space(6.0);
@@ -2640,9 +2758,9 @@ impl SftpApp {
                                 ui.horizontal_top(|ui| {
                                     ui.vertical(|ui| {
                                         ui.set_width((ui.available_width() - 96.0).max(220.0));
-                                        win32::list_view(ui, list_height, |ui| {
+                                        theme::list_view(ui, list_height, |ui| {
                                             let area = egui::ScrollArea::vertical().id_salt(("algorithms", kind.label())).auto_shrink([false, false]);
-                                            win32::scroll(ui, area, |ui| {
+                                            theme::scroll(ui, area, |ui| {
                                                 for (index, choice) in draft.algorithms.list_mut(kind).iter_mut().enumerate() {
                                                     ui.horizontal(|ui| {
                                                         ui.add_space(3.0);
@@ -2652,7 +2770,7 @@ impl SftpApp {
                                                         } else {
                                                             choice.name.clone()
                                                         };
-                                                        if win32::list_item(ui, &label, draft.algorithm_row == Some(index)).clicked() {
+                                                        if theme::list_item(ui, &label, draft.algorithm_row == Some(index)).clicked() {
                                                             clicked = Some(index);
                                                         }
                                                     });
@@ -2665,13 +2783,13 @@ impl SftpApp {
                                         ui.spacing_mut().item_spacing.y = 6.0;
                                         let count = draft.algorithms.list(kind).len();
                                         let row = draft.algorithm_row;
-                                        if win32::button_sized(ui, row.is_some_and(|row| row > 0), "Move Up", 86.0).clicked() {
+                                        if theme::button_sized(ui, row.is_some_and(|row| row > 0), "Move Up", 86.0).clicked() {
                                             action = Some(-1);
                                         }
-                                        if win32::button_sized(ui, row.is_some_and(|row| row + 1 < count), "Move Down", 86.0).clicked() {
+                                        if theme::button_sized(ui, row.is_some_and(|row| row + 1 < count), "Move Down", 86.0).clicked() {
                                             action = Some(1);
                                         }
-                                        if win32::button_sized(ui, true, "Defaults", 86.0).clicked() {
+                                        if theme::button_sized(ui, true, "Defaults", 86.0).clicked() {
                                             action = Some(0);
                                         }
                                     });
@@ -2702,7 +2820,7 @@ impl SftpApp {
                                     AlgorithmKind::HostKey => ALGORITHMS_HELP_HOST_KEYS,
                                 });
                                 ui.add_space(4.0);
-                                ui.colored_label(win32::warn_amber(), "The server uses the first ticked algorithm it supports. Applies to new connections.");
+                                ui.colored_label(theme::warn_amber(), "The server uses the first ticked algorithm it supports. Applies to new connections.");
                             }
                             SettingsPage::Terminal => {
                                 egui::Grid::new("settings_terminal").num_columns(3).spacing([8.0, 8.0]).show(ui, |ui| {
@@ -2742,7 +2860,7 @@ impl SftpApp {
                                     ui.weak("When off, Ctrl+C always interrupts. Ctrl+Shift+C copies in either case.");
                                 });
                                 ui.add_space(6.0);
-                                ui.colored_label(win32::warn_amber(), "Terminal type and scrollback apply to new shells.");
+                                ui.colored_label(theme::warn_amber(), "Terminal type and scrollback apply to new shells.");
                             }
                             SettingsPage::Logging => {
                                 ui.checkbox(&mut draft.logging_enabled, "Enable logging");
@@ -2755,8 +2873,8 @@ impl SftpApp {
                                     ui.label("Log directory:");
                                     ui.horizontal(|ui| {
                                         let width = (ui.available_width() - 80.0).max(120.0);
-                                        win32::text_edit(ui, egui::TextEdit::singleline(&mut draft.log_directory).desired_width(width));
-                                        if win32::button_sized(ui, true, "Default", 70.0).clicked() {
+                                        theme::text_edit(ui, egui::TextEdit::singleline(&mut draft.log_directory).desired_width(width));
+                                        if theme::button_sized(ui, true, "Default", 70.0).clicked() {
                                             draft.log_directory = default_log_dir().display().to_string();
                                         }
                                     });
@@ -2772,14 +2890,14 @@ impl SftpApp {
                         }
                         if !self.settings_error.is_empty() {
                             ui.add_space(6.0);
-                            ui.colored_label(win32::error_red(), &self.settings_error);
+                            ui.colored_label(theme::error_red(), &self.settings_error);
                         }
                     });
                 });
                 dialog_buttons(ui, |ui| {
-                    if win32::button_sized(ui, true, "Apply", 75.0).clicked() { apply = true; }
-                    if win32::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
-                    if win32::button_sized(ui, true, "OK", 75.0).clicked() { apply = true; close = true; }
+                    if theme::button_sized(ui, true, "Apply", 75.0).clicked() { apply = true; }
+                    if theme::button_sized(ui, true, "Cancel", 75.0).clicked() { close = true; }
+                    if theme::button_sized(ui, true, "OK", 75.0).clicked() { apply = true; close = true; }
                 });
             });
             if window_ctx.input(|input| input.viewport().close_requested()) { close = true; }
@@ -2802,7 +2920,7 @@ impl SftpApp {
             match result {
                 Ok(settings) => {
                     if settings.theme != self.settings.theme {
-                        win32::apply(ctx, settings.theme);
+                        theme::apply(ctx, settings.theme);
                     }
                     crate::units::set(settings.units);
                     if settings.network.parallel_files != self.settings.network.parallel_files {
@@ -2851,72 +2969,37 @@ impl eframe::App for SftpApp {
         let can_download = connected && !self.session().remote_selected.is_empty();
         let can_upload = self.session().can_upload();
         egui::TopBottomPanel::top("toolbar")
-            .frame(win32::panel_frame(3))
+            .frame(theme::panel_frame(3))
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
-                // Connect button with an attached menu of saved profiles.
-                let mut quick = None;
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    if win32::icon_button(ui, true, win32::Icon::Connect, "Connect… (opens a new session tab)").clicked() {
-                        self.dialog = Some(Dialog::Profiles);
-                    }
-                    let menu_id = ui.id().with("quick_connect");
-                    let open = egui::Popup::is_id_open(ui.ctx(), menu_id);
-                    let arrow = win32::dropdown_arrow(ui, true, open, "Connect to a saved profile");
-                    egui::Popup::menu(&arrow).id(menu_id).show(|ui| {
-                        win32::menu_item_style(ui.style_mut());
-                        ui.set_min_width(180.0);
-                        if self.saved_profiles.is_empty() {
-                            ui.add_enabled(false, egui::Button::new("No saved profiles"));
-                        }
-                        for (index, profile) in self.saved_profiles.iter().enumerate() {
-                            let label = format!("{}  ({}@{})", profile.name, profile.username, profile.host);
-                            if ui.button(label).clicked() {
-                                quick = Some(index);
-                            }
-                        }
-                        ui.separator();
-                        if ui.button("Manage profiles…").clicked() {
-                            self.dialog = Some(Dialog::Profiles);
-                        }
-                    });
-                });
-                if let Some(index) = quick { self.quick_connect(index); }
-                if win32::icon_button(ui, can_close, win32::Icon::Disconnect, "Disconnect and close this session").clicked() { self.disconnect_active(); }
-                win32::toolbar_separator(ui);
-                if win32::icon_button(ui, can_upload, win32::Icon::Upload, "Upload selected local items").clicked() { self.upload_selected(); }
-                if win32::icon_button(ui, can_download, win32::Icon::Download, "Download selected remote files").clicked() { self.download_selected(); }
-                win32::toolbar_separator(ui);
+                if theme::icon_button(ui, true, theme::Icon::Connect, "Connect… (opens a new session)").clicked() {
+                    self.dialog = Some(Dialog::Profiles);
+                }
+                if theme::icon_button(ui, can_close, theme::Icon::Disconnect, "Disconnect and close this session").clicked() { self.disconnect_active(); }
+                theme::toolbar_separator(ui);
+                if theme::icon_button(ui, can_upload, theme::Icon::Upload, "Upload selected local items").clicked() { self.upload_selected(); }
+                if theme::icon_button(ui, can_download, theme::Icon::Download, "Download selected remote files").clicked() { self.download_selected(); }
+                theme::toolbar_separator(ui);
                 let showing = !self.settings.hide_hidden_items;
                 let tip = if showing {
                     "Hidden items are shown (dot files; on Windows also files marked hidden). Click to hide them."
                 } else {
                     "Hidden items are hidden (dot files; on Windows also files marked hidden). Click to show them."
                 };
-                if win32::icon_toggle(ui, showing, win32::Icon::HiddenItems, tip).clicked() {
+                if theme::icon_toggle(ui, showing, theme::Icon::HiddenItems, tip).clicked() {
                     self.settings.hide_hidden_items = showing;
                     if let Err(error) = crate::settings::save(&self.settings) {
                         self.session_mut().status = format!("Could not save settings: {error}");
                     }
                 }
-                win32::toolbar_separator(ui);
-                if win32::icon_button(ui, true, win32::Icon::Settings, "Settings").clicked() { self.open_settings(); }
+                theme::toolbar_separator(ui);
+                if theme::icon_button(ui, true, theme::Icon::Settings, "Settings").clicked() { self.open_settings(); }
             });
-        });
-        egui::TopBottomPanel::top("sessions")
-            .frame(win32::panel_frame(0).inner_margin(egui::Margin { left: 4, right: 4, top: 3, bottom: 0 }))
-            .show(ctx, |ui| {
-            let tabs: Vec<(u64, String)> = self.sessions.iter().map(|session| (session.id, session.title())).collect();
-            let mut active_id = self.session().id;
-            if win32::tab_strip(ui, &mut active_id, &tabs) {
-                if let Some(index) = self.session_index(active_id) { self.active = index; }
-            }
         });
         egui::TopBottomPanel::bottom("status")
             .exact_height(22.0)
-            .frame(win32::panel_frame(0).inner_margin(egui::Margin::symmetric(2, 2)))
+            .frame(theme::panel_frame(0).inner_margin(egui::Margin::symmetric(2, 2)))
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -2934,32 +3017,33 @@ impl eframe::App for SftpApp {
                 let turbo_width = if turbo.is_some() { TURBO_PANE_WIDTH + ui.spacing().item_spacing.x } else { 0.0 };
                 let fixed = 200.0 + turbo_width + 180.0 + 130.0 + VERSION_PANE_WIDTH + 4.0 * ui.spacing().item_spacing.x;
                 let message_width = (ui.available_width() - fixed).max(120.0);
-                win32::status_pane(ui, message_width, self.session().status.as_str());
-                win32::status_pane(ui, 200.0, connection);
+                theme::status_pane(ui, message_width, self.session().status.as_str());
+                theme::status_pane(ui, 200.0, connection);
                 match turbo {
                     Some(true) => {
-                        win32::status_badge(ui, TURBO_PANE_WIDTH, "Turbo Active", TURBO_ACTIVE)
+                        theme::status_badge(ui, TURBO_PANE_WIDTH, "Turbo Active", theme::ok_green())
                             .on_hover_text("Downloads from this server use rsftp-turbo over UDP.");
                     }
                     Some(false) => {
-                        win32::status_badge(ui, TURBO_PANE_WIDTH, "Turbo Unavailable", TURBO_UNAVAILABLE)
+                        theme::status_badge(ui, TURBO_PANE_WIDTH, "Turbo Unavailable", theme::error_red())
                             .on_hover_text("Downloads from this server use SFTP. The Log tab says why rsftp-turbo is unavailable.");
                     }
                     None => {}
                 }
-                win32::status_pane(ui, 180.0, speeds);
-                win32::status_pane(ui, 130.0, format!("{active} active transfer{}", if active == 1 { "" } else { "s" }))
+                theme::status_pane(ui, 180.0, speeds);
+                theme::status_pane(ui, 130.0, format!("{active} active transfer{}", if active == 1 { "" } else { "s" }))
                     .on_hover_text("Across all sessions");
-                win32::status_pane(ui, VERSION_PANE_WIDTH, version_text())
+                theme::status_pane(ui, VERSION_PANE_WIDTH, version_text())
                     .on_hover_text(format!("Rust SFTP Client {}", version_text()));
             });
         });
+        self.sidebar(ctx);
         egui::TopBottomPanel::bottom("queue")
             .resizable(true)
             .default_height(queue_panel_height(&ctx.style()))
             .min_height(100.0)
             .max_height(600.0)
-            .frame(win32::panel_frame(QUEUE_PANEL_MARGIN))
+            .frame(theme::panel_frame(QUEUE_PANEL_MARGIN))
             .show(ctx, |ui| {
             let a = self.active;
             let count = |tab: QueueTab| self.sessions[a].transfers.iter().filter(|item| item.operation_id.is_none() && item.tab() == tab).count();
@@ -2971,7 +3055,7 @@ impl eframe::App for SftpApp {
                 (QueueTab::Statistics, "Statistics".to_owned()),
                 (QueueTab::Terminal, "SSH Terminal".to_owned()),
             ];
-            win32::tab_strip(ui, &mut self.sessions[a].queue_tab, &tabs);
+            theme::tab_strip(ui, &mut self.sessions[a].queue_tab, &tabs);
             // Each tab gets exactly the space left in the panel, so switching
             // tabs never resizes the panel (it would otherwise grow or shrink
             // to whatever the tab's contents need).
@@ -3012,8 +3096,6 @@ impl eframe::App for SftpApp {
 
 /// Status-bar rsftp-turbo badge: width and background colours.
 const TURBO_PANE_WIDTH: f32 = 120.0;
-const TURBO_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0, 128, 0);
-const TURBO_UNAVAILABLE: egui::Color32 = egui::Color32::from_rgb(170, 0, 0);
 
 /// Rows in the statistics table and the gap between them.
 const STATS_ROWS: usize = 10;
@@ -3072,10 +3154,10 @@ fn about_page(ui: &mut egui::Ui, height: f32, draft: &mut SettingsDraft, updater
 
         ui.add_space(10.0);
         ui.strong("Updates");
-        win32::etched_hline(ui);
+        theme::separator(ui);
         ui.horizontal(|ui| {
             ui.checkbox(&mut draft.auto_update, "Install updates automatically");
-            win32::info_tip(ui, "Checks GitHub for a new version at startup and once a day, and installs it in the background. \
+            theme::info_tip(ui, "Checks GitHub for a new version at startup and once a day, and installs it in the background. \
                 The new version starts the next time the program is opened (or right away if you choose to restart). \
                 Takes effect when you click OK or Apply.");
         });
@@ -3083,7 +3165,7 @@ fn about_page(ui: &mut egui::Ui, height: f32, draft: &mut SettingsDraft, updater
         ui.horizontal(|ui| {
             let ctx = ui.ctx().clone();
             let enabled = !updater.busy() && !matches!(updater.status, Status::Installed(_));
-            if win32::button_sized(ui, enabled, "Check for updates", 130.0).clicked() {
+            if theme::button_sized(ui, enabled, "Check for updates", 130.0).clicked() {
                 updater.check(&ctx, false);
             }
             match &updater.status {
@@ -3093,14 +3175,14 @@ fn about_page(ui: &mut egui::Ui, height: f32, draft: &mut SettingsDraft, updater
                 Status::Available(release) => { ui.label(format!("Version {} is available.", release.label())); }
                 Status::Installing(release) => { ui.spinner(); ui.label(format!("Downloading and verifying {}…", release.label())); }
                 Status::Installed(release) => { ui.label(format!("Version {} is installed. Restart to use it.", release.label())); }
-                Status::Failed(_) => { ui.colored_label(win32::error_red(), "The last update failed."); }
+                Status::Failed(_) => { ui.colored_label(theme::error_red(), "The last update failed."); }
             }
         });
         match &updater.status {
             Status::Available(release) => {
                 let release = release.clone();
                 ui.horizontal(|ui| {
-                    if update::supported() && win32::button_sized(ui, true, "Install update", 130.0).clicked() {
+                    if update::supported() && theme::button_sized(ui, true, "Install update", 130.0).clicked() {
                         updater.install(ui.ctx());
                     }
                     ui.hyperlink_to("Release notes", &release.url);
@@ -3109,14 +3191,14 @@ fn about_page(ui: &mut egui::Ui, height: f32, draft: &mut SettingsDraft, updater
             Status::Installed(release) => {
                 let url = release.url.clone();
                 ui.horizontal(|ui| {
-                    if win32::button_sized(ui, true, "Restart now", 130.0).clicked() {
+                    if theme::button_sized(ui, true, "Restart now", 130.0).clicked() {
                         restart = true;
                     }
                     ui.hyperlink_to("Release notes", url);
                 });
             }
             Status::Failed(error) => {
-                ui.add(egui::Label::new(egui::RichText::new(error).color(win32::error_red())).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(error).color(theme::error_red())).wrap());
             }
             _ => {}
         }
@@ -3142,6 +3224,121 @@ const PANE_HEADER_GAP: f32 = 6.0;
 /// Space between a pane's toolbar band and its browser group.
 const PANE_SECTION_GAP: f32 = 6.0;
 const PANE_HEADER_BOTTOM_GAP: f32 = 5.0;
+
+const SIDEBAR_WIDTH: f32 = 250.0;
+const SIDEBAR_ROW_HEIGHT: f32 = 36.0;
+
+/// State dot of a sidebar row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionDot {
+    Connected,
+    Connecting,
+    Idle,
+}
+
+fn session_dot(session: &Session) -> SessionDot {
+    if session.is_connected() {
+        SessionDot::Connected
+    } else if session.is_connecting() {
+        SessionDot::Connecting
+    } else {
+        SessionDot::Idle
+    }
+}
+
+/// Name and detail line of a (connected or connecting) session in the sidebar.
+fn session_labels(session: &Session) -> (String, String) {
+    match &session.profile {
+        Some(profile) => (profile.name.clone(), format!("{}@{}:{}", profile.username, profile.host, profile.port)),
+        None => ("Session".into(), String::new()),
+    }
+}
+
+/// A sidebar section header: a chevron and muted title that fold the section,
+/// and a + button. Returns whether the section is open.
+fn sidebar_section(ui: &mut egui::Ui, title: &str, open: &mut bool, add_tip: &str, add: &mut bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width() - 24.0, 22.0), egui::Sense::click());
+        if response.clicked() {
+            *open = !*open;
+        }
+        let painter = ui.painter();
+        let color = if response.hovered() { theme::text_color() } else { theme::muted() };
+        let c = egui::pos2(rect.left() + 6.0, rect.center().y);
+        let chevron = if *open {
+            vec![c + egui::vec2(-3.5, -1.8), c + egui::vec2(0.0, 1.8), c + egui::vec2(3.5, -1.8)]
+        } else {
+            vec![c + egui::vec2(-1.8, -3.5), c + egui::vec2(1.8, 0.0), c + egui::vec2(-1.8, 3.5)]
+        };
+        painter.add(egui::Shape::line(chevron, egui::Stroke::new(1.2_f32, color)));
+        painter.text(egui::pos2(rect.left() + 16.0, rect.center().y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(12.0), color);
+        if theme::icon_button_sized(ui, true, theme::Icon::Add, add_tip, egui::vec2(20.0, 20.0), 12.0).clicked() {
+            *add = true;
+        }
+    });
+    *open
+}
+
+struct SidebarRow {
+    response: egui::Response,
+    clicked: bool,
+    /// The row's close button was clicked.
+    close: bool,
+}
+
+/// A sidebar entry: a state dot, the name, and a detail line in the monospace
+/// font; `selected` gets the selection fill and bar, `closable` a close button
+/// on hover.
+fn sidebar_row(ui: &mut egui::Ui, id: impl std::hash::Hash, name: &str, detail: &str, dot: SessionDot, selected: bool, closable: bool) -> SidebarRow {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), SIDEBAR_ROW_HEIGHT), egui::Sense::click());
+    let close_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 14.0, rect.center().y), egui::vec2(20.0, 20.0));
+    let close_response = closable.then(|| ui.interact(close_rect, ui.id().with(&id).with("close"), egui::Sense::click()));
+    let hovered = response.hovered() || close_response.as_ref().is_some_and(egui::Response::hovered);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if selected {
+            painter.rect_filled(rect, theme::RADIUS, theme::selection());
+            theme::selection_bar(painter, rect);
+        } else if hovered {
+            painter.rect_filled(rect, theme::RADIUS, theme::hover_fill());
+        }
+        let dot_center = egui::pos2(rect.left() + 12.0, rect.top() + 12.0);
+        match dot {
+            SessionDot::Connected => { painter.circle_filled(dot_center, 3.5, theme::ok_green()); }
+            SessionDot::Connecting => { painter.circle_filled(dot_center, 3.5, theme::warn_amber()); }
+            SessionDot::Idle => { painter.circle_stroke(dot_center, 3.0, egui::Stroke::new(1.0_f32, theme::muted())); }
+        }
+        // The terminate button shows on the active session and on hover.
+        let show_close = closable && (hovered || selected);
+        let text_left = rect.left() + 24.0;
+        let text_right = rect.right() - if show_close { 28.0 } else { 6.0 };
+        let width = (text_right - text_left).max(0.0);
+        let name_color = if selected { theme::selection_text() } else { theme::text_color() };
+        // Lines too long for the sidebar end in "…".
+        let line = |text: &str, font: egui::FontId, color: egui::Color32, middle: f32| {
+            let galley = egui::WidgetText::from(egui::RichText::new(text).font(font).color(color))
+                .into_galley(ui, Some(egui::TextWrapMode::Truncate), width, egui::FontSelection::Default);
+            painter.galley(egui::pos2(text_left, (rect.top() + middle - galley.size().y / 2.0).round()), galley, color);
+        };
+        line(name, egui::FontId::proportional(13.0), name_color, 12.0);
+        line(detail, egui::FontId::monospace(11.5), theme::muted(), 27.0);
+        if let Some(close) = &close_response {
+            if show_close {
+                // Red (Rosé Pine love), a little brighter under the pointer.
+                let row_fill = if selected { theme::selection() } else { theme::hover_fill() };
+                let red = if close.hovered() { theme::mix(theme::error_red(), theme::text_color(), 0.2) } else { theme::error_red() };
+                theme::paint_material_cancel(painter, egui::Rect::from_center_size(close_rect.center(), egui::vec2(18.0, 18.0)), red, row_fill);
+            }
+        }
+    }
+    let close = close_response.as_ref().is_some_and(egui::Response::clicked);
+    let response = match close_response {
+        Some(close) => response.union(close.on_hover_text("Terminate this session (disconnects and closes it)")),
+        None => response,
+    };
+    SidebarRow { clicked: response.clicked() && !close, close, response }
+}
 
 /// A file pane that accepts dropped files. Unlike egui's plain drop zone it
 /// draws no outline at rest (the pane's band and group frame are its borders),
@@ -3177,15 +3374,15 @@ fn pane_header_slot<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) 
 fn pane_filter_edit(ui: &mut egui::Ui, filter: &mut String) {
     // The sunken frame adds 3 points on each side.
     let width = (ui.available_width() - 6.0).max(20.0);
-    win32::text_edit(ui, egui::TextEdit::singleline(filter).desired_width(width));
+    theme::text_edit(ui, egui::TextEdit::singleline(filter).desired_width(width));
 }
 
 /// The star button: bookmarks the pane's folder, or removes its bookmark.
 fn bookmark_button(ui: &mut egui::Ui, enabled: bool, bookmarked: bool) -> egui::Response {
     if bookmarked {
-        win32::icon_button(ui, enabled, win32::Icon::RemoveBookmark, "Remove bookmark")
+        theme::icon_button(ui, enabled, theme::Icon::RemoveBookmark, "Remove bookmark")
     } else {
-        win32::icon_button(ui, enabled, win32::Icon::Bookmark, "Bookmark this folder")
+        theme::icon_button(ui, enabled, theme::Icon::Bookmark, "Bookmark this folder")
     }
 }
 
@@ -3222,35 +3419,42 @@ fn dialog_buttons(ui: &mut egui::Ui, add_buttons: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// Right-click menu of a file-list row, with a coloured icon per action.
+/// `upload` picks the transfer icon (the local pane uploads, the remote one downloads).
+#[allow(clippy::too_many_arguments)]
 fn row_context_menu(
     ui: &mut egui::Ui,
     dir: bool,
     transfer_label: &str,
     transfer_enabled: bool,
+    upload: bool,
     single: bool,
     hashable: bool,
 ) -> Option<RowAction> {
-    win32::menu_item_style(ui.style_mut());
+    theme::menu_item_style(ui.style_mut());
+    ui.set_min_width(200.0);
+    ui.spacing_mut().item_spacing.y = 1.0;
     let mut action = None;
-    let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, value: RowAction| {
-        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+    let mut item = |ui: &mut egui::Ui, enabled: bool, icon: theme::MenuIcon, label: &str, value: RowAction| {
+        if theme::menu_item(ui, enabled, icon, label).clicked() {
             action = Some(value);
             ui.close();
         }
     };
-    if dir { item(ui, true, "Open", RowAction::Open); }
-    item(ui, transfer_enabled, transfer_label, RowAction::Transfer);
+    if dir { item(ui, true, theme::MenuIcon::Open, "Open", RowAction::Open); }
+    let transfer_icon = if upload { theme::MenuIcon::Upload } else { theme::MenuIcon::Download };
+    item(ui, transfer_enabled, transfer_icon, transfer_label, RowAction::Transfer);
     if hashable {
         ui.separator();
         for algorithm in HashAlgorithm::ALL {
-            item(ui, !dir && single, &format!("Calculate {}", algorithm.label()), RowAction::Hash(algorithm));
+            item(ui, !dir && single, theme::MenuIcon::Hash, &format!("Calculate {}", algorithm.label()), RowAction::Hash(algorithm));
         }
     }
     ui.separator();
-    item(ui, single, "Rename", RowAction::Rename);
-    item(ui, true, "Delete", RowAction::Delete);
+    item(ui, single, theme::MenuIcon::Rename, "Rename", RowAction::Rename);
+    item(ui, true, theme::MenuIcon::Delete, "Delete", RowAction::Delete);
     ui.separator();
-    item(ui, true, "New folder", RowAction::NewFolder);
+    item(ui, true, theme::MenuIcon::NewFolder, "New folder", RowAction::NewFolder);
     action
 }
 
@@ -3262,8 +3466,9 @@ fn list_background(ui: &mut egui::Ui, clear_selection: &mut dyn FnMut()) -> bool
     if response.clicked() { clear_selection(); }
     let mut new_folder = false;
     response.context_menu(|ui| {
-        win32::menu_item_style(ui.style_mut());
-        if ui.button("New folder").clicked() {
+        theme::menu_item_style(ui.style_mut());
+        ui.set_min_width(160.0);
+        if theme::menu_item(ui, true, theme::MenuIcon::NewFolder, "New folder").clicked() {
             new_folder = true;
             ui.close();
         }
@@ -3315,11 +3520,13 @@ fn speed_text(mib_per_second: f64) -> String {
     crate::units::speed_mib(mib_per_second)
 }
 
-const ROW_HEIGHT: f32 = 18.0;
+/// File list rows, in the listing font (Berkeley Mono or JetBrains Mono).
+const ROW_HEIGHT: f32 = 22.0;
+const FILE_TEXT_SIZE: f32 = 13.5;
 const FOOTER_HEIGHT: f32 = 20.0;
-const SIZE_WIDTH: f32 = 80.0;
-const MODIFIED_WIDTH: f32 = 150.0;
-const TYPE_WIDTH: f32 = 80.0;
+const SIZE_WIDTH: f32 = 92.0;
+const MODIFIED_WIDTH: f32 = 172.0;
+const TYPE_WIDTH: f32 = 100.0;
 
 /// Draws the file list column headers and returns the width of the Name column.
 const HEADER_HEIGHT: f32 = 19.0;
@@ -3355,12 +3562,12 @@ fn paint_list_header(ui: &mut egui::Ui, rect: egui::Rect, name_width: f32, order
         (SortColumn::Type, TYPE_WIDTH, "Type"),
     ] {
         let sorted = (order.column == column).then_some(order.ascending);
-        if win32::header_button(&mut header, width, HEADER_HEIGHT, label, sorted).clicked() {
+        if theme::header_button(&mut header, width, HEADER_HEIGHT, label, sorted).clicked() {
             clicked = Some(column);
         }
     }
     let rest = header.available_width();
-    if rest > 0.0 { win32::header_cell(&mut header, rest, HEADER_HEIGHT, ""); }
+    if rest > 0.0 { theme::header_cell(&mut header, rest, HEADER_HEIGHT, ""); }
     clicked
 }
 
@@ -3388,8 +3595,6 @@ fn click_modifiers(response: &egui::Response) -> (bool, bool) {
     response.ctx.input(|input| (input.modifiers.ctrl || input.modifiers.command, input.modifiers.shift))
 }
 
-const GRAPH_DOWN: egui::Color32 = egui::Color32::from_rgb(40, 100, 210);
-const GRAPH_UP: egui::Color32 = egui::Color32::from_rgb(0, 140, 60);
 
 /// Line graph of download and upload speed over the last `span`, newest at the
 /// right, with dotted lines at the (active-time) average download and upload speed.
@@ -3402,8 +3607,8 @@ fn paint_speed_graph(
     (average_down, average_up): (Option<f64>, Option<f64>),
 ) {
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, win32::window());
-    win32::sunken(&painter, rect);
+    painter.rect_filled(rect, 0.0, theme::ground());
+    theme::outline_strong(&painter, rect);
     let font = egui::TextStyle::Small.resolve(ui.style());
     let plot = egui::Rect::from_min_max(rect.min + egui::vec2(62.0, 8.0), rect.max - egui::vec2(10.0, 18.0));
     if plot.width() < 20.0 || plot.height() < 20.0 {
@@ -3419,16 +3624,16 @@ fn paint_speed_graph(
     for step in 0..=4 {
         let fraction = step as f32 / 4.0;
         let y = plot.bottom() - fraction * plot.height();
-        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, win32::grid()));
-        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, speed_text(y_max * f64::from(fraction)), font.clone(), win32::gray_text());
+        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], egui::Stroke::new(1.0, theme::grid()));
+        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, speed_text(y_max * f64::from(fraction)), font.clone(), theme::muted());
         let x = plot.left() + fraction * plot.width();
-        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], egui::Stroke::new(1.0, win32::grid()));
+        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], egui::Stroke::new(1.0, theme::grid()));
         let ago = span.mul_f32(1.0 - fraction);
         let label = if step == 4 { "now".to_owned() } else { format!("-{}", short_duration(ago)) };
         let anchor = if step == 0 { egui::Align2::LEFT_TOP } else if step == 4 { egui::Align2::RIGHT_TOP } else { egui::Align2::CENTER_TOP };
-        painter.text(egui::pos2(x, plot.bottom() + 3.0), anchor, label, font.clone(), win32::gray_text());
+        painter.text(egui::pos2(x, plot.bottom() + 3.0), anchor, label, font.clone(), theme::muted());
     }
-    painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0, win32::shadow()), egui::StrokeKind::Outside);
+    painter.rect_stroke(plot, 0.0, egui::Stroke::new(1.0, theme::rule_strong()), egui::StrokeKind::Outside);
 
     // Series. Samples stop while the app is idle; a gap wider than a few
     // sample intervals is drawn as zero so the line does not bridge it.
@@ -3457,7 +3662,8 @@ fn paint_speed_graph(
         }
         points
     };
-    let picks: [(fn(&SpeedSample) -> f64, egui::Color32); 2] = [(|sample| sample.up, GRAPH_UP), (|sample| sample.down, GRAPH_DOWN)];
+    let (graph_down, graph_up) = (theme::ok_green(), theme::rose());
+    let picks: [(fn(&SpeedSample) -> f64, egui::Color32); 2] = [(|sample| sample.up, graph_up), (|sample| sample.down, graph_down)];
     for (pick, color) in picks {
         let points = series(pick);
         if points.len() >= 2 {
@@ -3468,11 +3674,7 @@ fn paint_speed_graph(
     }
 
     // Averages: dotted lines across the plot, labelled at the left.
-    let (average_down_color, average_up_color) = if ui.visuals().dark_mode {
-        (egui::Color32::from_rgb(255, 95, 95), egui::Color32::from_rgb(240, 100, 240))
-    } else {
-        (egui::Color32::from_rgb(220, 0, 0), egui::Color32::from_rgb(200, 0, 200))
-    };
+    let (average_down_color, average_up_color) = (theme::notice_blue(), theme::warn_amber());
     let mut label_slots: Vec<f32> = Vec::new();
     for (average, color, label) in [(average_down, average_down_color, "avg download"), (average_up, average_up_color, "avg upload")] {
         let Some(average) = average else { continue };
@@ -3492,13 +3694,13 @@ fn paint_speed_graph(
     let entries = [
         ("Avg upload", average_up_color, true),
         ("Avg download", average_down_color, true),
-        ("Upload", GRAPH_UP, false),
-        ("Download", GRAPH_DOWN, false),
+        ("Upload", graph_up, false),
+        ("Download", graph_down, false),
     ];
     for (label, color, dotted) in entries {
-        let galley = painter.layout_no_wrap(label.to_owned(), font.clone(), win32::text_color());
+        let galley = painter.layout_no_wrap(label.to_owned(), font.clone(), theme::text_color());
         x -= galley.size().x;
-        painter.galley(egui::pos2(x, plot.top() + 4.0), galley, win32::text_color());
+        painter.galley(egui::pos2(x, plot.top() + 4.0), galley, theme::text_color());
         x -= 14.0;
         let swatch = egui::Rect::from_min_size(egui::pos2(x, plot.top() + 7.0), egui::vec2(10.0, 8.0));
         if dotted {
@@ -3529,16 +3731,21 @@ fn file_row(ui: &mut egui::Ui, name_width: f32, name: &str, dir: bool, size: u64
     }
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     if selected {
-        painter.rect_filled(rect, 0.0, win32::selection());
+        painter.rect_filled(rect, 0.0, theme::selection());
+        theme::selection_bar(&painter, rect);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 0.0, theme::hover_fill());
     }
-    let color = if selected { win32::selection_text() } else { win32::text_color() };
-    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = if selected { theme::selection_text() } else { theme::text_color() };
+    // The whole listing is monospaced, so names and columns line up.
+    let font = theme::listing_font(FILE_TEXT_SIZE);
+    let name_font = font.clone();
 
     let icon = egui::Rect::from_min_size(rect.left_center() + egui::vec2(4.0, -6.0), egui::vec2(14.0, 12.0));
     paint_file_icon(&painter, icon, dir);
     let name_rect = egui::Rect::from_min_max(egui::pos2(icon.right() + 6.0, rect.top()), egui::pos2(rect.left() + name_width - 4.0, rect.bottom()));
     painter.with_clip_rect(name_rect.intersect(painter.clip_rect()))
-        .text(name_rect.left_center(), egui::Align2::LEFT_CENTER, name, font.clone(), color);
+        .text(name_rect.left_center(), egui::Align2::LEFT_CENTER, name, name_font, color);
 
     let mut left = rect.left() + name_width;
     let modified = modified.replace('T', " ").trim_end_matches('Z').to_owned();
@@ -3560,20 +3767,18 @@ fn file_row(ui: &mut egui::Ui, name_width: f32, name: &str, dir: bool, size: u64
     response
 }
 
-/// Small Explorer-style icon: a manila folder or a dog-eared page.
-/// Icons keep their own colours in both themes, like Explorer's.
+/// Small file-list icon: a folder or a dog-eared page, as grey outlines.
 fn paint_file_icon(painter: &egui::Painter, rect: egui::Rect, dir: bool) {
-    let outline = egui::Stroke::new(1.0, if dir { egui::Color32::from_rgb(128, 96, 0) } else { egui::Color32::from_rgb(128, 128, 128) });
-    if dir {
-        let tab = egui::Rect::from_min_size(rect.min, egui::vec2(6.0, 3.0));
-        let body = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 2.0), rect.max);
-        painter.rect(tab, 0.0, egui::Color32::from_rgb(240, 200, 80), outline, egui::StrokeKind::Inside);
-        painter.rect(body, 0.0, egui::Color32::from_rgb(255, 222, 110), outline, egui::StrokeKind::Inside);
+    let stroke = egui::Stroke::new(1.1_f32, theme::muted());
+    let p = |x: f32, y: f32| rect.min + egui::vec2(x, y);
+    let shape = if dir {
+        vec![p(0.5, 1.0), p(5.0, 1.0), p(6.5, 2.5), p(13.5, 2.5), p(13.5, 11.5), p(0.5, 11.5)]
     } else {
-        let page = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 12.0));
-        painter.rect(page, 0.0, egui::Color32::WHITE, outline, egui::StrokeKind::Inside);
-        let corner = egui::Rect::from_min_max(egui::pos2(page.right() - 4.0, page.top()), egui::pos2(page.right(), page.top() + 4.0));
-        painter.rect(corner, 0.0, egui::Color32::from_rgb(223, 223, 223), outline, egui::StrokeKind::Inside);
+        vec![p(2.5, 0.5), p(8.5, 0.5), p(11.5, 3.5), p(11.5, 11.5), p(2.5, 11.5)]
+    };
+    painter.add(egui::Shape::closed_line(shape, stroke));
+    if !dir {
+        painter.add(egui::Shape::line(vec![p(8.5, 0.5), p(8.5, 3.5), p(11.5, 3.5)], stroke));
     }
 }
 
@@ -3588,21 +3793,12 @@ struct ConflictColors {
 }
 
 impl ConflictColors {
-    fn new(dark: bool) -> Self {
-        if dark {
-            Self {
-                replaced: egui::Color32::from_rgb(90, 36, 36),
-                replaced_text: egui::Color32::from_rgb(240, 120, 120),
-                new: egui::Color32::from_rgb(30, 74, 40),
-                new_text: egui::Color32::from_rgb(120, 210, 130),
-            }
-        } else {
-            Self {
-                replaced: egui::Color32::from_rgb(255, 220, 220),
-                replaced_text: egui::Color32::from_rgb(180, 0, 0),
-                new: egui::Color32::from_rgb(214, 245, 214),
-                new_text: egui::Color32::from_rgb(0, 120, 0),
-            }
+    fn new() -> Self {
+        Self {
+            replaced: theme::mix(theme::ground(), theme::error_red(), 0.18),
+            replaced_text: theme::error_red(),
+            new: theme::mix(theme::ground(), theme::ok_green(), 0.18),
+            new_text: theme::ok_green(),
         }
     }
 }
@@ -3695,7 +3891,7 @@ fn paint_expander(painter: &egui::Painter, rect: egui::Rect, expanded: bool) {
     } else {
         vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(3.0, 0.0), c + egui::vec2(-2.0, 4.0)]
     };
-    painter.add(egui::Shape::convex_polygon(points, win32::text_color(), egui::Stroke::NONE));
+    painter.add(egui::Shape::convex_polygon(points, theme::text_color(), egui::Stroke::NONE));
 }
 
 fn file_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, right_align: bool) {
@@ -3710,10 +3906,9 @@ fn file_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str, right_
     } else {
         (egui::Align2::LEFT_CENTER, rect.left_center() + egui::vec2(5.0, 0.0))
     };
-    painter.text(pos, anchor, text, egui::TextStyle::Body.resolve(ui.style()), win32::text_color());
+    painter.text(pos, anchor, text, egui::TextStyle::Body.resolve(ui.style()), theme::text_color());
 }
 
-const PIECE_FILL: egui::Color32 = egui::Color32::from_rgb(40, 100, 210);
 
 /// A byte range of a transfer and how much of it (from its start) is done.
 struct Piece {
@@ -3731,7 +3926,7 @@ fn paint_piece_bar(painter: &egui::Painter, rect: egui::Rect, total: u64, pieces
     let column_width = rect.width() / columns as f32;
     let bytes_per_column = total as f64 / columns as f64;
     let paint_run = |from: usize, to: usize, color: egui::Color32| {
-        if color == win32::window() { return; }
+        if color == theme::ground() { return; }
         let x0 = rect.left() + from as f32 * column_width;
         let x1 = rect.left() + to as f32 * column_width;
         painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())), 0.0, color);
@@ -3754,7 +3949,7 @@ fn paint_piece_bar(painter: &egui::Painter, rect: egui::Rect, total: u64, pieces
         }
         let done = (done / bytes_per_column).clamp(0.0, 1.0) as f32;
         let failed = (failed / bytes_per_column).clamp(0.0, 1.0) as f32;
-        let color = mix(mix(win32::window(), fill, done), win32::error_red(), failed);
+        let color = mix(mix(theme::ground(), fill, done), theme::error_red(), failed);
         match run {
             Some((_, run_color)) if run_color == color => {}
             Some((run_start, run_color)) => {
