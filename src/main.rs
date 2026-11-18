@@ -15,7 +15,7 @@ mod search;
 mod session;
 mod settings;
 mod terminal;
-mod win32;
+mod theme;
 
 use std::{
     panic::{self, AssertUnwindSafe},

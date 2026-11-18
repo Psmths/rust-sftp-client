@@ -7,3 +7,6 @@
 *.sftp-state
 .DS_Store
 Thumbs.db
+# Commercial font: used by local builds when present, not redistributed
+# (remove this line only if the font's licence allows embedding it in releases).
+/assets/fonts/BerkeleyMono*

@@ -1,13 +1,15 @@
 # Rust SFTP Client
 
 A native desktop SFTP client for Windows and Linux, written in Rust with egui, with a dual-pane
-Windows Classic–style interface (light or dark).
+interface in a flat style (Inter and JetBrains Mono fonts, hairline borders) with the three
+[Rosé Pine](https://rosepinetheme.com/) themes: Rosé Pine and Rosé Pine Moon (dark) and Rosé Pine Dawn (light).
 
 ## Features
 
 - **Connections:** saved profiles, password or (unencrypted) private-key login, passwords optionally kept
-  in the system credential store, SSH host keys pinned by SHA-256 fingerprint, one tab per connection,
-  and a quick-connect menu next to the Connect button.
+  in the system credential store, and SSH host keys pinned by SHA-256 fingerprint. A sidebar lists the
+  active sessions (one per connection) and the saved sessions; click a saved session to connect, or
+  right-click it to edit it.
 - **Browsing:** local and remote panes with sorting, Ctrl/Shift multi-select, filtering, recursive
   search, show/hide hidden items, new folder, rename and delete. Bookmark folders with the star button and
   jump back to them from the Bookmarks drop-down (remote bookmarks are kept per server login). The local
